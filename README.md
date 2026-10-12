@@ -88,7 +88,25 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 - 使用 `list_bills` 批量盘点、查重或只读对账，需要完整筛选范围时继续翻页到 `nextCursor=null`，批量判断转账方向时直接读取摘要的 `fromId` 和 `targetId`，需要资产名称时只调用一次 `list_assets` 建立 ID 映射
 - 列表字段无歧义时不要逐条调用 `get_bill`，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才读取单笔详情，写入成功后直接使用写入工具返回的完整账单
 - 钱迹在其他设备发生变化后，调用 `refresh_cache` 获取最新数据
+- 需要查看账单附件时，读取 `get_bill` 的 `bill.imageUrls`：按原顺序返回 HTTPS 原图地址，没有附件时为 `[]`；账单列表保持精简，不附带图片地址。服务返回地址，由具备图像读取能力的客户端按需下载或展示，不提供 OCR，也不修改附件
 - 创建、修改、退款、报销和删除操作会直接写入钱迹，请先确认参数
+
+### 账单附件图片
+
+完整账单（包括写入成功后返回的账单）包含 `imageUrls`，例如：
+
+```json
+{
+  "imageUrls": [
+    "https://billimg.qianjiapp.com/example-image-key!webporigin",
+    "https://billimg.qianjiapp.com/example-image-key_hg!huge"
+  ]
+}
+```
+
+以上为虚构示例地址。地址按 Android 客户端 `Bill.getImageUrl(key, 2)` 规则生成：图片对象键以 `_hg` 结尾时使用 `!huge`，否则使用 `!webporigin`，并将当前图片 CDN 升级为 HTTPS。仅拼接裸对象键可能无法读取。该规则依赖钱迹客户端及当前 CDN，未来可能变化。
+
+图片地址的查询沿用原账单的账号访问控制，但返回后应视为私人资料，不公开传播或发送给无关第三方。客户端访问 CDN 时不应附带 MCP PAT、钱迹登录凭据或 cookie。服务不会为构造图片地址发起额外网络请求。
 
 ## 配置
 

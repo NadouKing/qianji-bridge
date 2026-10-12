@@ -297,6 +297,7 @@ const billSummarySchema = z.object({
 const billSchema = z.object({
   ...billFields,
   createTime: z.number().int().describe("账单创建时间，Unix 秒"),
+  imageUrls: z.array(z.url()).describe("账单附件图片的 HTTPS 原图地址，按原顺序返回，无图片时为空数组，读取图片时不要发送 MCP PAT 或钱迹登录凭据"),
   updateTime: z.number().int().optional().describe("账单更新时间，Unix 秒"),
   tagIds: z.array(z.string()).optional().describe("标签 ID 列表"),
 });

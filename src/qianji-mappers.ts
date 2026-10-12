@@ -251,6 +251,7 @@ export function publicBill(raw: Record<string, unknown>): Record<string, unknown
       : publicBillId("categoryId", raw.cateid),
     assetId: publicOptionalAssetId(raw.assetid),
     createTime: raw.createtime,
+    imageUrls: billImageUrls(raw.images),
   };
 
   if (raw.updatetime !== undefined && raw.updatetime !== null) bill.updateTime = raw.updatetime;
@@ -261,6 +262,17 @@ export function publicBill(raw: Record<string, unknown>): Record<string, unknown
   }
   addSharedBillFields(bill, raw);
   return bill;
+}
+
+/** 按 Android Bill.getImageUrl(key, 2) 规则构造可读取的原图地址。 */
+function billImageUrls(images: unknown): string[] {
+  if (images === undefined || images === null) return [];
+  if (!Array.isArray(images) || images.some((key) => typeof key !== "string" || !key.trim() || !key.isWellFormed())) {
+    throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹账单包含无效图片信息", 502);
+  }
+  return images.map((key: string) =>
+    `https://billimg.qianjiapp.com/${encodeURIComponent(key)}${key.endsWith("_hg") ? "!huge" : "!webporigin"}`
+  );
 }
 
 /** 补齐账单摘要和详情共用的公开字段。 */

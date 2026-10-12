@@ -1342,6 +1342,58 @@ test("旧缓存中的数字引用 ID 按新契约输出字符串", async (t) => 
   );
 });
 
+test("get_bill 通过 MCP 返回缓存附件地址，列表不包含地址且不能跨账号读取", async (t) => {
+  const billId = "1770000000000123456";
+  const otherBillId = "1770000000000123457";
+  const raw = {
+    id: billId, userid: "uid-test", bookid: 1, time: 1_770_000_000,
+    type: 0, money: 1, status: 2, cateid: 2, createtime: 1_770_000_000,
+    images: ["fixture-image", "fixture-image_hg"],
+  };
+  let upstreamCalls = 0;
+  const { store, app, token } = setupApp({
+    fetch: async (input) => {
+      upstreamCalls += 1;
+      assert.equal(new URL(String(input)).pathname, "/syncv2/pull");
+      return Response.json({ ec: 200, data: {
+        changes: [raw], deletes: [], categories: [], bookid: -1,
+        pageoffset: 0, hasmore: 0, count: 1, pagesign: "", lasttimes: { cursor: 1 },
+      } });
+    },
+  });
+  t.after(async () => { await app.close(); store.close(); });
+  const otherToken = store.createPat("other-fixture-user", null).token;
+  const otherPat = store.verifyPat(otherToken)!;
+  store.bindPat(otherPat.id, "other-fixture-uid", "other-fixture-utoken", "OTHER-DEVICE");
+  store.upsertBill(store.verifyPat(otherToken)!.accountId!, {
+    ...raw, id: otherBillId, userid: "other-fixture-uid", images: ["other-private-image"],
+  });
+  const client = new Client(
+    { name: "bill-image-fixture", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+  t.after(() => client.close());
+  await client.connect(transport(app, token));
+  for (let i = 0; i < 2; i += 1) {
+    const result = await client.callTool({ name: "get_bill", arguments: { billId } });
+    assert.equal(result.isError, undefined, JSON.stringify(result.content));
+    assert.deepEqual((result.structuredContent as { bill: { imageUrls: string[] } }).bill.imageUrls, [
+      "https://billimg.qianjiapp.com/fixture-image!webporigin",
+      "https://billimg.qianjiapp.com/fixture-image_hg!huge",
+    ]);
+  }
+  const listed = await client.callTool({ name: "list_bills", arguments: { allBooks: true } });
+  assert.equal(listed.isError, undefined);
+  const rows = (listed.structuredContent as { results: Record<string, unknown>[] }).results;
+  assert.equal(rows.length, 1);
+  assert.equal("imageUrls" in rows[0]!, false);
+  const denied = await client.callTool({ name: "get_bill", arguments: { billId: otherBillId } });
+  assert.equal(denied.isError, true);
+  assert.match(JSON.stringify(denied.content), /BILL_NOT_FOUND/);
+  assert.doesNotMatch(JSON.stringify(denied), /other-private-image/);
+  assert.equal(upstreamCalls, 1, "附件映射只读已同步缓存，不额外访问 API 或 CDN");
+});
+
 test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) => {
   const billId = "1770000000000123456";
   const { store, app, token } = setupApp({
@@ -1394,6 +1446,7 @@ test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) =>
   assert.equal(returned.remark, "");
   assert.equal(returned.assetId, null);
   assert.equal("updateTime" in returned, false);
+  assert.deepEqual(returned.imageUrls, []);
 });
 
 test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", async (t) => {
