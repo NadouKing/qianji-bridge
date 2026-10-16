@@ -249,6 +249,8 @@ https://qianjiga.litangkj.com
 
 ## 开发者信息
 
+修改代码或文档前先读 [AGENTS.md](AGENTS.md) 和[分支与工作目录规范](docs/development-workflow.md)。本 fork 的日常维护 PR 提交到 `NadouKing/qianji-mcp`。
+
 服务器级 MCP 使用流程维护在 [`src/server-instructions.md`](src/server-instructions.md)，修改后会同时用于旧版 `initialize` 和新版 `server/discover` 响应。
 
 <details>
