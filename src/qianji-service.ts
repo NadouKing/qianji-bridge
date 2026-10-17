@@ -403,27 +403,7 @@ export class MoneyTrackService {
     const names = updates.map(({ name }) => normalizeCategoryName(name));
     return this.withBillAccount(accountId, async (account) =>
       this.withCatalogWrite(account, "categories", updates.length, async (markRemoteSuccess) => {
-        const options = { forceRefresh: true, allowStale: false };
-        const books = await this.loadBooks(account, options);
-        const contexts = new Map<string, { bookId: string; type: 0 | 1; parentId: string; icon?: string }>();
-        for (const bookId of new Set([GLOBAL_SYNC_BOOK_ID, ...books.map((book) => String(book.bookid))])) {
-          const roots = await this.loadCategories(account, bookId, options);
-          for (const root of roots) {
-            for (const category of [root, ...categoryChildren(root)]) {
-              const id = String(category.id);
-              if (!ids.includes(id)) continue;
-              const type = Number(category.type);
-              if (type !== 0 && type !== 1) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效分类类型", 502);
-              contexts.set(id, { bookId, type, parentId: String(category.parentid ?? "-1"),
-                ...(typeof category.icon === "string" ? { icon: category.icon } : {}) });
-            }
-          }
-          if (contexts.size === ids.length) break;
-        }
-        if (contexts.size !== ids.length) throw crossAccount("分类");
-        for (const bookId of new Set([...contexts.values()].map((context) => context.bookId))) {
-          await this.requireWritableBook(account, bookId);
-        }
+        const contexts = await this.loadWritableCategoryContexts(account, ids);
         const categories: Array<{ categoryId: string; name: string }> = [];
         for (const [index] of updates.entries()) {
           const categoryId = ids[index]!;
@@ -500,7 +480,15 @@ export class MoneyTrackService {
     if (parentId === categoryId) throw new AppError("INVALID_CATEGORY_PARENT", "父分类不能是分类本身");
     return this.withBillAccount(accountId, async (account) =>
       this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
-        if (parentId === "-1") await this.client.changeCategoryLevel(account, categoryId, parentId);
+        const contexts = await this.loadWritableCategoryContexts(account, parentId === "-1" ? [categoryId] : [categoryId, parentId]);
+        const source = contexts.get(categoryId)!;
+        if (parentId !== "-1") {
+          const parent = contexts.get(parentId)!;
+          if (!["-1", "0"].includes(parent.parentId) || parent.bookId !== source.bookId || parent.type !== source.type) {
+            throw new AppError("INVALID_CATEGORY_PARENT", "目标必须是同账本、同收支类型的一级分类");
+          }
+        }
+        if (parentId === "-1" || ["-1", "0"].includes(source.parentId)) await this.client.changeCategoryLevel(account, categoryId, parentId);
         else await this.client.moveCategory(account, categoryId, parentId);
         markRemoteSuccess();
         return { categoryId, parentId };
@@ -2331,6 +2319,32 @@ export class MoneyTrackService {
       return { ...asset, money: decimalAdd(money, delta) };
     });
     await this.store.setCatalogCache(accountId, "assets", "", data, cached.refreshedAtMs);
+  }
+
+  /** 强制读取并校验分类上下文，供改名和层级调整使用，避免陈旧缓存选错接口。 */
+  private async loadWritableCategoryContexts(account: QianjiAccount, ids: string[]) {
+    const options = { forceRefresh: true, allowStale: false };
+    const books = await this.loadBooks(account, options);
+    const contexts = new Map<string, { bookId: string; type: 0 | 1; parentId: string; icon?: string }>();
+    for (const bookId of new Set([GLOBAL_SYNC_BOOK_ID, ...books.map((book) => String(book.bookid))])) {
+      const roots = await this.loadCategories(account, bookId, options);
+      for (const root of roots) {
+        for (const category of [root, ...categoryChildren(root)]) {
+          const id = String(category.id);
+          if (!ids.includes(id)) continue;
+          const type = Number(category.type);
+          if (type !== 0 && type !== 1) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效分类类型", 502);
+          contexts.set(id, { bookId, type, parentId: String(category.parentid ?? "-1"),
+            ...(typeof category.icon === "string" ? { icon: category.icon } : {}) });
+        }
+      }
+      if (contexts.size === ids.length) break;
+    }
+    if (contexts.size !== ids.length) throw crossAccount("分类");
+    for (const bookId of new Set([...contexts.values()].map((context) => context.bookId))) {
+      await this.requireWritableBook(account, bookId);
+    }
+    return contexts;
   }
 
   /** 读取指定账本的完整分类目录。 */

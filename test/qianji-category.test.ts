@@ -393,16 +393,28 @@ test("服务层删除前检查是只读操作并返回受影响账单数", async
   );
 });
 
-test("服务层移动分类按父 ID 选择移动或层级调整接口", async (t) => {
+test("分类提升、降级和换父级按新鲜层级选择接口，拒绝无效目标", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 10, 4);
   seedUser(store, account, now);
+  let sourceParent = "172";
+  store.setCatalogCache(accountId, "categories", "-1", [{ id: "170", name: "Stale", type: 0, parentid: "-1" }], now);
   const requests: Array<{ path: string; form: URLSearchParams }> = [];
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input, init) => {
       const path = new URL(String(input)).pathname;
-      requests.push({ path, form: new URLSearchParams(String(init?.body)) });
+      if (path === "/book/list") return ok({ list: [] });
+      if (path === "/category/listv2") return ok({ list: [
+        { id: "170", name: "Source", type: 0, parentid: sourceParent },
+        { id: "171", name: "Parent A", type: 0, parentid: "-1" },
+        { id: "172", name: "Parent B", type: 0, parentid: "-1" },
+        { id: "173", name: "Income", type: 1, parentid: "-1" },
+        { id: "174", name: "Child", type: 0, parentid: "171" },
+      ] });
+      const form = new URLSearchParams(String(init?.body));
+      requests.push({ path, form });
+      sourceParent = form.get("parentid") ?? "-1";
       return ok({});
     },
   }), () => now);
@@ -413,19 +425,27 @@ test("服务层移动分类按父 ID 选择移动或层级调整接口", async (
   assert.equal(requests[0]!.form.get("parentid"), null);
 
   assert.deepEqual(await service.moveCategory(accountId, "170", "171"), { categoryId: "170", parentId: "171" });
-  assert.equal(requests[1]!.path, "/category/movesubcate");
+  assert.equal(requests[1]!.path, "/category/changelevel");
   assert.equal(requests[1]!.form.get("parentid"), "171");
+
+  assert.deepEqual(await service.moveCategory(accountId, "170", "172"), { categoryId: "170", parentId: "172" });
+  assert.equal(requests[2]!.path, "/category/movesubcate");
+  assert.equal(requests[2]!.form.get("parentid"), "172");
 
   for (const [categoryId, parentId, code] of [
     ["170", "170", "INVALID_CATEGORY_PARENT"],
     ["abc", "171", "INVALID_CATEGORY_ID"],
     ["170", "abc", "INVALID_CATEGORY_PARENT"],
+    ["170", "173", "INVALID_CATEGORY_PARENT"],
+    ["170", "174", "INVALID_CATEGORY_PARENT"],
   ] as const) {
     await assert.rejects(
       () => service.moveCategory(accountId, categoryId, parentId),
       (error) => error instanceof AppError && error.code === code,
     );
   }
+  await assert.rejects(() => service.moveCategory(accountId, "170", "999"));
+  assert.equal(requests.length, 3);
 });
 
 test("服务层重排分类发送保持精度的 ID 数组并失效快照", async (t) => {

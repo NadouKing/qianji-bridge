@@ -882,11 +882,11 @@ export function createMoneyTrackMcp(
           categoryIds: z.array(positiveIdText).min(1).max(100).optional()
             .describe("多个分类 ID 筛选"),
           includeSubcategories: z.boolean().optional().meta({
-            description: "是否同时匹配所选一级分类的子分类",
+            description: "是否同时匹配 categoryIds 所选一级分类的子分类，不作用于 categoryId",
             default: true,
           }),
           categoryId: positiveIdText.optional()
-            .describe("单个分类 ID 筛选"),
+            .describe("单个分类 ID 精确筛选，不包含子分类，需要包含子分类时使用 categoryIds"),
           tagIds: tagIdsSchema.min(1).optional().describe("多个标签 ID 筛选"),
           tagMatch: tagMatchSchema.optional().meta({
             description: "标签匹配方式",
@@ -1311,7 +1311,7 @@ export function createMoneyTrackMcp(
         deletions: z.array(z.strictObject({
           categoryId: positiveIdText.describe("要永久删除的分类 ID"),
           transferTo: positiveIdText.optional()
-            .describe("删除后原账单转入的分类 ID，省略时清空账单的分类关联"),
+            .describe("删除后原账单转入的分类 ID，分类非空且不删除账单时必须指定，省略不会清空分类关联"),
           deleteBills: z.boolean().optional().default(false)
             .describe("是否同时永久删除原分类下的全部账单。钱迹此路径不回滚资产余额。如需回滚余额，先用 delete_bills 删除已确认范围的账单，再删除空分类"),
         })).min(1).max(100).describe("待删除分类列表"),
