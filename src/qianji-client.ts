@@ -366,9 +366,15 @@ export class QianjiClient {
     return object.id === undefined && object.cateid === undefined ? undefined : normalizeCategory(object);
   }
 
-  /** 按分类 ID 重命名分类。 */
-  async updateCategory(account: QianjiAccount, categoryId: string, name: string): Promise<void> {
-    await this.authPost(account, "/category/submitv2", { did: categoryId, v: name });
+  /** 改名须携带原账本、类型及可选父级/图标，避免服务端拒绝或覆盖上下文。 */
+  async updateCategory(
+    account: QianjiAccount, categoryId: string, name: string,
+    context: { bookId: string; type: 0 | 1; parentId?: string; icon?: string },
+  ): Promise<void> {
+    const body: Record<string, string | number> = { did: categoryId, v: name, bookid: context.bookId, t: context.type };
+    if (context.parentId && context.parentId !== "-1" && context.parentId !== "0") body.parentid = context.parentId;
+    if (context.icon) body.icon = context.icon;
+    await this.authPost(account, "/category/submitv2", body);
   }
 
   /** 删除分类，可把账单转移到其他分类或连同账单一起删除。 */
@@ -405,9 +411,9 @@ export class QianjiClient {
     await this.authPost(account, "/category/changelevel", { did: categoryId, ...(parentId !== "-1" ? { parentid: parentId } : {}) });
   }
 
-  /** 按给定 ID 顺序重排分类，`v` 使用保持精度的 JSON 数字数组。 */
+  /** 重排同一层级的分类；reorder3 接收分组的二维 ID 数组。 */
   async reorderCategories(account: QianjiAccount, orderedIds: string[]): Promise<void> {
-    await this.authPost(account, "/category/reorder3", { v: stringifyQianjiCategoryIdList(orderedIds) });
+    await this.authPost(account, "/category/reorder3", { v: `[${stringifyQianjiCategoryIdList(orderedIds)}]` });
   }
 
   /** 批量创建指定真实一级分类下的子分类。 */
@@ -507,16 +513,13 @@ export class QianjiClient {
     return object.id === undefined ? undefined : { ...object, id: opaqueIdText(object.id, "标签") };
   }
 
-  /** 按标签 ID 修改标签名称、所属组或颜色，`v` 使用仅含变更字段的 JSON 字符串载荷。 */
+  /** 提交标签完整可编辑字段；服务端会清空未提供的字段，调用方须先读取并合并。 */
   async updateTag(
     account: QianjiAccount,
     tagId: string,
-    patch: { name?: string; groupId?: string; color?: string },
+    patch: { name: string; groupId: string; color: string | null },
   ): Promise<void> {
-    const payload: Record<string, string> = {};
-    if (patch.name !== undefined) payload.name = patch.name;
-    if (patch.groupId !== undefined) payload.groupid = patch.groupId;
-    if (patch.color !== undefined) payload.color = patch.color;
+    const payload = { name: patch.name, groupid: patch.groupId, color: patch.color };
     await this.authPost(account, "/tag/submittag", { did: tagId, v: JSON.stringify(payload) });
   }
 

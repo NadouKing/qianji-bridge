@@ -75,6 +75,9 @@ for (const [name, kind, run] of batchCases) {
     let calls = 0;
     const service = new MoneyTrackService(store, new QianjiClient({ fetch: async input => {
       if (new URL(String(input)).pathname === "/syncv2/pull") return Response.json({ ec: 200, data: { changes: [], deletes: [], bookid: "-1", pageoffset: 0, pagesign: "", hasmore: 0, lasttimes: {} } });
+      if (new URL(String(input)).pathname === "/tag/list") return Response.json({ ec: 200, data: { list: [{ id: "", name: "", tags: ["a", "b", "c"].map(id => ({ id, name: id })) }] } });
+      if (new URL(String(input)).pathname === "/book/list") return Response.json({ ec: 200, data: { list: [] } });
+      if (new URL(String(input)).pathname === "/category/listv2") return Response.json({ ec: 200, data: { list: ["1", "2", "3"].map(id => ({ id, name: id, type: 0, parentid: "-1" })) } });
       calls++;
       if (calls === 2) throw new Error("fixture secret must not leak");
       return Response.json({ ec: 200, data: {} });

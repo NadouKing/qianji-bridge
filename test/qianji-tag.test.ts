@@ -78,7 +78,7 @@ test("创建标签发送 JSON 字符串载荷并规范化响应标签", async ()
   assert.equal(await withoutId.createTag(accountFixture, { name: "午餐" }), undefined);
 });
 
-test("修改标签发送 did 与仅含变更字段的 JSON 载荷", async () => {
+test("修改标签发送 did 与完整字段并保留空颜色", async () => {
   const requests: Array<{ path: string; form: URLSearchParams }> = [];
   const client = new QianjiClient({
     fetch: async (input, init) => {
@@ -93,9 +93,9 @@ test("修改标签发送 did 与仅含变更字段的 JSON 载荷", async () => 
   assert.equal(requests[0]!.form.get("did"), "t1");
   assert.equal(requests[0]!.form.get("v"), '{"name":"新名","groupid":"g2","color":"00ff00"}');
 
-  await client.updateTag(accountFixture, "t1", { color: "abcdef" });
+  await client.updateTag(accountFixture, "t1", { name: "旧名", groupId: "", color: null });
   assert.equal(requests[1]!.form.get("did"), "t1");
-  assert.equal(requests[1]!.form.get("v"), '{"color":"abcdef"}');
+  assert.equal(requests[1]!.form.get("v"), '{"name":"旧名","groupid":"","color":null}');
 });
 
 test("删除、归档标签与删除标签组发送 did 表单", async () => {
@@ -257,7 +257,7 @@ test("服务层创建标签发送 JSON 载荷并失效标签快照", async (t) =
   }
 });
 
-test("服务层批量修改标签发送 did 与变更字段并拒绝重复和空补丁", async (t) => {
+test("服务层批量修改标签合并完整字段并拒绝重复和空补丁", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 10, 4);
@@ -266,6 +266,7 @@ test("服务层批量修改标签发送 did 与变更字段并拒绝重复和空
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input, init) => {
       const path = new URL(String(input)).pathname;
+      if (path === "/tag/list") return ok({ list: [{ id: "g1", name: "组", tags: [{ id: "t1", name: "旧名", color: "112233" }, { id: "t2", name: "保留名", color: "445566" }] }] });
       forms.push({ path, form: new URLSearchParams(String(init?.body)) });
       assert.equal(path, "/tag/submittag");
       return ok({});
@@ -284,7 +285,7 @@ test("服务层批量修改标签发送 did 与变更字段并拒绝重复和空
   });
   assert.deepEqual(forms.map(({ form }) => ({ did: form.get("did"), v: form.get("v") })), [
     { did: "t1", v: '{"name":"新名","groupid":"g2","color":"00ff00"}' },
-    { did: "t2", v: '{"color":"abcdef"}' },
+    { did: "t2", v: '{"name":"保留名","groupid":"g1","color":"abcdef"}' },
   ]);
 
   for (const [updates, code] of [
@@ -439,7 +440,9 @@ test("标签写入预占并保留非 VIP 每日写入配额，远端失败时释
   let failNext = false;
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input) => {
-      assert.equal(new URL(String(input)).pathname, "/tag/submittag");
+      const path = new URL(String(input)).pathname;
+      if (path === "/tag/list") return ok({ list: [{ id: "", name: "", tags: [{ id: "t1", name: "A" }, { id: "t2", name: "B" }] }] });
+      assert.equal(path, "/tag/submittag");
       return failNext ? Response.json({ ec: 500, em: "server failure" }) : ok({});
     },
   }), () => now);
@@ -453,6 +456,46 @@ test("标签写入预占并保留非 VIP 每日写入配额，远端失败时释
     (error) => error instanceof AppError && error.code === "QIANJI_BUSINESS_ERROR",
   );
   assert.equal(store.getWriteQuota(accountId).used, 1);
+});
+
+test("标签局部更新读取最新字段，保留名称、分组和颜色，缺失项阻止整个批次写入", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = Date.UTC(2026, 9, 18);
+  seedUser(store, account, now);
+  store.setCatalogCache(accountId, "tags", "", [{ id: "t1", name: "Stale", groupId: "old", color: "000000" }], now);
+  let remote = { name: "Fresh", groupid: "g1", color: "123abc" as string | null };
+  let writes = 0;
+  let reads = 0;
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/tag/list") {
+      reads++;
+      return ok({ list: [{ id: remote.groupid, name: "Group", tags: [{ id: "t1", ...remote }] }] });
+    }
+    assert.equal(path, "/tag/submittag");
+    writes++;
+    // 模拟真实服务的覆盖语义：缺失字段会清空。
+    const payload = JSON.parse(new URLSearchParams(String(init?.body)).get("v")!);
+    remote = { name: payload.name ?? "", groupid: payload.groupid ?? "", color: payload.color ?? null };
+    return ok({});
+  }}), () => now);
+
+  await service.updateTags(accountId, [{ tagId: "t1", name: "Renamed" }]);
+  assert.deepEqual(remote, { name: "Renamed", groupid: "g1", color: "123abc" });
+  await service.updateTags(accountId, [{ tagId: "t1", color: "abcdef" }]);
+  assert.deepEqual(remote, { name: "Renamed", groupid: "g1", color: "abcdef" });
+  await service.updateTags(accountId, [{ tagId: "t1", groupId: "g2" }]);
+  assert.deepEqual(remote, { name: "Renamed", groupid: "g2", color: "abcdef" });
+  remote = { name: "NoColor", groupid: "", color: null };
+  await service.updateTags(accountId, [{ tagId: "t1", name: "StillNoColor" }]);
+  assert.deepEqual(remote, { name: "StillNoColor", groupid: "", color: null });
+  await assert.rejects(() => service.updateTags(accountId, [
+    { tagId: "t1", name: "MustNotWrite" }, { tagId: "missing", name: "Missing" },
+  ]));
+  assert.equal(writes, 4);
+  assert.equal(reads, 5);
+  assert.equal(remote.name, "StillNoColor");
 });
 
 test("normalizeTagId 拒绝空文本与超长文本并接受不透明字符串", () => {

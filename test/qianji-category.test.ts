@@ -78,7 +78,7 @@ test("改名、删除、删除前检查和移动分类的表单契约与 APK 证
     },
   });
 
-  await client.updateCategory(accountFixture, "177", "夜宵");
+  await client.updateCategory(accountFixture, "177", "夜宵", { bookId: "1", type: 0 });
   assert.equal(requests[0]!.path, "/category/submitv2");
   assert.equal(requests[0]!.form.get("did"), "177");
   assert.equal(requests[0]!.form.get("v"), "夜宵");
@@ -109,7 +109,7 @@ test("改名、删除、删除前检查和移动分类的表单契约与 APK 证
   assert.equal(requests[5]!.form.get("parentid"), null);
 });
 
-test("重排分类发送保持精度的 JSON 数字数组并拒绝非法 ID", async () => {
+test("重排分类发送保持精度的二维 JSON 数组并拒绝非法 ID", async () => {
   const forms: URLSearchParams[] = [];
   const client = new QianjiClient({
     fetch: async (input, init) => {
@@ -120,10 +120,10 @@ test("重排分类发送保持精度的 JSON 数字数组并拒绝非法 ID", as
   });
 
   await client.reorderCategories(accountFixture, ["170", "171"]);
-  assert.equal(forms[0]!.get("v"), "[170,171]");
+  assert.equal(forms[0]!.get("v"), "[[170,171]]");
 
   await client.reorderCategories(accountFixture, ["9223372036854775807"]);
-  assert.equal(forms[1]!.get("v"), "[9223372036854775807]");
+  assert.equal(forms[1]!.get("v"), "[[9223372036854775807]]");
 
   for (const ids of [["abc"], ["9223372036854775808"], [""]]) {
     await assert.rejects(
@@ -278,6 +278,8 @@ test("服务层批量改名发送 did 与新名称并拒绝重复和非法 ID", 
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input, init) => {
       const path = new URL(String(input)).pathname;
+      if (path === "/book/list") return ok({ list: [{ bookid: "1", name: "Book" }] });
+      if (path === "/category/listv2") return ok({ list: ["5", "170", "171"].map(id => ({ id, name: "Old", type: 0, parentid: "-1" })) });
       forms.push({ path, form: new URLSearchParams(String(init?.body)) });
       assert.equal(path, "/category/submitv2");
       return ok({});
@@ -444,7 +446,7 @@ test("服务层重排分类发送保持精度的 ID 数组并失效快照", asyn
 
   const result = await service.reorderCategories(accountId, ["170", "171"]);
   assert.deepEqual(result, { orderedCategoryIds: ["170", "171"] });
-  assert.equal(forms[0]!.get("v"), "[170,171]");
+  assert.equal(forms[0]!.get("v"), "[[170,171]]");
   assert.equal(store.getCatalogCache(account.id, "categories", "1"), undefined);
 
   for (const [ids, code] of [
@@ -540,7 +542,10 @@ test("无账本上下文的分类写入使全部已缓存账本的分类快照�
   store.setCatalogCache(account.id, "categories", "-1", [{ id: "6", name: "收入", type: 1, parentid: "-1" }], now);
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input) => {
-      assert.equal(new URL(String(input)).pathname, "/category/submitv2");
+      const path = new URL(String(input)).pathname;
+      if (path === "/book/list") return ok({ list: [{ bookid: "1", name: "Book" }] });
+      if (path === "/category/listv2") return ok({ list: ["5", "170", "171"].map(id => ({ id, name: "Old", type: 0, parentid: "-1" })) });
+      assert.equal(path, "/category/submitv2");
       return ok({});
     },
   }), () => now);
@@ -558,7 +563,10 @@ test("分类写入预占并保留非 VIP 每日写入配额，远端失败时释
   let failNext = false;
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input) => {
-      assert.equal(new URL(String(input)).pathname, "/category/submitv2");
+      const path = new URL(String(input)).pathname;
+      if (path === "/book/list") return ok({ list: [{ bookid: "1", name: "Book" }] });
+      if (path === "/category/listv2") return ok({ list: ["5", "170", "171"].map(id => ({ id, name: "Old", type: 0, parentid: "-1" })) });
+      assert.equal(path, "/category/submitv2");
       return failNext ? Response.json({ ec: 500, em: "server failure" }) : ok({});
     },
   }), () => now);
@@ -572,6 +580,36 @@ test("分类写入预占并保留非 VIP 每日写入配额，远端失败时释
     (error) => error instanceof AppError && error.code === "QIANJI_BUSINESS_ERROR",
   );
   assert.equal(store.getWriteQuota(accountId).used, 1);
+});
+
+test("子分类改名从新鲜目录恢复账本、收入类型、父级和图标，缺失分类不写入", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = Date.UTC(2026, 9, 18);
+  seedUser(store, account, now);
+  store.setCatalogCache(accountId, "categories", "1", [{ id: "171", name: "Stale", type: 0, parentid: "-1" }], now);
+  const writes: URLSearchParams[] = [];
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const form = new URLSearchParams(String(init?.body));
+    if (path === "/book/list") return ok({ list: [{ bookid: "1", name: "Book" }] });
+    if (path === "/category/listv2") return ok({ list: form.get("bookid") === "-1" ? [] : [
+      { id: "170", name: "Parent", type: 1, parentid: "-1", sublist: [
+        { id: "171", name: "Child", type: 1, parentid: "170", icon: "fixture-icon" },
+      ] },
+    ] });
+    assert.equal(path, "/category/submitv2");
+    writes.push(form);
+    return ok({});
+  }}), () => now);
+  await service.updateCategories(accountId, [{ categoryId: "171", name: "Renamed" }]);
+  assert.deepEqual(Object.fromEntries(writes[0]!), {
+    uid: account.uid, fr: account.uid, did: "171", v: "Renamed", bookid: "1", t: "1", parentid: "170", icon: "fixture-icon",
+  });
+  await assert.rejects(() => service.updateCategories(accountId, [
+    { categoryId: "171", name: "MustNotWrite" }, { categoryId: "999", name: "Missing" },
+  ]));
+  assert.equal(writes.length, 1);
 });
 
 test("normalizeBookId 保留分类操作的默认账本哨兵值", () => {

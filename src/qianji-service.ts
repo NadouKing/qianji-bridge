@@ -403,11 +403,32 @@ export class MoneyTrackService {
     const names = updates.map(({ name }) => normalizeCategoryName(name));
     return this.withBillAccount(accountId, async (account) =>
       this.withCatalogWrite(account, "categories", updates.length, async (markRemoteSuccess) => {
+        const options = { forceRefresh: true, allowStale: false };
+        const books = await this.loadBooks(account, options);
+        const contexts = new Map<string, { bookId: string; type: 0 | 1; parentId: string; icon?: string }>();
+        for (const bookId of new Set([GLOBAL_SYNC_BOOK_ID, ...books.map((book) => String(book.bookid))])) {
+          const roots = await this.loadCategories(account, bookId, options);
+          for (const root of roots) {
+            for (const category of [root, ...categoryChildren(root)]) {
+              const id = String(category.id);
+              if (!ids.includes(id)) continue;
+              const type = Number(category.type);
+              if (type !== 0 && type !== 1) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效分类类型", 502);
+              contexts.set(id, { bookId, type, parentId: String(category.parentid ?? "-1"),
+                ...(typeof category.icon === "string" ? { icon: category.icon } : {}) });
+            }
+          }
+          if (contexts.size === ids.length) break;
+        }
+        if (contexts.size !== ids.length) throw crossAccount("分类");
+        for (const bookId of new Set([...contexts.values()].map((context) => context.bookId))) {
+          await this.requireWritableBook(account, bookId);
+        }
         const categories: Array<{ categoryId: string; name: string }> = [];
         for (const [index] of updates.entries()) {
           const categoryId = ids[index]!;
           const name = names[index]!;
-          await this.client.updateCategory(account, categoryId, name);
+          await this.client.updateCategory(account, categoryId, name, contexts.get(categoryId)!);
           markRemoteSuccess();
           categories.push({ categoryId, name });
         }
@@ -631,13 +652,20 @@ export class MoneyTrackService {
     });
     return this.withBillAccount(accountId, async (account) =>
       this.withCatalogWrite(account, "tags", updates.length, async (markRemoteSuccess) => {
+        // submit 接口是全字段覆盖；强制读取，避免用陈旧缓存覆盖用户在 App 的修改。
+        const current = await this.loadTags(account, { forceRefresh: true, allowStale: false });
+        const merged = normalized.map((update) => {
+          const tag = current.find((candidate) => String(candidate.id) === update.tagId);
+          if (!tag) throw crossAccount("标签");
+          return {
+            name: update.name ?? String(tag.name ?? ""),
+            groupId: update.groupId ?? String(tag.groupId ?? ""),
+            color: update.color ?? (tag.color == null ? null : String(tag.color)),
+          };
+        });
         const tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> = [];
-        for (const update of normalized) {
-          await this.client.updateTag(account, update.tagId, {
-            name: update.name,
-            groupId: update.groupId,
-            color: update.color,
-          });
+        for (const [index, update] of normalized.entries()) {
+          await this.client.updateTag(account, update.tagId, merged[index]!);
           markRemoteSuccess();
           tags.push({
             tagId: update.tagId,

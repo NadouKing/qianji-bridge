@@ -56,8 +56,11 @@
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
 - 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
 - 分类：使用 `delete_categories` 的 `deletions`，可选择把账单转移到其他分类或连同账单一起删除
-  - 转移目标不能是本批次待删除分类；不得同时指定转移账单和删除账单。操作后调用 `refresh_cache`，再核对受影响账单和统计
+  - 转移目标不能是本批次待删除分类；不得同时指定转移账单和删除账单。操作后调用 `refresh_cache`，再核对受影响账单、统计和资产余额
+  - `deleteBills=true` 会删除账单，但此接口不回滚资产余额，刷新缓存也不会修复差额。若用户需要撤销账单对余额的影响，先用 `delete_bills` 删除已确认范围的账单并核对余额，再删除空分类。不得擅自创建抵扣账单来补余额
+  - 父分类仍有子分类时服务端会拒绝删除；须先确认子分类的处理方式
 - 标签：使用 `delete_tags` 的 `tagIds`，删除标签组使用 `delete_tag_groups` 的 `groupIds`，保留标签但不再使用可改用 `archive_tags` 的 `tagIds` 归档
+  - 删除标签组会把组内标签移到默认组，不会删除这些标签；`list_tags` 暂不显示空标签组
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，账号未被其他 PAT 使用时会删除全部本地数据，不会删除钱迹云端数据
 
 完成当前用户请求所需的全部调用后，将最终结果交付用户并结束本次操作。

@@ -1313,7 +1313,7 @@ export function createMoneyTrackMcp(
           transferTo: positiveIdText.optional()
             .describe("删除后原账单转入的分类 ID，省略时清空账单的分类关联"),
           deleteBills: z.boolean().optional().default(false)
-            .describe("是否同时永久删除原分类下的全部账单"),
+            .describe("是否同时永久删除原分类下的全部账单。钱迹此路径不回滚资产余额。如需回滚余额，先用 delete_bills 删除已确认范围的账单，再删除空分类"),
         })).min(1).max(100).describe("待删除分类列表"),
       }),
       outputSchema: z.object({
@@ -1419,7 +1419,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "delete_tag_groups",
     {
-      description: "批量永久删除标签组",
+      description: "批量永久删除标签组，组内标签移到默认组，不会随组删除",
       inputSchema: z.strictObject({
         groupIds: z.array(opaqueIdText).min(1).max(100)
           .describe("要永久删除的标签组 ID 列表"),
