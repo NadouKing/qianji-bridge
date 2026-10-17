@@ -1,28 +1,91 @@
-## qianji-bridge（钱迹桥接服务）
+# qianji-bridge（钱迹桥接服务）
 
-qianji-bridge 是一个可自行部署的钱迹 MCP Server，它通过钱迹私有 HTTP API 同步账本数据，让支持 Streamable HTTP 的 MCP Client 查询和管理账单。
+让 AI 帮忙查账、核对、分类和记账，少做一点重复劳动。
 
-- 查询账本、资产、借入或借出详情、分类、标签、用户、账单和固定统计报表
-- 管理普通收支、转账、信用卡还款、退款与报销
-- 管理分类、子分类、标签与标签组，支持移动、归档和排序
-- 使用 Bearer PAT 认证，并隔离不同钱迹账号的数据
-- 默认使用 SQLite，也可连接 PostgreSQL 或 MySQL
+这是可自行部署的钱迹 MCP 服务，供支持 Streamable HTTP 的 AI 客户端调用。
 
-> [!WARNING]
-> 本项目依赖钱迹私有 API，接口可能随钱迹客户端升级而变化。
+## 官方入口与开源来源
 
-本项目 fork 自 [fangzhengjin/qianji-mcp](https://github.com/fangzhengjin/qianji-mcp)。MCP 是提供给 AI 客户端的接口协议，Bridge 表达连接钱迹与外部工具的用途。分类与标签管理移植自 [apsuadwf 的 PR #3](https://github.com/fangzhengjin/qianji-mcp/pull/3)，并补充批量失败恢复和缓存隔离修复。
+先感谢钱迹和这些开源作者。本项目在已有工作上继续完善，保留来源和许可证。
 
-改名保留 `QIANJI_MCP_*` 环境变量、`/mcp` 地址、PAT 格式与数据库结构；已有数据卷继续使用原名称，无需迁移运行数据。
+| 来源 | 与本项目的关系 |
+|---|---|
+| [钱迹官网](https://www.qianjiapp.com/) · [官方使用指南](https://docs.qianjiapp.com/) | 钱迹是实际保存、同步和展示账目的应用；本项目对接它的服务，协议行为参考 Android 客户端实现 |
+| [fangzhengjin/qianji-mcp](https://github.com/fangzhengjin/qianji-mcp) | 本仓库直接 fork 的 TypeScript 上游，提供 MCP 服务、登录认证、同步缓存和基础账单操作 |
+| [apsuadwf 的分类与标签贡献（PR #3）](https://github.com/fangzhengjin/qianji-mcp/pull/3) | 移植其中两个提交的分类与标签管理能力，保留作者信息，继续修复和验证 |
+| [ljq29/MCP_qianji](https://github.com/ljq29/MCP_qianji) | 调研和试用过的 Python 实现，作为功能与使用体验参考；当前服务仍以 TypeScript 上游为基础 |
+
+**这是个人维护的非官方项目，不是钱迹官方推出的 MCP 服务。** 它通过钱迹私有 HTTP API 工作，接口可能随客户端升级变化；上面的开源项目也不能视为钱迹官方背书。
+
+## 为什么做这个
+
+就是为了方便记账，也为了能在记账上偷点懒。
+
+隔一段时间集中记账时，要翻微信、支付宝和银行卡账单，还要检查哪些已经记过、哪些应该合并、该放进哪个分类。希望把这些重复工作交给 AI：能确定的按规则处理，拿不准的集中问我，最后把账目核对好。
+
+做法也很简单：**融集百家之长，遇到实际问题就补上需要的能力。** 复用好的开源实现，保留贡献来源，用真实场景验证结果，优先把常用流程做可靠。
+
+本 fork 已补充账单附件链接、预算设置，以及分类/标签字段保留、分类排序与层级调整、批量失败恢复和账号缓存隔离等修复。它是连接 AI 与钱迹的工具层；读懂账单文件、图片识别、判断重复和理解个人习惯，仍由 AI 客户端及用户提供的规则完成。
+
+## 怎么用它偷懒记账
+
+1. 把微信、支付宝或银行导出的 Excel / CSV / PDF 交给能读取文件的 AI 客户端。
+2. 让 AI 通过本服务查询已有账单，核对支付账户、退款、报销和重复记录。
+3. 按自己的规则归类、合并，无法判断的集中确认；在授权范围内新增或修改账单。
+4. 写入后核对账单、账户余额和统计，在钱迹 App 补图片或查看结果。
+
+例如可以这样交代 AI：
+
+> 先核对这份账单与钱迹现有记录，不要重复记账。按我提供的分类和合并规则整理，不确定的集中问我。先列出准备新增、修改和跳过的内容。
+
+本服务不内置个人分类偏好，也不自动解析 Excel、不提供 OCR、不自动上传附件。方法和偏好可另存为自己的规则文档；密码、账单和私人图片不应提交到公开仓库。
 
 ## 快速导航
 
+- [现在能做什么](#现在能做什么)
+- [验证范围与已知限制](#验证范围与已知限制)
 - [快速开始](#快速开始)
-- [Android 4.5.4 兼容性检查与人工验收](docs/compatibility-4.5.4.md)
 - [配置](#配置)
-- [MCP 工具](#mcp-工具)
 - [使用要点](#使用要点)
 - [安全须知](#安全须知)
+- [开发与后续方向](#开发与后续方向)
+
+<a id="mcp-工具"></a>
+
+## 现在能做什么
+
+以下功能以当前检出的代码为准；未合并分支或本地改动不会自动出现在已部署服务中。当前普通用户有 **42 个工具**，超级管理员额外有 **3 个 PAT 管理工具**。
+
+| 使用场景 | 工具 |
+|---|---|
+| 账号登录与解绑 | `connect_qianji`、`disconnect_qianji` |
+| 查询基础数据 | `list_books`、`list_book_members`、`list_assets`、`list_categories`、`list_tags`、`get_user_info` |
+| 查询借入或借出详情 | `list_debt_accounts` |
+| 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bill_statistics`、`refresh_cache` |
+| 查询预算使用情况 | `get_budget` |
+| 设置单项总预算或分类预算 | `set_budget` |
+| 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
+| 删除普通收支、待报销支出、转账或还款 | `delete_bills` |
+| 转账与信用卡还款 | `create_transfer`、`update_transfer` |
+| 退款 | `create_refund`、`update_refund`、`delete_refund` |
+| 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` |
+| 分类管理 | `create_categories`、`create_subcategories`、`update_categories`、`delete_categories`、`check_category_deletion`、`move_category`、`reorder_categories`、`list_category_icons` |
+| 标签管理 | `create_tag_groups`、`delete_tag_groups`、`create_tags`、`update_tags`、`delete_tags`、`archive_tags`、`reorder_tags`、`reorder_tag_groups` |
+| PAT 管理，仅超级管理员 | `list_pats`、`create_pat`、`delete_pat` |
+
+## 验证范围与已知限制
+
+当前适配和联调基线为 Android **4.5.4-1234**，不是对所有钱迹版本、平台和参数组合的兼容承诺。详细过程见[兼容性与验收记录](docs/compatibility-4.5.4.md)。
+
+- 常用收支、转账、信用卡还款、退款、报销、分类/标签管理、跨币种和月预算已在授权的测试资源上验证，并核对写入后的金额和余额
+- 普通账单图片可通过详情返回的链接读取；超长图可能被 CDN 以图片面积过大拒绝处理，返回链接不代表下载一定成功
+- 年度预算设置、父子分类预算写入及部分异常登录状态只有离线覆盖；其他客户端平台与容器部署未在本轮完成验收
+- 尚无创建账本、创建/编辑资产、上传附件、标签组改名等工具；服务提供债务查询，但不覆盖 App 的所有债务管理操作
+- 分类“连账单删除”不会回滚账户余额；需要回滚时应先正常删除账单、核对余额，再删除空分类
+- 空标签组暂不在查询结果中显示；删除标签后历史账单可能保留旧标签 ID
+- 预算设置需读取并提交完整期间列表，服务会保留其他额度并回读核对，但无法保证与 App 同时编辑时的原子性
+
+2026-10-18 预算功能回归：**193 项通过、1 项跳过**，类型检查通过。跳过的是 PostgreSQL / MySQL 的实库集成测试，因为没有配置专用测试数据库。SQLite 和离线业务测试已经运行；外部数据库尚未实测，不影响默认 SQLite 下的记账流程。
 
 ## 快速开始
 
@@ -36,23 +99,49 @@ bun -e "import { randomBytes } from 'node:crypto'; console.log('mt_pat_' + rando
 
 请立即保存输出结果，服务不会自动显示或找回这枚 PAT。
 
-### 2. 启动容器
+### 2. 启动服务
+
+个人本地使用可以直接运行源码，需要 Bun 1.3.14 或更高版本。在仓库根目录执行：
+
+```bash
+bun install --frozen-lockfile
+```
+
+Windows PowerShell：
+
+```powershell
+$env:QIANJI_MCP_ADMIN_PAT = 'mt_pat_替换为刚才生成的完整PAT'
+$env:QIANJI_MCP_PUBLIC_URL = 'http://127.0.0.1:3000'
+bun run start
+```
+
+macOS / Linux Shell：
+
+```bash
+QIANJI_MCP_ADMIN_PAT='mt_pat_替换为刚才生成的完整PAT' \
+QIANJI_MCP_PUBLIC_URL='http://127.0.0.1:3000' bun run start
+```
+
+默认仅监听本机，SQLite 文件为 `data/qianji.db`。保持服务进程运行，再连接 AI 客户端。
+
+<details>
+<summary>也可以使用 Docker</summary>
 
 在仓库根目录构建本 fork 的代码：
 
 ```bash
 docker build -t qianji-bridge:local .
 docker run --rm --name qianji-bridge \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   -v qianji-mcp-data:/data \
   -e QIANJI_MCP_ADMIN_PAT='mt_pat_...' \
   -e QIANJI_MCP_PUBLIC_URL='http://127.0.0.1:3000' \
   qianji-bridge:local
 ```
 
-容器监听 `0.0.0.0:3000`，SQLite 数据库保存在 `/data/qianji.db`。
+容器内部监听 `0.0.0.0:3000`，上例仅向宿主机本地地址映射端口，SQLite 数据库保存在 `/data/qianji.db`。
 
-远程部署时，将 `QIANJI_MCP_PUBLIC_URL` 改为 MCP Client 实际访问的基础地址，例如 `https://mcp.example.com`。
+远程部署时，通过 HTTPS 反向代理转发到服务，并将 `QIANJI_MCP_PUBLIC_URL` 改为 MCP Client 实际访问的基础地址，例如 `https://mcp.example.com`。上例的端口映射适用于宿主机上的代理；其他部署方式需按代理所在位置配置网络。
 
 绑定页面也必须通过该公开地址访问。`POST /connect` 优先校验 `Origin`，缺失时校验 `Referer` 是否与该公开地址同源，同时拒绝 `Sec-Fetch-Site` 标记的跨站请求；反向代理应保留这些来源头，无来源头的客户端仍须提供有效的一次性 `ticket`。
 
@@ -63,7 +152,9 @@ ghcr.io/nadouking/qianji-bridge:latest
 ghcr.io/nadouking/qianji-bridge:<7-character-commit-id>
 ```
 
-### 3. 连接 MCP Client
+</details>
+
+### 3. 连接 AI 客户端
 
 MCP 地址为：
 
@@ -91,50 +182,10 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 
 绑定完成后重新调用原工具，钱迹登录状态失效时，工具会再次要求连接。
 
-### 4. 开始使用
-
-- 需要按账本、资产、分类、标签或成员筛选，或者写入时缺少可信 ID，才调用对应查询工具获取，不得猜测或构造 ID
-- 使用 `list_bills` 批量盘点、查重或只读对账，需要完整筛选范围时继续翻页到 `nextCursor=null`，批量判断转账方向时直接读取摘要的 `fromId` 和 `targetId`，需要资产名称时只调用一次 `list_assets` 建立 ID 映射
-- 列表字段无歧义时不要逐条调用 `get_bill`，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才读取单笔详情，写入成功后直接使用写入工具返回的完整账单
-- 钱迹在其他设备发生变化后，调用 `refresh_cache` 获取最新数据
-- 需要查看账单附件时，读取 `get_bill` 的 `bill.imageUrls`：按原顺序返回 HTTPS 原图地址，没有附件时为 `[]`；账单列表保持精简，不附带图片地址。服务返回地址，由具备图像读取能力的客户端按需下载或展示，不提供 OCR，也不修改附件
-- 创建、修改、退款、报销和删除操作会直接写入钱迹，请先确认参数
-
-### 账单附件图片
-
-完整账单（包括写入成功后返回的账单）包含 `imageUrls`，例如：
-
-```json
-{
-  "imageUrls": [
-    "https://billimg.qianjiapp.com/example-image-key!webporigin",
-    "https://billimg.qianjiapp.com/example-image-key_hg!huge"
-  ]
-}
-```
-
-以上为虚构示例地址。地址按 Android 客户端 `Bill.getImageUrl(key, 2)` 规则生成：图片对象键以 `_hg` 结尾时使用 `!huge`，否则使用 `!webporigin`，并将当前图片 CDN 升级为 HTTPS。仅拼接裸对象键可能无法读取。该规则依赖钱迹客户端及当前 CDN，未来可能变化。
-
-图片地址的查询沿用原账单的账号访问控制，但返回后应视为私人资料，不公开传播或发送给无关第三方。客户端访问 CDN 时不应附带 MCP PAT、钱迹登录凭据或 cookie。服务不会为构造图片地址发起额外网络请求。
-
-### 分类与标签的批量写入
-
-批量操作按输入顺序执行，不是远端事务。参数先整体校验；若中途失败，`WRITE_PARTIAL` 消息会给出从 1 开始的 `completed`（已完成）、`unconfirmed`（结果未确认）与 `notAttempted`（尚未执行）序号。已完成项不得重试；未确认项需先查询核对，禁止直接重试整个批次。缓存清理失败时先调用 `refresh_cache`。
-
-分类删除的转移目标不能出现在本批次待删除分类中，`transferTo` 与 `deleteBills=true` 不可同时指定。删除分类会同步受影响账单并失效余额缓存；若同步失败，先用 `refresh_cache` 再核对账单和统计。
-
-分类的 `deleteBills=true` 路径会删除账单，但不回滚资产余额（Android 4.5.4 接口实测）；刷新缓存不会修复该差额。如需回滚余额，先核对范围并通过 `delete_bills` 删除账单，再删除空分类。有子分类时须先处理子分类，服务端会拒绝直接删除父分类。
-
-分类改名和标签局部更新会先读取最新目录，补齐未改动字段再提交；请避免在提交期间从其他客户端同时编辑同一项。删除标签组会将组内标签移到默认组；空标签组暂不显示在 `list_tags` 的分组列表中。
-
-分类移动会先读取当前层级：一级降为二级和二级提升为一级使用层级调整接口，二级分类换父级使用移动接口。非空分类删除必须选择转移或删除其账单，省略两者会被服务端拒绝。账单查询中 `categoryId` 是精确筛选；需要包含子分类时使用 `categoryIds` 和 `includeSubcategories`。
-
 ## 配置
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
-| 分类管理 | `create_categories`、`create_subcategories`、`update_categories`、`delete_categories`、`check_category_deletion`、`move_category`、`reorder_categories`、`list_category_icons` |
-| 标签管理 | `create_tag_groups`、`delete_tag_groups`、`create_tags`、`update_tags`、`delete_tags`、`archive_tags`、`reorder_tags`、`reorder_tag_groups` |
 | `QIANJI_MCP_ADMIN_PAT` | 是 | 无 | 超级管理员 PAT，必须以 `mt_pat_` 开头，后接至少 32 个随机字符 |
 | `QIANJI_MCP_PUBLIC_URL` | 否 | `http://<host>:<port>` | MCP Client 实际访问的基础地址，只能包含协议、主机和可选端口 |
 | `QIANJI_MCP_HOST` | 否 | `127.0.0.1` | HTTP 监听地址，Docker 镜像默认为 `0.0.0.0` |
@@ -149,7 +200,11 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 
 ### 数据库
 
-不设置 `QIANJI_MCP_DATABASE_URL` 时使用 SQLite，无需额外服务。外部数据库支持：
+数据库是服务内部保存登录令牌、账号绑定、同步进度和账单缓存的地方，不是交给 AI 的 Excel 账单。
+
+默认 SQLite 就是一个本地数据库文件，无需额外安装数据库。个人使用可保持默认配置；PostgreSQL / MySQL 是部署时的可选替代方案，不影响“把 Excel 交给 AI 核对”的流程。
+
+外部数据库支持：
 
 ```text
 postgres://user:password@host/database
@@ -177,22 +232,50 @@ https://qianjiga.litangkj.com
 
 </details>
 
-## MCP 工具
+## 使用要点
 
-| 使用场景 | 工具 |
-|---|---|
-| 账号登录与解绑 | `connect_qianji`、`disconnect_qianji` |
-| 查询基础数据 | `list_books`、`list_book_members`、`list_assets`、`list_categories`、`list_tags`、`get_user_info` |
-| 查询借入或借出详情 | `list_debt_accounts` |
-| 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bill_statistics`、`refresh_cache` |
-| 查询预算使用情况 | `get_budget` |
-| 设置单项总预算或分类预算 | `set_budget` |
-| 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
-| 删除普通收支、待报销支出、转账或还款 | `delete_bills` |
-| 转账与信用卡还款 | `create_transfer`、`update_transfer` |
-| 退款 | `create_refund`、`update_refund`、`delete_refund` |
-| 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` |
-| PAT 管理，仅超级管理员 | `list_pats`、`create_pat`、`delete_pat` |
+### 核对与写入
+
+- 需要按账本、资产、分类、标签或成员筛选，或者写入时缺少可信 ID，才调用对应查询工具获取，不得猜测或构造 ID
+- 使用 `list_bills` 批量盘点、查重或只读对账，需要完整筛选范围时继续翻页到 `nextCursor=null`，批量判断转账方向时直接读取摘要的 `fromId` 和 `targetId`，需要资产名称时只调用一次 `list_assets` 建立 ID 映射
+- 列表字段无歧义时不要逐条调用 `get_bill`，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才读取单笔详情，写入成功后直接使用写入工具返回的完整账单
+- 钱迹在其他设备发生变化后，调用 `refresh_cache` 获取最新数据
+- 需要查看账单附件时，读取 `get_bill` 的 `bill.imageUrls`：按原顺序返回 HTTPS 图片读取地址，没有附件时为 `[]`；账单列表保持精简，不附带图片地址。服务返回地址，由具备图像读取能力的客户端按需下载或展示，不提供 OCR，也不修改附件
+- 创建、修改、退款、报销和删除操作会直接写入钱迹，请先确认参数
+
+### 账单附件图片
+
+完整账单（包括写入成功后返回的账单）包含 `imageUrls`，例如：
+
+```json
+{
+  "imageUrls": [
+    "https://billimg.qianjiapp.com/example-image-key!webporigin",
+    "https://billimg.qianjiapp.com/example-image-key_hg!huge"
+  ]
+}
+```
+
+以上为虚构示例地址。地址按 Android 客户端 `Bill.getImageUrl(key, 2)` 规则生成：图片对象键以 `_hg` 结尾时使用 `!huge`，否则使用 `!webporigin`，并将当前图片 CDN 升级为 HTTPS。仅拼接裸对象键可能无法读取。该规则依赖钱迹客户端及当前 CDN，未来可能变化。
+
+已知边界：超长图片可能被钱迹 CDN 以 `image area too large` 拒绝处理，即使链接生成正确也无法打开。本轮样本在 App 中也无法读取；服务不提供绕过访问限制的原图下载，也不能保证所有长图可用。
+
+图片地址的查询沿用原账单的账号访问控制，但返回后应视为私人资料，不公开传播或发送给无关第三方。客户端访问 CDN 时不应附带 MCP PAT、钱迹登录凭据或 cookie。服务不会为构造图片地址发起额外网络请求。
+
+### 分类与标签的批量写入
+
+批量操作按输入顺序执行，不是远端事务。参数先整体校验；若中途失败，`WRITE_PARTIAL` 消息会给出从 1 开始的 `completed`（已完成）、`unconfirmed`（结果未确认）与 `notAttempted`（尚未执行）序号。已完成项不得重试；未确认项需先查询核对，禁止直接重试整个批次。缓存清理失败时先调用 `refresh_cache`。
+
+分类删除的转移目标不能出现在本批次待删除分类中，`transferTo` 与 `deleteBills=true` 不可同时指定。删除分类会同步受影响账单并失效余额缓存；若同步失败，先用 `refresh_cache` 再核对账单和统计。
+
+分类的 `deleteBills=true` 路径会删除账单，但不回滚资产余额（Android 4.5.4 接口实测）；刷新缓存不会修复该差额。如需回滚余额，先核对范围并通过 `delete_bills` 删除账单，再删除空分类。有子分类时须先处理子分类，服务端会拒绝直接删除父分类。
+
+分类改名和标签局部更新会先读取最新目录，补齐未改动字段再提交；请避免在提交期间从其他客户端同时编辑同一项。删除标签组会将组内标签移到默认组；空标签组暂不显示在 `list_tags` 的分组列表中。
+
+分类移动会先读取当前层级：一级降为二级和二级提升为一级使用层级调整接口，二级分类换父级使用移动接口。非空分类删除必须选择转移或删除其账单，省略两者会被服务端拒绝。账单查询中 `categoryId` 是精确筛选；需要包含子分类时使用 `categoryIds` 和 `includeSubcategories`。
+
+<details>
+<summary>工具参数和金额规则</summary>
 
 ### 调用时需要注意
 
@@ -222,7 +305,7 @@ https://qianjiga.litangkj.com
 - 业务金额必须大于 0、不超过 `9,999,999,999.99` 且最多两位小数，手续费和优惠不能大于 `money`
 - 账号需要迁移新版报销时，首次 `reimburse_bills` 会明确提示迁移影响，向用户说明“迁移后旧版本将不能继续使用报销”并取得明确同意后，使用相同业务参数并将 `confirmReimbursementUpgrade` 设为 `true` 重试，服务器只会在钱迹明确要求时迁移并重试一次，不会为已升级账号主动迁移
 
-## 使用要点
+</details>
 
 ### 数据同步
 
@@ -231,7 +314,7 @@ https://qianjiga.litangkj.com
 - 写操作会在远端成功后同步确认
 
 > [!IMPORTANT]
-> 写后确认失败不表示远端已经回滚，请按错误提示调用 `refresh_cache`，使本地缓存与远端状态重新一致。
+> 写后确认失败不表示远端已经回滚，账单或目录按提示调用 `refresh_cache` 后核对，预算直接调用 `get_budget` 回读；不要盲目重复写入。
 
 ### 写入额度
 
@@ -243,6 +326,8 @@ https://qianjiga.litangkj.com
 每日额度按 `Asia/Shanghai` 自然日和钱迹 UID 计算，同一 UID 的多枚 PAT 共享额度，批量报销和关联删除分别按一次调用计数。
 
 ## 安全须知
+
+登录时，网页将密码转换为 MD5 后交给服务转发给钱迹；当前实现不将密码或密码 MD5 持久化到数据库。登录成功后保存钱迹返回的登录令牌、账号标识和设备标识。MD5 是摘要，不是可代替 HTTPS 的加密保护；该摘要在此协议中可能被重放用于登录。登录令牌与 MCP PAT 也都需要按凭据保管。
 
 > [!CAUTION]
 > PAT 在数据库中明文保存，完整 Token 仅在创建时返回一次，数据库、备份、PAT 创建结果和相关模型会话都必须按凭据管理。
@@ -273,23 +358,17 @@ https://qianjiga.litangkj.com
 
 </details>
 
-## 开发者信息
+## 开发与后续方向
 
-修改代码或文档前先读 [AGENTS.md](AGENTS.md) 和[分支与工作目录规范](docs/development-workflow.md)。本 fork 的日常维护 PR 提交到 `NadouKing/qianji-bridge`。
+项目使用 TypeScript + Bun，保持现有扁平目录即可：
 
-服务器级 MCP 使用流程维护在 [`src/server-instructions.md`](src/server-instructions.md)，修改后会同时用于旧版 `initialize` 和新版 `server/discover` 响应。
+| 位置 | 内容 |
+|---|---|
+| `src/` | MCP 工具、钱迹接口、业务规则、认证、缓存与存储 |
+| `test/` | 模拟网络的业务测试、HTTP 集成测试和可选外部数据库测试 |
+| `docs/` | 开发规范、兼容性与真实联调记录 |
 
-<details>
-<summary>从源码运行</summary>
-
-需要 Bun 1.3.14 或更高版本：
-
-```bash
-bun install --frozen-lockfile
-QIANJI_MCP_ADMIN_PAT='mt_pat_...' bun run start
-```
-
-默认监听 `127.0.0.1:3000`，SQLite 数据库保存在 `data/qianji.db`。
+修改前阅读 [AGENTS.md](AGENTS.md) 和[分支与工作目录规范](docs/development-workflow.md)。本 fork 的维护 PR 提交到 `NadouKing/qianji-bridge`。AI 调用工具时的操作说明位于 [src/server-instructions.md](src/server-instructions.md)。
 
 ```bash
 bun run dev
@@ -297,52 +376,18 @@ bun run typecheck
 bun test
 ```
 
-</details>
+如果要补测 PostgreSQL / MySQL，分别配置 `QIANJI_TEST_POSTGRES_URL` 和 `QIANJI_TEST_MYSQL_URL`，指向专用测试数据库再运行测试。未配置的数据库不会被验收，不要用日常数据库运行测试。
 
-### 项目结构
+后续优先考虑这些实际问题，尚未承诺实现：
 
-源码保持扁平的 `src/` 结构，领域文件使用 `<领域>-<职责>.ts` 命名，通用且职责单一的模块使用简短名称。
+- 给批量记账增加可核对的写入计划和重复提交保护，减少重复记账
+- 按使用需要补账本/资产管理、空标签组查询等缺口
+- 增加独立环境下的外部数据库与跨平台验证
 
-<details>
-<summary>展开目录结构与文件说明</summary>
+当前规模不做目录重组。新增能力时保留图片链接、PAT 认证、账号隔离与既有数据兼容性。
 
-```text
-.
-├── src/
-│   ├── auth.ts                  # Bearer PAT 认证、账号绑定身份和管理员权限校验
-│   ├── bill-rules.ts            # 账单输入类型、ID 规范化、金额及退款关系等纯业务规则
-│   ├── bind-page.ts             # 钱迹账号绑定页面及浏览器端密码摘要计算
-│   ├── data-store.ts            # 数据存储契约、共享数据类型及默认 SQLite 实现
-│   ├── errors.ts                # 跨 HTTP 和 MCP 边界使用的稳定应用错误
-│   ├── http-server.ts           # HTTP 配置、路由、服务启动和优雅停机入口
-│   ├── ids.ts                   # 钱迹业务 ID 和哨兵值的公共校验规则
-│   ├── mcp-server.ts            # MCP Server 创建、业务工具及 PAT 管理工具注册
-│   ├── qianji-client.ts         # 钱迹私有 HTTP API、签名、协议序列化和响应规范化
-│   ├── qianji-mappers.ts        # 钱迹原始数据与 MCP 公开 DTO 之间的转换
-│   ├── qianji-service.ts        # 账号、缓存、同步、配额及账单写入流程编排
-│   ├── server-instructions.md   # 新旧 MCP 协议共用的服务器级使用说明
-│   ├── server-store.ts          # PostgreSQL 和 MySQL 数据存储实现
-│   ├── sqlite-schema.ts         # 默认 SQLite 数据库 Schema
-│   └── text-assets.d.ts         # Markdown 文本资源的 TypeScript 类型声明
-├── test/
-│   ├── auth-data-store.test.ts  # PAT、账号绑定、SQLite 迁移和数据隔离测试
-│   ├── context.ts               # Bun 测试包装器及逆序执行的资源清理机制
-│   ├── mcp-http.test.ts         # MCP 协议、HTTP 路由、Schema 和连接流程集成测试
-│   ├── qianji-client.test.ts    # 钱迹签名、序列化、接口请求和响应规范化测试
-│   ├── qianji-service.test.ts   # 缓存、同步、配额及各类账单业务流程测试
-│   └── server-store.test.ts     # PostgreSQL 和 MySQL 存储契约集成测试
-├── .dockerignore                # Docker 构建上下文排除规则
-├── .gitignore                   # Git 忽略规则
-├── Dockerfile                   # 容器镜像构建和服务启动配置
-├── bun.lock                     # Bun 依赖锁定文件
-├── package.json                 # 项目元数据、依赖和开发命令
-├── tsconfig.json                # TypeScript 严格类型检查配置
-├── LICENSE                      # MIT 许可证
-└── README.md                    # 使用说明和项目结构文档
-```
-
-</details>
+从 `qianji-mcp` 改名后，仍保留 `QIANJI_MCP_*` 环境变量、`/mcp` 地址、PAT 格式、数据库结构和原数据卷名；改仓库名无需迁移运行数据。代码更新、PR 合并、镜像发布和实际部署是不同步骤，不会因为修改 README 自动升级正在运行的服务。
 
 ## 许可证
 
-[MIT](LICENSE)
+[MIT](LICENSE)，保留原作者 ZhengJin 的版权声明及贡献者信息。
