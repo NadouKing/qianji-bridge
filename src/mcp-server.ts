@@ -655,7 +655,7 @@ export function createMoneyTrackMcp(
   bindingTickets: BindingTicketManager,
 ): McpServer {
   const server = new McpServer(
-    { name: "qianji-remote-mcp", version: "0.1.0" },
+    { name: "qianji-bridge", version: "0.1.0" },
     { instructions: serverInstructions.trim() },
   );
 

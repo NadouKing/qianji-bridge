@@ -30,7 +30,7 @@ test("ctrl/act 只接受两段接口路径", () => {
 });
 
 test("已确认的 reqidv2 算法可用固定时钟复现", () => {
-  assert.equal(createReqidv2("category", "listv2", 1_770_000_000_000), "a49200e153e3e61720772d44f8fba407");
+  assert.equal(createReqidv2("category", "listv2", 1_770_000_000_000), "e22405eab2a3e6a5da921c2d0c829be0");
 });
 
 test("JSON 解析和序列化不丢失 64 位业务 ID", () => {
@@ -110,7 +110,7 @@ test("钱迹账单的 assetId、fromId 和 targetId 拒绝 0", async () => {
   }
 });
 
-test("统一 Client 使用 Android 4.5.1b3 公共头并直接转发登录密码 MD5", async () => {
+test("统一 Client 使用 Android 4.5.4 公共头并直接转发登录密码 MD5", async () => {
   let captured: { url: string; headers: Headers; body: URLSearchParams; redirect?: RequestRedirect } | undefined;
   const passwordMd5 = md5("plain-password");
   const client = new QianjiClient({
@@ -141,9 +141,9 @@ test("统一 Client 使用 Android 4.5.1b3 公共头并直接转发登录密码 
   assert.equal(captured?.headers.get("devname"), "MCP");
   assert.equal(captured?.headers.get("os"), "1");
   assert.equal(captured?.headers.get("pkg"), "com.mutangtech.qianji");
-  assert.equal(captured?.headers.get("vs"), "1207");
-  assert.equal(captured?.headers.get("vsn"), "4.5.1b3");
-  assert.equal(captured?.headers.get("mk"), "beta");
+  assert.equal(captured?.headers.get("vs"), "1234");
+  assert.equal(captured?.headers.get("vsn"), "4.5.4");
+  assert.equal(captured?.headers.get("mk"), "guanwang");
   assert.equal(captured?.headers.get("ctrl"), "account");
   assert.equal(captured?.headers.get("act"), "login");
   assert.equal(captured?.headers.get("devid"), "DEVICE-ID");
@@ -369,8 +369,11 @@ test("调试日志记录上游原始内容并递归脱敏 token 字段", async (
   assert.equal(line.includes("response-token"), false);
   assert.equal(line.includes("nested-token"), false);
   assert.equal(line.includes("HEADER-DEVID"), false);
-  assert.equal(statSync(logDirectory).mode & 0o777, 0o700);
-  assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  // POSIX mode 位不适用于 Windows；该平台的 ACL 不由此断言验证。
+  if (process.platform !== "win32") {
+    assert.equal(statSync(logDirectory).mode & 0o777, 0o700);
+    assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  }
 });
 
 test("登录失败区分账号密码不匹配和成功响应字段缺失", async () => {

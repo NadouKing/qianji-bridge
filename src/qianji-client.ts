@@ -18,9 +18,9 @@ const CLIENT_PROFILE = {
   os: "1",
   osvs: "36",
   pkg: "com.mutangtech.qianji",
-  vs: "1207",
-  vsn: "4.5.1b3",
-  mk: "beta",
+  vs: "1234",
+  vsn: "4.5.4",
+  mk: "guanwang",
   devbrand: "MCP",
   devname: "MCP",
 } as const;
@@ -112,13 +112,13 @@ export function extractCtrlAct(path: string): { ctrl: string; act: string } {
   return { ctrl: parts[0]!, act: parts[1]! };
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算路径对应的 `tok`。 */
+/** 沿用已验证签名算法，由请求标识和接口路径计算 `tok`。 */
 export function createTok(reqidv2: string, ctrl: string, act: string): string {
   const encReqid = md5(reqidv2 + TOK_SECRET);
   return md5(reqidv2 + "1172020" + ctrl + encReqid + act);
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算 `reqidv2`，时间可注入以支持确定性测试。 */
+/** 沿用已验证签名算法，并使用当前 Android 请求版本计算 `reqidv2`，时间可注入以支持确定性测试。 */
 export function createReqidv2(ctrl: string, act: string, epochMs = Date.now()): string {
   const shiftedMs = epochMs + Number(CLIENT_PROFILE.vs) + 9_081_127;
   return md5(CLIENT_PROFILE.pkg + String(shiftedMs) + ctrl + act + REQID_SECRET);
@@ -358,7 +358,7 @@ export class QianjiClient {
       v: input.name,
       t: input.type,
     };
-    if (input.parentId !== undefined) body.parentid = input.parentId;
+    if (input.parentId !== undefined && input.parentId !== "-1") body.parentid = input.parentId;
     if (input.icon !== undefined) body.icon = input.icon;
     const data = await this.authPost(account, "/category/submitv2", body);
     if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
@@ -377,9 +377,8 @@ export class QianjiClient {
     categoryId: string,
     options: { transferTo?: string; deleteBills?: boolean } = {},
   ): Promise<void> {
-    const body: Record<string, string | number> = { did: categoryId };
+    const body: Record<string, string | number> = { did: categoryId, deletebills: options.deleteBills ? 1 : 0 };
     if (options.transferTo !== undefined) body.newcateid = options.transferTo;
-    if (options.deleteBills) body.deletebills = 1;
     await this.authPost(account, "/category/deletev2", body);
   }
 
@@ -389,7 +388,7 @@ export class QianjiClient {
     categoryId: string,
   ): Promise<{ count: number; other?: unknown }> {
     const data = asObject(await this.authPost(account, "/category/deletecheckv2", { did: categoryId }));
-    const count = Number(data.count ?? 0);
+    const count = data.count === undefined || data.count === null ? Number.NaN : Number(data.count);
     if (!Number.isInteger(count) || count < 0) {
       throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效账单数", 502);
     }
@@ -403,7 +402,7 @@ export class QianjiClient {
 
   /** 调整分类层级，`parentId` 传 `-1` 时提升为一级分类。 */
   async changeCategoryLevel(account: QianjiAccount, categoryId: string, parentId: string): Promise<void> {
-    await this.authPost(account, "/category/changelevel", { did: categoryId, parentid: parentId });
+    await this.authPost(account, "/category/changelevel", { did: categoryId, ...(parentId !== "-1" ? { parentid: parentId } : {}) });
   }
 
   /** 按给定 ID 顺序重排分类，`v` 使用保持精度的 JSON 数字数组。 */

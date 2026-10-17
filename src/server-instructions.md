@@ -56,6 +56,7 @@
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
 - 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
 - 分类：使用 `delete_categories` 的 `deletions`，可选择把账单转移到其他分类或连同账单一起删除
+  - 转移目标不能是本批次待删除分类；不得同时指定转移账单和删除账单。操作后调用 `refresh_cache`，再核对受影响账单和统计
 - 标签：使用 `delete_tags` 的 `tagIds`，删除标签组使用 `delete_tag_groups` 的 `groupIds`，保留标签但不再使用可改用 `archive_tags` 的 `tagIds` 归档
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，账号未被其他 PAT 使用时会删除全部本地数据，不会删除钱迹云端数据
 
@@ -70,6 +71,7 @@
   4. 除上述两种完整链接形式外，不得索取、提取或复述账号、密码、PAT 或链接中的一次性 `ticket`
 - 需要确认钱迹最新状态时，调用 `refresh_cache` 刷新用户、账单及全部目录缓存，包含币种目录，若收到 `WRITE_CONFIRMATION_FAILED`，远端写入可能已经生效，刷新后查询相关账单，仍无法确认时停止并告知用户，不得自动重试原写入
 - 批量写入收到 `WRITE_PARTIAL` 时，按错误中的输入序号确认每一项结果，成功项已经写入，不得重试，只处理冲突或未确认项
+  - 分类或标签批量写入的序号从 1 开始：`completed` 已完成，`unconfirmed` 结果未知，`notAttempted` 未执行；未确认不等于失败，须查询核对后才能决定是否补做，不得重试整个批次。缓存清理失败时先调用 `refresh_cache`
 
 ### 数据约定
 

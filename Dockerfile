@@ -13,7 +13,7 @@ RUN bun run typecheck && bun test
 
 FROM oven/bun:1.3.14-slim
 
-LABEL org.opencontainers.image.source="https://github.com/fangzhengjin/qianji-mcp" \
+LABEL org.opencontainers.image.source="https://github.com/NadouKing/qianji-bridge" \
       org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app

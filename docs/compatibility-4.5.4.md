@@ -1,0 +1,89 @@
+# Android 4.5.4 兼容性检查与人工验收
+
+检查日期：2026-10-17。本轮以 Android 官方 APK 为协议依据，不以 Windows 界面推断安卓请求格式。
+
+## 版本与证据
+
+| 对象 | 版本或状态 |
+|---|---|
+| 此前本地分析的 APK | Android 4.5.3 / versionCode 1230（读取旧 APK Manifest） |
+| 原 MCP 的请求配置 | 4.5.1b3 / 1207 / beta |
+| 本轮官网 APK | Android 4.5.4 / 1234 / guanwang（读取 Manifest 和 APP_MARKET_NAME） |
+| 本 PR 的请求配置 | 4.5.4 / 1234 / guanwang；设备标识仍由服务自身提供 |
+| 上游 main | `90a8b8a3aff5c4237b386761407824f7978714e4`，检查时没有后续提交 |
+
+来源：[官方 Android 更新记录](https://docs.qianjiapp.com/change-log/change_log_android.html)、[官方 APK](https://app.qianjiapp.com/qianji_454_1234_gw.apk)。
+
+APK SHA-256：`f7afc6220029fbe7d6f85b60105fb890caac8a880721a3c7ffc3dd7447a167b8`。
+页面的下载文件是 4.5.4，但部分日志标题仍写 4.5.3-1230，日期也有重复；本次以实际 APK Manifest 为版本依据。
+JADX 1.5.6 导出存在 43 个方法还原错误；本次检查的下列接口类、公共头和图片方法可读，不代表整个应用已完整还原。
+APK、反编译源码、真实账号数据不提交到本仓库。
+
+官方近期日志涉及截图 AI 记账、批量图片下载、筛选和导出改进等客户端功能；它们不意味着本桥接服务已提供这些功能。
+当前图片功能仍是账单详情返回原图 URL，不承担上传、OCR 或打包下载。
+
+## 本次核对与调整
+
+- 公共头：`sa.a` / `za.h` 从 Manifest 读取版本和渠道；本 PR 更新对应配置，`reqidv2` 使用相同版本号参与计算。
+- 签名：`JNIHelper` 的 Java 组合结构与现有算法一致；旧、新 APK 的 arm64 `libfabricsuffer.so` 字节一致（SHA-256 `441122805c78ab4b1a0435d42495c2beecfbde626baf9880e08187c40cf2f7e3`）。没有声称重新完整逆向本机库。
+- 公共接口冒烟：使用随机设备标识、没有账号或登录凭据，调用 `/client/checkupdate`，新版签名请求返回成功、`data={}`。这只验证公开接口接受该请求，不能替代登录后业务验证。
+- 分类：对照 `com.mutangtech.qianji.network.api.category.a`，删除明确发送 `deletebills=0/1`；创建和提升一级分类时不把 `-1` 作为 `parentid` 发出。
+- 分类删除影响检查：缺失或无效 `count` 不再当成零笔账单。
+- 批量分类/标签：参数先整体校验，失败时仍失效当前账号缓存；返回从 1 开始的已完成、未确认、未执行序号，禁止整批盲重试。
+- 分类缓存失效不再依赖账本列表，覆盖默认作用域和已不在账本列表内的缓存，不清其他账号或其他种类缓存。
+- 删除分类后同步受影响账单并失效资产余额缓存；若同步失败，返回已完成状态及刷新提示。
+- 图片：`Bill.getImageUrl` 的 `_hg`、`!huge`、`!webporigin` 规则不变；继续使用 HTTPS、对象键编码和账号隔离。
+- 保留环境变量 `QIANJI_MCP_*`、PAT、`/mcp` 路径、数据库结构和既有数据卷。仓库改名不迁移本机运行数据。
+
+## 功能清单
+
+共 44 个 MCP 工具：原有 28 个、新增 16 个。下列“已检查”指源码、APK 接口或离线模拟测试；全部登录后的真人业务验收仍待完成。
+
+| 范围 | 工具 | 已检查 / 人工验收重点 |
+|---|---|---|
+| 连接 | `connect_qianji`、`disconnect_qianji` | 一次性绑定链接、PAT/UID 约束、绑定页同源限制、解绑行为有模拟测试；用独立测试账号验证登录失效和重登，勿解绑生产账号 |
+| 用户与刷新 | `get_user_info`、`refresh_cache` | `/client/init`、`/syncv2/pull` 入口存在；测试首次同步门禁、分页、失败可见性、额度与共享 UID；人工核对客户端改动后刷新结果 |
+| 账本和成员 | `list_books`、`list_book_members` | `/book/list`、`/book/members` 入口存在；验证可见性、成员和 ID；人工检查共享账本、隐藏账本 |
+| 资产和债务 | `list_assets`、`list_debt_accounts` | `/asset/list`、`/asset/listloan` 入口存在；余额默认隐藏、借入借出与币种解析有测试；人工核对隐藏资产、还清债务 |
+| 分类与标签查询 | `list_categories`、`list_tags` | `/category/listv2`、`/tag/list` 及分组结构已对照；人工核对子分类、归档标签和默认账本 |
+| 账单查询 | `list_bills`、`get_bill` | 本地同步数据筛选、游标、ID 精度、账号隔离、附件有测试；人工检查时间范围、分页、退款关联和普通图/长图 |
+| 统计和预算 | `get_bill_statistics`、`get_budget` | 本地统计规则及 `/budget/list` 的日期筛选、`range` 已对照；人工按相同日期、币种、不计入选项与 App 核对 |
+| 普通收支 | `create_bills`、`update_bills`、`delete_bills` | `/bill/syncall` 入口和本地写入确认、部分成功、退款/报销关联限制有测试；人工只在测试账本验证金额、分类、标签、日期和删除范围 |
+| 转账/信用卡还款 | `create_transfer`、`update_transfer` | 通过账单同步写入，转入转出、手续费/优惠与币种有测试；人工检查双边余额与还款标识 |
+| 退款 | `create_refund`、`update_refund`、`delete_refund` | `/bill/refund2` 和账单同步入口存在，关系和限额有测试；人工验证部分退款、二次退款、修改及删除后的原账单 |
+| 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` | `/baoxiao/baoxiao`、`upgradev2`、`cancelbaoxiao` 参数已对照；迁移确认、关系、币种和配额有测试；人工验证部分/整笔报销及取消，不自动同意账号迁移 |
+| 分类创建 | `create_categories`、`create_subcategories` | `submitv2`、`submitmultiple` 参数、父级、默认账本已检查；人工验证同名项、重复子分类返回及刷新后显示 |
+| 分类变更 | `update_categories`、`move_category`、`reorder_categories` | `submitv2`、`movesubcate`、`changelevel`、`reorder3` 已检查；人工重点检查改名后类型/图标/账本是否保留、提升/移动后的子分类结构 |
+| 分类删除与图标 | `delete_categories`、`check_category_deletion`、`list_category_icons` | 删除参数、影响数量、目标冲突与刷新有测试；人工验证转移账单与连账单删除两条独立路径及图标显示 |
+| 标签组 | `create_tag_groups`、`delete_tag_groups`、`reorder_tag_groups` | `submitgroup`、`deletegroup`、`reordergroup` 已对照；人工验证组排序、删除组后标签归属（是否移动或级联由服务端决定） |
+| 标签 | `create_tags`、`update_tags`、`delete_tags`、`archive_tags`、`reorder_tags` | `submittag`、`deletetag`、`archivetag`、`reordertag` 已对照；人工重点检查仅改名/仅改色/仅改组时其他字段是否保持，以及历史账单标签 |
+| PAT 管理 | `list_pats`、`create_pat`、`delete_pat` | 仅管理员可调用，账号隔离和最后一个 PAT 清理逻辑有测试；人工使用专门测试 PAT，禁止拿在用 PAT 做删除实验 |
+
+分类改名目前使用 `did + v`，标签更新使用仅包含变化字段的 JSON。APK 对应提交方法携带更完整上下文；服务端是否支持这些精简更新，需要优先实测，不能只靠模拟响应证明。不应在生产分类/标签上首次验证。
+
+## 已完成的自动验证
+
+- Bun 1.3.14，锁文件安装检查、`bun run typecheck`、`git diff --check`。
+- `bun test`：186 通过、1 跳过、0 失败；全部业务测试使用虚构数据和模拟网络，本地 HTTP 集成测试不连接真实钱迹账号。
+- 新增回归覆盖默认分类缓存、跨账号隔离、9 种批量中途失败、全量参数预检、缓存失败后的成功提示，以及分类删除后的账单同步。
+- Windows 测试清理前回收临时 SQLite statement，避免已关闭数据库仍被句柄占用；POSIX mode 位断言仅在非 Windows 执行，Windows ACL 没有由这些断言验证。
+- 跳过的 PostgreSQL/MySQL 实库集成测试需要专门的临时数据库。SQL 的账号和种类边界已有离线检查，但不能据此宣称实库测试通过。
+- 未进行容器构建、发布、生产部署、重启或真实记账；未测试 iOS/Windows 客户端的跨端最终表现。
+
+## 一起验收的顺序
+
+1. 准备独立测试账号、测试账本和测试资产；标签可能是账号全局的，仅新建账本不能完全隔离。若暂时只有生产账号，先做只读验证。
+2. 用户确认客户端平台、完整版本号。先验收账本、资产、分类、标签、账单查询和图片，再核对一段固定日期的统计/预算。
+3. 使用测试分类和测试标签完成“创建 → 改名 → 移动/改色 → 排序 → 归档/删除”。优先验证上表提到的精简更新是否保留其他字段。
+4. 在测试账本用 1 元、2 元等虚构金额做收支 → 修改 → 转账/还款 → 退款 → 报销 → 删除，逐步在 App 核对金额、关联、余额及统计。
+5. 删除分类分别验证“转移账单”和“连账单删除”，检查刷新后列表、统计和资产余额；任何未确认写入先核对，禁止直接重试。
+6. 异常中断、服务器部分成功继续用模拟测试验证；不要故意在生产账号制造失败。
+
+反馈只需记录：工具名、客户端版本、虚构输入、预期结果、实际结果、是否已刷新。账号、金额明细、附件、令牌和真实日志不进入公开 issue、PR 或此文档。
+
+## 后续优化候选
+
+- 优先：完成精简更新、分类删除和标签组删除的真实验收；发现字段被覆盖时再按服务端实际行为补齐上下文。
+- 补充 Linux、PostgreSQL/MySQL 的持续集成验证，保留 Windows 本地测试。
+- 有需要再添加标签组改名、恢复归档标签；目前 16 个新增工具并未覆盖 App 的每个管理动作。
+- 把每次 APK 版本、哈希和协议差异记录成同类文档，避免只修改版本号就声称全面兼容。

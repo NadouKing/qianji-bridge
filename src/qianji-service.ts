@@ -369,28 +369,27 @@ export class MoneyTrackService {
     inputs: CreateCategoryInput[],
   ): Promise<{ categories: Record<string, unknown>[] }> {
     if (inputs.length === 0) throw new AppError("INVALID_CATEGORIES", "categories 不能为空");
-    return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+    const normalized = inputs.map((input) => ({
+      bookId: normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID),
+      name: normalizeCategoryName(input.name),
+      type: input.type,
+      parentId: input.parentId === undefined ? undefined : normalizeCategoryParentId(input.parentId),
+      icon: input.icon,
+    }));
+    return this.withBillAccount(accountId, async (account) => {
+      for (const bookId of new Set(normalized.map((input) => input.bookId))) {
+        await this.requireWritableBook(account, bookId);
+      }
+      return this.withCatalogWrite(account, "categories", inputs.length, async (markRemoteSuccess) => {
         const categories: Record<string, unknown>[] = [];
-        for (const input of inputs) {
-          const bookId = normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
-          await this.requireWritableBook(account, bookId);
-          const name = normalizeCategoryName(input.name);
-          const parentId = input.parentId === undefined ? undefined : normalizeCategoryParentId(input.parentId);
-          const created = await this.client.createCategory(account, {
-            bookId,
-            name,
-            type: input.type,
-            parentId,
-            icon: input.icon,
-          });
+        for (const input of normalized) {
+          const created = await this.client.createCategory(account, input);
           markRemoteSuccess();
           if (created) categories.push(publicCategory(created));
         }
-        await this.invalidateAllCategoryCaches(account.id);
         return { categories };
-      }),
-    );
+      });
+    });
   }
 
   /** 一次提交批量重命名分类，写入后使本地分类快照失效。 */
@@ -401,17 +400,17 @@ export class MoneyTrackService {
     if (updates.length === 0) throw new AppError("INVALID_CATEGORY_UPDATES", "updates 不能为空");
     const ids = updates.map(({ categoryId }) => normalizeCategoryId(categoryId));
     if (new Set(ids).size !== ids.length) throw new AppError("INVALID_CATEGORY_UPDATES", "updates 不能包含重复 categoryId");
+    const names = updates.map(({ name }) => normalizeCategoryName(name));
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "categories", updates.length, async (markRemoteSuccess) => {
         const categories: Array<{ categoryId: string; name: string }> = [];
-        for (const [index, update] of updates.entries()) {
+        for (const [index] of updates.entries()) {
           const categoryId = ids[index]!;
-          const name = normalizeCategoryName(update.name);
+          const name = names[index]!;
           await this.client.updateCategory(account, categoryId, name);
           markRemoteSuccess();
           categories.push({ categoryId, name });
         }
-        await this.invalidateAllCategoryCaches(account.id);
         return { categories };
       }),
     );
@@ -425,15 +424,22 @@ export class MoneyTrackService {
     if (deletions.length === 0) throw new AppError("INVALID_CATEGORY_DELETIONS", "deletions 不能为空");
     const ids = deletions.map(({ categoryId }) => normalizeCategoryId(categoryId));
     if (new Set(ids).size !== ids.length) throw new AppError("INVALID_CATEGORY_DELETIONS", "deletions 不能包含重复 categoryId");
+    const transfers = deletions.map((deletion) => {
+      const transferTo = deletion.transferTo === undefined ? undefined : normalizeCategoryId(deletion.transferTo);
+      if (transferTo !== undefined && ids.includes(transferTo)) {
+        throw new AppError("INVALID_CATEGORY_TRANSFER", "不能把账单转移到本批次待删除的分类");
+      }
+      if (transferTo !== undefined && deletion.deleteBills === true) {
+        throw new AppError("INVALID_CATEGORY_TRANSFER", "转移账单与删除账单不能同时选择");
+      }
+      return transferTo;
+    });
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "categories", deletions.length, async (markRemoteSuccess) => {
         const deleted: Array<{ categoryId: string; transferredTo?: string; billsDeleted: boolean }> = [];
         for (const [index, deletion] of deletions.entries()) {
           const categoryId = ids[index]!;
-          const transferTo = deletion.transferTo === undefined ? undefined : normalizeCategoryId(deletion.transferTo);
-          if (transferTo === categoryId) {
-            throw new AppError("INVALID_CATEGORY_TRANSFER", "不能把账单转移到被删除的分类本身");
-          }
+          const transferTo = transfers[index];
           await this.client.deleteCategory(account, categoryId, {
             transferTo,
             deleteBills: deletion.deleteBills === true,
@@ -445,9 +451,8 @@ export class MoneyTrackService {
             billsDeleted: deletion.deleteBills === true,
           });
         }
-        await this.invalidateAllCategoryCaches(account.id);
         return { deleted };
-      }),
+      }, true),
     );
   }
 
@@ -473,11 +478,10 @@ export class MoneyTrackService {
     const parentId = normalizeCategoryParentId(parentIdInput);
     if (parentId === categoryId) throw new AppError("INVALID_CATEGORY_PARENT", "父分类不能是分类本身");
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
         if (parentId === "-1") await this.client.changeCategoryLevel(account, categoryId, parentId);
         else await this.client.moveCategory(account, categoryId, parentId);
         markRemoteSuccess();
-        await this.invalidateAllCategoryCaches(account.id);
         return { categoryId, parentId };
       }),
     );
@@ -494,10 +498,9 @@ export class MoneyTrackService {
       throw new AppError("INVALID_CATEGORY_ORDER", "orderedCategoryIds 不能包含重复 ID");
     }
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
         await this.client.reorderCategories(account, ids);
         markRemoteSuccess();
-        await this.invalidateAllCategoryCaches(account.id);
         return { orderedCategoryIds: ids };
       }),
     );
@@ -520,7 +523,7 @@ export class MoneyTrackService {
     const names = input.names.map((name) => normalizeCategoryName(name));
     if (names.length === 0) throw new AppError("INVALID_CATEGORY_NAMES", "names 不能为空");
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
         await this.requireWritableBook(account, bookId);
         const result = await this.client.submitMultipleCategories(account, {
           bookId,
@@ -529,7 +532,6 @@ export class MoneyTrackService {
           names,
         });
         markRemoteSuccess();
-        await this.invalidateAllCategoryCaches(account.id);
         return { categories: result.list.map(publicCategory), repeats: result.repeats };
       }),
     );
@@ -551,14 +553,13 @@ export class MoneyTrackService {
     if (groups.length === 0) throw new AppError("INVALID_TAG_GROUPS", "groups 不能为空");
     const names = groups.map(({ name }) => normalizeTagName(name));
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", groups.length, async (markRemoteSuccess) => {
         const created: Record<string, unknown>[] = [];
         for (const name of names) {
           const group = await this.client.createTagGroup(account, name);
           markRemoteSuccess();
           if (group) created.push(publicTagGroup(group));
         }
-        await this.invalidateAllTagCaches(account.id);
         return { groups: created };
       }),
     );
@@ -575,12 +576,11 @@ export class MoneyTrackService {
       throw new AppError("INVALID_TAG_GROUP_DELETIONS", "groupIds 不能包含重复 ID");
     }
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", groupIds.length, async (markRemoteSuccess) => {
         for (const groupId of ids) {
           await this.client.deleteTagGroup(account, groupId);
           markRemoteSuccess();
         }
-        await this.invalidateAllTagCaches(account.id);
         return { deletedGroupIds: ids };
       }),
     );
@@ -598,14 +598,13 @@ export class MoneyTrackService {
       color: normalizeTagColor(tag.color),
     }));
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", tags.length, async (markRemoteSuccess) => {
         const created: Record<string, unknown>[] = [];
         for (const tag of normalized) {
           const result = await this.client.createTag(account, tag);
           markRemoteSuccess();
           if (result) created.push(publicTag(result));
         }
-        await this.invalidateAllTagCaches(account.id);
         return { tags: created };
       }),
     );
@@ -631,7 +630,7 @@ export class MoneyTrackService {
       };
     });
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", updates.length, async (markRemoteSuccess) => {
         const tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> = [];
         for (const update of normalized) {
           await this.client.updateTag(account, update.tagId, {
@@ -647,7 +646,6 @@ export class MoneyTrackService {
             ...(update.color !== undefined ? { color: update.color } : {}),
           });
         }
-        await this.invalidateAllTagCaches(account.id);
         return { tags };
       }),
     );
@@ -659,12 +657,11 @@ export class MoneyTrackService {
     const ids = tagIds.map(normalizeTagId);
     if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_DELETIONS", "tagIds 不能包含重复 ID");
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", tagIds.length, async (markRemoteSuccess) => {
         for (const tagId of ids) {
           await this.client.deleteTag(account, tagId);
           markRemoteSuccess();
         }
-        await this.invalidateAllTagCaches(account.id);
         return { deletedTagIds: ids };
       }),
     );
@@ -676,12 +673,11 @@ export class MoneyTrackService {
     const ids = tagIds.map(normalizeTagId);
     if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_ARCHIVES", "tagIds 不能包含重复 ID");
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", tagIds.length, async (markRemoteSuccess) => {
         for (const tagId of ids) {
           await this.client.archiveTag(account, tagId);
           markRemoteSuccess();
         }
-        await this.invalidateAllTagCaches(account.id);
         return { archivedTagIds: ids };
       }),
     );
@@ -698,10 +694,9 @@ export class MoneyTrackService {
       throw new AppError("INVALID_TAG_ORDER", "orderedTagIds 不能包含重复 ID");
     }
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", 1, async (markRemoteSuccess) => {
         await this.client.reorderTags(account, ids);
         markRemoteSuccess();
-        await this.invalidateAllTagCaches(account.id);
         return { orderedTagIds: ids };
       }),
     );
@@ -718,10 +713,9 @@ export class MoneyTrackService {
       throw new AppError("INVALID_TAG_GROUP_ORDER", "orderedGroupIds 不能包含重复 ID");
     }
     return this.withBillAccount(accountId, async (account) =>
-      this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      this.withCatalogWrite(account, "tags", 1, async (markRemoteSuccess) => {
         await this.client.reorderTagGroups(account, ids);
         markRemoteSuccess();
-        await this.invalidateAllTagCaches(account.id);
         return { orderedGroupIds: ids };
       }),
     );
@@ -1926,6 +1920,69 @@ export class MoneyTrackService {
     });
   }
 
+  /** 目录批量写入不是事务：失败也清缓存，按输入顺序报告已完成和未确认项。 */
+  private async withCatalogWrite<T>(
+    account: QianjiAccount,
+    kind: "categories" | "tags",
+    total: number,
+    operation: (markRemoteSuccess: () => void) => Promise<T>,
+    refreshBills = false,
+  ): Promise<T> {
+    return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      let completed = 0;
+      let result: T | undefined;
+      let failed = false;
+      let failure: unknown;
+      try {
+        result = await operation(() => {
+          completed += 1;
+          markRemoteSuccess();
+        });
+      } catch (error) {
+        failed = true;
+        failure = error;
+      }
+      // 不依赖账本列表是否存在；也清除默认作用域和已不在列表里的缓存。
+      // 即使请求报错也清除，因为响应丢失不能证明远端没有写入。
+      let cacheFailure: unknown;
+      try {
+        await this.store.invalidateCatalogCache(account.id, kind);
+        if (refreshBills && completed > 0) {
+          await this.store.invalidateCatalogCache(account.id, "assets", "");
+          await this.syncUnlocked(account);
+        }
+      } catch (error) {
+        cacheFailure = error;
+      }
+      if (failed || cacheFailure !== undefined) {
+        if (completed > 0) {
+          const progress = {
+            completed: Array.from({ length: completed }, (_, index) => index + 1),
+            unconfirmed: failed && completed < total ? [completed + 1] : [],
+            notAttempted: failed ? Array.from({ length: Math.max(0, total - completed - 1) }, (_, index) => completed + index + 2) : [],
+          };
+          const cause = safeError(failed ? failure : cacheFailure);
+          throw new AppError(
+            failed ? "WRITE_PARTIAL" : "WRITE_CONFIRMATION_FAILED",
+            `目录写入结果（序号从 1 开始）：${JSON.stringify(progress)}。${cause.code}：${cause.message}。` +
+              (cacheFailure !== undefined ? "本地缓存更新失败，请先调用 refresh_cache。" : "请查询目录核对未确认项。") +
+              "已完成项不得重试，未确认项不代表失败，不得直接重试整个批次。",
+            502,
+          );
+        }
+        if (failed) {
+          const cause = safeError(failure);
+          throw new AppError(cause.code,
+            `${cause.message}。第 1 项未确认，后续项未执行；请先刷新并核对目录，不得直接重试。` +
+              (cacheFailure !== undefined ? "本地缓存清理失败，请先调用 refresh_cache。" : ""),
+            cause.httpStatus);
+        }
+        throw cacheFailure;
+      }
+      return result as T;
+    });
+  }
+
   /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留。 */
   private async withBusinessWrite<T>(
     account: QianjiAccount,
@@ -2261,19 +2318,6 @@ export class MoneyTrackService {
       () => this.client.listCategories(account, bookId, -1),
       options,
     );
-  }
-
-  /** 分类写入后使账号内全部已缓存账本的分类快照失效。 */
-  private async invalidateAllCategoryCaches(accountId: number): Promise<void> {
-    const books = await this.store.getCatalogCache(accountId, "books", "");
-    for (const book of books?.data ?? []) {
-      await this.store.invalidateCatalogCache(accountId, "categories", String(book.bookid));
-    }
-  }
-
-  /** 标签写入后使账号的标签快照失效。 */
-  private async invalidateAllTagCaches(accountId: number): Promise<void> {
-    await this.store.invalidateCatalogCache(accountId, "tags", "");
   }
 
   /** 读取包含正常和归档标签的完整目录。 */

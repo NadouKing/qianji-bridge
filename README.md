@@ -1,18 +1,24 @@
-## qianji-mcp
+## qianji-bridge（钱迹桥接服务）
 
-qianji-mcp 是一个可自行部署的钱迹 MCP Server，它通过钱迹私有 HTTP API 同步账本数据，让支持 Streamable HTTP 的 MCP Client 查询和管理账单。
+qianji-bridge 是一个可自行部署的钱迹 MCP Server，它通过钱迹私有 HTTP API 同步账本数据，让支持 Streamable HTTP 的 MCP Client 查询和管理账单。
 
 - 查询账本、资产、借入或借出详情、分类、标签、用户、账单和固定统计报表
 - 管理普通收支、转账、信用卡还款、退款与报销
+- 管理分类、子分类、标签与标签组，支持移动、归档和排序
 - 使用 Bearer PAT 认证，并隔离不同钱迹账号的数据
 - 默认使用 SQLite，也可连接 PostgreSQL 或 MySQL
 
 > [!WARNING]
 > 本项目依赖钱迹私有 API，接口可能随钱迹客户端升级而变化。
 
+本项目 fork 自 [fangzhengjin/qianji-mcp](https://github.com/fangzhengjin/qianji-mcp)。MCP 是提供给 AI 客户端的接口协议，Bridge 表达连接钱迹与外部工具的用途。分类与标签管理移植自 [apsuadwf 的 PR #3](https://github.com/fangzhengjin/qianji-mcp/pull/3)，并补充批量失败恢复和缓存隔离修复。
+
+改名保留 `QIANJI_MCP_*` 环境变量、`/mcp` 地址、PAT 格式与数据库结构；已有数据卷继续使用原名称，无需迁移运行数据。
+
 ## 快速导航
 
 - [快速开始](#快速开始)
+- [Android 4.5.4 兼容性检查与人工验收](docs/compatibility-4.5.4.md)
 - [配置](#配置)
 - [MCP 工具](#mcp-工具)
 - [使用要点](#使用要点)
@@ -32,13 +38,16 @@ bun -e "import { randomBytes } from 'node:crypto'; console.log('mt_pat_' + rando
 
 ### 2. 启动容器
 
+在仓库根目录构建本 fork 的代码：
+
 ```bash
-docker run --rm --name qianji-mcp \
+docker build -t qianji-bridge:local .
+docker run --rm --name qianji-bridge \
   -p 3000:3000 \
   -v qianji-mcp-data:/data \
   -e QIANJI_MCP_ADMIN_PAT='mt_pat_...' \
   -e QIANJI_MCP_PUBLIC_URL='http://127.0.0.1:3000' \
-  ghcr.io/fangzhengjin/qianji-mcp:latest
+  qianji-bridge:local
 ```
 
 容器监听 `0.0.0.0:3000`，SQLite 数据库保存在 `/data/qianji.db`。
@@ -47,11 +56,11 @@ docker run --rm --name qianji-mcp \
 
 绑定页面也必须通过该公开地址访问。`POST /connect` 优先校验 `Origin`，缺失时校验 `Referer` 是否与该公开地址同源，同时拒绝 `Sec-Fetch-Site` 标记的跨站请求；反向代理应保留这些来源头，无来源头的客户端仍须提供有效的一次性 `ticket`。
 
-镜像同时提供以下标签：
+主分支合并后，现有工作流会构建并推送以下镜像标签；未合并的 PR 请使用上面的本地构建：
 
 ```text
-ghcr.io/fangzhengjin/qianji-mcp:latest
-ghcr.io/fangzhengjin/qianji-mcp:<7-character-commit-id>
+ghcr.io/nadouking/qianji-bridge:latest
+ghcr.io/nadouking/qianji-bridge:<7-character-commit-id>
 ```
 
 ### 3. 连接 MCP Client
@@ -108,10 +117,18 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 
 图片地址的查询沿用原账单的账号访问控制，但返回后应视为私人资料，不公开传播或发送给无关第三方。客户端访问 CDN 时不应附带 MCP PAT、钱迹登录凭据或 cookie。服务不会为构造图片地址发起额外网络请求。
 
+### 分类与标签的批量写入
+
+批量操作按输入顺序执行，不是远端事务。参数先整体校验；若中途失败，`WRITE_PARTIAL` 消息会给出从 1 开始的 `completed`（已完成）、`unconfirmed`（结果未确认）与 `notAttempted`（尚未执行）序号。已完成项不得重试；未确认项需先查询核对，禁止直接重试整个批次。缓存清理失败时先调用 `refresh_cache`。
+
+分类删除的转移目标不能出现在本批次待删除分类中，`transferTo` 与 `deleteBills=true` 不可同时指定。删除分类会同步受影响账单并失效余额缓存；若同步失败，先用 `refresh_cache` 再核对账单和统计。
+
 ## 配置
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 |---|---:|---|---|
+| 分类管理 | `create_categories`、`create_subcategories`、`update_categories`、`delete_categories`、`check_category_deletion`、`move_category`、`reorder_categories`、`list_category_icons` |
+| 标签管理 | `create_tag_groups`、`delete_tag_groups`、`create_tags`、`update_tags`、`delete_tags`、`archive_tags`、`reorder_tags`、`reorder_tag_groups` |
 | `QIANJI_MCP_ADMIN_PAT` | 是 | 无 | 超级管理员 PAT，必须以 `mt_pat_` 开头，后接至少 32 个随机字符 |
 | `QIANJI_MCP_PUBLIC_URL` | 否 | `http://<host>:<port>` | MCP Client 实际访问的基础地址，只能包含协议、主机和可选端口 |
 | `QIANJI_MCP_HOST` | 否 | `127.0.0.1` | HTTP 监听地址，Docker 镜像默认为 `0.0.0.0` |
@@ -138,7 +155,7 @@ MySQL 最低版本为 8.0.16。
 
 服务启动时会连接并初始化数据库，连接失败会终止启动，不会自动回退到 SQLite，也不会在数据库之间搬运已有数据。
 
-无论使用哪种数据库，当前都只应运行一个 qianji-mcp 实例，SQLite 文件不能由多个实例共享。
+无论使用哪种数据库，当前都只应运行一个 qianji-bridge 实例，SQLite 文件不能由多个实例共享。
 
 ### 钱迹 API 线路
 
@@ -249,7 +266,7 @@ https://qianjiga.litangkj.com
 
 ## 开发者信息
 
-修改代码或文档前先读 [AGENTS.md](AGENTS.md) 和[分支与工作目录规范](docs/development-workflow.md)。本 fork 的日常维护 PR 提交到 `NadouKing/qianji-mcp`。
+修改代码或文档前先读 [AGENTS.md](AGENTS.md) 和[分支与工作目录规范](docs/development-workflow.md)。本 fork 的日常维护 PR 提交到 `NadouKing/qianji-bridge`。
 
 服务器级 MCP 使用流程维护在 [`src/server-instructions.md`](src/server-instructions.md)，修改后会同时用于旧版 `initialize` 和新版 `server/discover` 响应。
 

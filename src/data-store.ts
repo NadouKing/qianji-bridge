@@ -164,7 +164,7 @@ export interface DataStore {
   /** 写入指定目录快照。 */
   setCatalogCache(accountId: number, kind: CatalogKind, scope: string, data: Record<string, unknown>[], refreshedAtMs?: number): MaybePromise<void>;
   /** 使指定目录快照失效。 */
-  invalidateCatalogCache(accountId: number, kind: CatalogKind, scope: string): MaybePromise<void>;
+  invalidateCatalogCache(accountId: number, kind: CatalogKind, scope?: string): MaybePromise<void>;
   /** 原子保存远端已确认的账单组。 */
   saveConfirmedBills(accountId: number, bills: Record<string, unknown>[], invalidateAssets?: boolean): MaybePromise<void>;
   /** 读取一条账号范围内的完整账单。 */
@@ -515,8 +515,12 @@ export class Store implements DataStore {
       .run(accountId, kind, scope, JSON.stringify(data), refreshedAtMs);
   }
 
-  /** 在调用方当前事务内使一个目录快照失效。 */
-  invalidateCatalogCache(accountId: number, kind: CatalogKind, scope: string): void {
+  /** 使当前账号的目录快照失效；省略 scope 时清除该类的全部作用域。 */
+  invalidateCatalogCache(accountId: number, kind: CatalogKind, scope?: string): void {
+    if (scope === undefined) {
+      this.db.prepare("DELETE FROM catalog_cache WHERE account_id = ? AND kind = ?").run(accountId, kind);
+      return;
+    }
     this.db.prepare("DELETE FROM catalog_cache WHERE account_id = ? AND kind = ? AND scope = ?")
       .run(accountId, kind, scope);
   }

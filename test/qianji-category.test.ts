@@ -91,7 +91,7 @@ test("改名、删除、删除前检查和移动分类的表单契约与 APK 证
 
   await client.deleteCategory(accountFixture, "177");
   assert.equal(requests[2]!.form.get("newcateid"), null);
-  assert.equal(requests[2]!.form.get("deletebills"), null);
+  assert.equal(requests[2]!.form.get("deletebills"), "0");
 
   const check = await client.deleteCategoryCheck(accountFixture, "177");
   assert.equal(requests[3]!.path, "/category/deletecheckv2");
@@ -106,7 +106,7 @@ test("改名、删除、删除前检查和移动分类的表单契约与 APK 证
   await client.changeCategoryLevel(accountFixture, "177", "-1");
   assert.equal(requests[5]!.path, "/category/changelevel");
   assert.equal(requests[5]!.form.get("did"), "177");
-  assert.equal(requests[5]!.form.get("parentid"), "-1");
+  assert.equal(requests[5]!.form.get("parentid"), null);
 });
 
 test("重排分类发送保持精度的 JSON 数字数组并拒绝非法 ID", async () => {
@@ -193,16 +193,12 @@ test("读取分类图标分组不携带参数并规范化分组字段", async ()
 });
 
 test("删除前检查拒绝缺失或非法的账单数", async () => {
-  for (const data of [{ count: "abc" }, { count: -1 }, { count: 1.5 }, { other: 1 }]) {
+  for (const data of [{ count: "abc" }, { count: -1 }, { count: 1.5 }, { count: null }, { other: 1 }]) {
     const client = new QianjiClient({ fetch: async () => ok(data) });
-    if (data.other !== undefined) {
-      assert.deepEqual(await client.deleteCategoryCheck(accountFixture, "177"), { count: 0, other: 1 });
-    } else {
-      await assert.rejects(
-        () => client.deleteCategoryCheck(accountFixture, "177"),
-        (error) => error instanceof AppError && error.code === "QIANJI_RESPONSE_INVALID",
-      );
-    }
+    await assert.rejects(
+      () => client.deleteCategoryCheck(accountFixture, "177"),
+      (error) => error instanceof AppError && error.code === "QIANJI_RESPONSE_INVALID",
+    );
   }
 });
 
@@ -328,6 +324,7 @@ test("服务层批量删除支持账单转移与连账单删除并拒绝自转�
   const service = new MoneyTrackService(store, new QianjiClient({
     fetch: async (input, init) => {
       const path = new URL(String(input)).pathname;
+      if (path === "/syncv2/pull") return ok({ changes: [], deletes: [], bookid: "-1", pageoffset: 0, pagesign: "", hasmore: 0, lasttimes: {} });
       forms.push({ path, form: new URLSearchParams(String(init?.body)) });
       assert.equal(path, "/category/deletev2");
       return ok({});
@@ -335,13 +332,13 @@ test("服务层批量删除支持账单转移与连账单删除并拒绝自转�
   }), () => now);
 
   const result = await service.deleteCategories(accountId, [
-    { categoryId: "170", transferTo: "171", deleteBills: true },
-    { categoryId: "171" },
+    { categoryId: "170", transferTo: "172" },
+    { categoryId: "171", deleteBills: true },
   ]);
   assert.deepEqual(result, {
     deleted: [
-      { categoryId: "170", transferredTo: "171", billsDeleted: true },
-      { categoryId: "171", billsDeleted: false },
+      { categoryId: "170", transferredTo: "172", billsDeleted: false },
+      { categoryId: "171", billsDeleted: true },
     ],
   });
   assert.deepEqual(forms.map(({ form }) => ({
@@ -349,8 +346,8 @@ test("服务层批量删除支持账单转移与连账单删除并拒绝自转�
     newcateid: form.get("newcateid"),
     deletebills: form.get("deletebills"),
   })), [
-    { did: "170", newcateid: "171", deletebills: "1" },
-    { did: "171", newcateid: null, deletebills: null },
+    { did: "170", newcateid: "172", deletebills: "0" },
+    { did: "171", newcateid: null, deletebills: "1" },
   ]);
 
   for (const [deletions, code] of [
@@ -411,7 +408,7 @@ test("服务层移动分类按父 ID 选择移动或层级调整接口", async (
   assert.deepEqual(await service.moveCategory(accountId, "170", "-1"), { categoryId: "170", parentId: "-1" });
   assert.equal(requests[0]!.path, "/category/changelevel");
   assert.equal(requests[0]!.form.get("did"), "170");
-  assert.equal(requests[0]!.form.get("parentid"), "-1");
+  assert.equal(requests[0]!.form.get("parentid"), null);
 
   assert.deepEqual(await service.moveCategory(accountId, "170", "171"), { categoryId: "170", parentId: "171" });
   assert.equal(requests[1]!.path, "/category/movesubcate");

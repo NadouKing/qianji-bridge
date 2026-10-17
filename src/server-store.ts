@@ -285,8 +285,12 @@ export class ServerStore implements DataStore {
     await this.upsert(this.sql, "catalog_cache", ["account_id", "kind", "scope", "data_json", "refreshed_at_ms"], [accountId, kind, scope, JSON.stringify(data), refreshedAtMs], ["data_json", "refreshed_at_ms"]);
   }
 
-  /** 使账号范围内的目录快照失效。 */
-  async invalidateCatalogCache(accountId: number, kind: CatalogKind, scope: string): Promise<void> {
+  /** 使当前账号的目录快照失效；省略 scope 时清除该类的全部作用域。 */
+  async invalidateCatalogCache(accountId: number, kind: CatalogKind, scope?: string): Promise<void> {
+    if (scope === undefined) {
+      await this.query(this.sql, "DELETE FROM catalog_cache WHERE account_id = ? AND kind = ?", [accountId, kind]);
+      return;
+    }
     await this.query(this.sql, "DELETE FROM catalog_cache WHERE account_id = ? AND kind = ? AND scope = ?", [accountId, kind, scope]);
   }
 
