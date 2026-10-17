@@ -299,8 +299,11 @@ test("SQLite 权限以及 PAT、账号映射在重启后保持，且不改已有
   store.setCatalogCache(account.id, "tags", "", [{ id: "tag-1", name: "重启缓存" }], 1_770_000_000_000);
   store.close();
 
-  assert.equal(statSync(join(directory, "private")).mode & 0o777, 0o700);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  // POSIX mode 位不适用于 Windows；该平台的 ACL 不由此断言验证。
+  if (process.platform !== "win32") {
+    assert.equal(statSync(join(directory, "private")).mode & 0o777, 0o700);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+  }
   const reopened = new Store(path);
   assert.equal(reopened.verifyPat(pat.token)?.accountId, account.id);
   assert.equal(reopened.requireAccount(account.id).devid, account.devid);
@@ -313,8 +316,11 @@ test("SQLite 权限以及 PAT、账号映射在重启后保持，且不改已有
   const existingPath = join(existingDirectory, "qianji.db");
   const existingStore = new Store(existingPath);
   existingStore.close();
-  assert.equal(statSync(existingDirectory).mode & 0o777, 0o755);
-  assert.equal(statSync(existingPath).mode & 0o777, 0o600);
+  // POSIX mode 位不适用于 Windows；该平台的 ACL 不由此断言验证。
+  if (process.platform !== "win32") {
+    assert.equal(statSync(existingDirectory).mode & 0o777, 0o755);
+    assert.equal(statSync(existingPath).mode & 0o777, 0o600);
+  }
 });
 
 test("bun:sqlite 保持 WAL、外键、事务回滚和 64 位业务 ID 精度", (t) => {

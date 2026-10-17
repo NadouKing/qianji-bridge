@@ -2,7 +2,7 @@ import { randomInt } from "node:crypto";
 
 import { decimalAdd, decimalRound, decimalSubtract } from "./decimal.ts";
 import { AppError } from "./errors.ts";
-import { isCurrencySymbol, isOptionalPositiveLongId, isPositiveLongId } from "./ids.ts";
+import { isCurrencySymbol, isOptionalPositiveLongId, isParentLongId, isPositiveLongId } from "./ids.ts";
 import { isRawJsonNumber, type SyncBillResult } from "./qianji-client.ts";
 
 export type BillIdInput = string;
@@ -223,6 +223,52 @@ function addOptionalCurrencyAmount(
 export const MAX_MONEY = 9_999_999_999.99;
 export const MAX_SEARCH_KEYWORD_LENGTH = 42;
 export const MAX_BILL_CURSOR_LENGTH = 65_536;
+export const MAX_CATEGORY_NAME_LENGTH = 50;
+export const MAX_TAG_NAME_LENGTH = 50;
+export const MAX_TAG_ID_LENGTH = 64;
+
+/** 匹配六位小写十六进制标签色值。 */
+export const TAG_COLOR_PATTERN = /^[0-9a-f]{6}$/;
+
+/** 规范化分类名称，拒绝空白或超长文本。 */
+export function normalizeCategoryName(value: string, code = "INVALID_CATEGORY_NAME"): string {
+  const name = value.trim();
+  if (!name || name.length > MAX_CATEGORY_NAME_LENGTH) throw new AppError(code, "分类名称无效");
+  return name;
+}
+
+/** 规范化允许 `-1` 和 `0` 哨兵值的分类父 ID。 */
+export function normalizeCategoryParentId(value: ReferenceIdInput): string {
+  if (!isParentLongId(value)) throw new AppError("INVALID_CATEGORY_PARENT", "父分类 ID 无效");
+  return value;
+}
+
+/** 规范化标签名称，拒绝空白或超长文本。 */
+export function normalizeTagName(value: string, code = "INVALID_TAG_NAME"): string {
+  const name = value.trim();
+  if (!name || name.length > MAX_TAG_NAME_LENGTH) throw new AppError(code, "标签名称无效");
+  return name;
+}
+
+/** 规范化不透明标签 ID，拒绝空文本或超长文本。 */
+export function normalizeTagId(value: string): string {
+  if (!value || value.length > MAX_TAG_ID_LENGTH) throw new AppError("INVALID_TAG_ID", "标签 ID 无效");
+  return value;
+}
+
+/** 规范化标签组 ID，允许空字符串表示默认组。 */
+export function normalizeTagGroupId(value: string): string {
+  if (value.length > MAX_TAG_ID_LENGTH) throw new AppError("INVALID_TAG_GROUP_ID", "标签组 ID 无效");
+  return value;
+}
+
+/** 规范化可选标签颜色，只接受六位十六进制色值并统一为小写。 */
+export function normalizeTagColor(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const color = value.trim().toLowerCase();
+  if (!TAG_COLOR_PATTERN.test(color)) throw new AppError("INVALID_TAG_COLOR", "标签颜色无效");
+  return color;
+}
 
 /** 规范化账单 ID，并拒绝会丢失精度的 JavaScript 数字表示。 */
 export function normalizeBillId(value: BillIdInput): string {

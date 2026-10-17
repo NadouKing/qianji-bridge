@@ -13,12 +13,15 @@
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，默认不返回余额和信用额度，只有用户明确要求查看余额或额度时才设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，`list_assets` 可能包含 type 5 债务记录基础资产条目，但不能替代详细信息，不要自行聚合两类响应
 - 分类：使用 `list_categories`
+- 分类图标：使用 `list_category_icons`
+- 删除分类的影响评估：使用 `check_category_deletion` 取得受影响账单数量
 - 标签：使用 `list_tags`
 - 账单批量盘点、查重或只读对账：使用 `list_bills`，`remarkKeyword` 按不区分大小写的字面子串匹配，需要完整筛选范围时继续翻页到 `nextCursor=null`
 - 共享账本按成员筛选：先使用 `list_book_members` 取得成员 ID，再传给 `list_bills.memberIds` 或 `get_bill_statistics.memberIds`
 - 收支、报销、退款、分类、成员或时间趋势统计：使用 `get_bill_statistics`，`currency` 币种标识同时筛选原始记账币种并指定统计结果币种，省略时不筛选原始币种并按当前本位币汇总
   - 无论是否传入 `currency`，都直接使用固定返回结构，不自行发明 `groupBy`
 - 预算使用情况：使用 `get_budget`，省略 `period` 时查询按账本月份起始日确定的当前月，只有用户需要逐日支出、累计支出或预算趋势时才设 `includeDailyStatistics=true`
+- 设置预算：使用 `set_budget`，必须明确账本、月份或年份及总预算/分类目标；一次只改一项，其他额度保持，金额 0 清除此项额度。仅在用户授权范围内设置。实际总额度可能由分类额度之和决定，用 `get_budget` 核对；写入结果未确认时先回读，不盲目重试。避免与 App 同时编辑预算
 - 批量判断转账方向：直接使用 `list_bills` 摘要的 `fromId`/`targetId`，需要显示资产名称时只调用一次 `list_assets` 建立 ID 映射
 - 列表字段无歧义时直接使用结果，不要逐条调用 `get_bill`，只有重复或近似候选、关系冲突、摘要缺失字段或用户要求完整记录时才使用，写入成功后直接使用写入工具返回的完整账单
 - 用户需要核对账单附件时，使用 `get_bill` 返回的 `imageUrls` 按需读取图片，无图片时为空数组
@@ -40,6 +43,9 @@
 
 退款和报销必须使用专用工具，不得自行构造账单关联关系。
 
+- 分类：创建一级分类使用 `create_categories`，批量创建子分类使用 `create_subcategories`，改名使用 `update_categories`，移动或调整层级使用 `move_category`，重排顺序使用 `reorder_categories`
+- 标签：创建使用 `create_tags`，创建标签组使用 `create_tag_groups`，改名、移动分组或改色使用 `update_tags`，重排标签使用 `reorder_tags`，重排标签组使用 `reorder_tag_groups`
+
 需要主动登录或重新登录当前钱迹账号时，使用 `connect_qianji` 获取一次性链接，未解绑的重新登录只能使用当前已连接的钱迹账号。
 
 #### 删除或取消
@@ -50,6 +56,13 @@
 - 单笔退款：使用 `delete_refund` 的 `refundBillId`
 - 单笔报销入账：使用 `delete_reimbursement` 的 `reimbursementBillId`
 - 取消一笔或多笔源账单的全部报销关系：使用 `cancel_reimbursements` 的 `sourceBillIds`，保留源账单并删除其报销入账子账单，不得传报销入账子账单 ID
+- 分类：使用 `delete_categories` 的 `deletions`，可选择把账单转移到其他分类或连同账单一起删除
+  - 转移目标不能是本批次待删除分类；不得同时指定转移账单和删除账单。操作后调用 `refresh_cache`，再核对受影响账单、统计和资产余额
+  - `deleteBills=true` 会删除账单，但此接口不回滚资产余额，刷新缓存也不会修复差额。若用户需要撤销账单对余额的影响，先用 `delete_bills` 删除已确认范围的账单并核对余额，再删除空分类。不得擅自创建抵扣账单来补余额
+  - 父分类仍有子分类时服务端会拒绝删除；须先确认子分类的处理方式
+  - 非空分类必须指定 `transferTo` 或选择 `deleteBills=true`，不能通过省略两者来保留无分类账单
+- 标签：使用 `delete_tags` 的 `tagIds`，删除标签组使用 `delete_tag_groups` 的 `groupIds`，保留标签但不再使用可改用 `archive_tags` 的 `tagIds` 归档
+  - 删除标签组会把组内标签移到默认组，不会删除这些标签；`list_tags` 暂不显示空标签组
 - 当前 PAT 的钱迹账号绑定：使用 `disconnect_qianji`，账号未被其他 PAT 使用时会删除全部本地数据，不会删除钱迹云端数据
 
 完成当前用户请求所需的全部调用后，将最终结果交付用户并结束本次操作。
@@ -63,6 +76,7 @@
   4. 除上述两种完整链接形式外，不得索取、提取或复述账号、密码、PAT 或链接中的一次性 `ticket`
 - 需要确认钱迹最新状态时，调用 `refresh_cache` 刷新用户、账单及全部目录缓存，包含币种目录，若收到 `WRITE_CONFIRMATION_FAILED`，远端写入可能已经生效，刷新后查询相关账单，仍无法确认时停止并告知用户，不得自动重试原写入
 - 批量写入收到 `WRITE_PARTIAL` 时，按错误中的输入序号确认每一项结果，成功项已经写入，不得重试，只处理冲突或未确认项
+  - 分类或标签批量写入的序号从 1 开始：`completed` 已完成，`unconfirmed` 结果未知，`notAttempted` 未执行；未确认不等于失败，须查询核对后才能决定是否补做，不得重试整个批次。缓存清理失败时先调用 `refresh_cache`
 
 ### 数据约定
 

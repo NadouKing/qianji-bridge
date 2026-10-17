@@ -14,7 +14,13 @@ import {
   normalizeBillId,
   normalizeBookId,
   normalizeCategoryId,
+  normalizeCategoryName,
+  normalizeCategoryParentId,
   normalizeRequiredAssetId,
+  normalizeTagColor,
+  normalizeTagGroupId,
+  normalizeTagId,
+  normalizeTagName,
   patchWasApplied,
   refundPatchApplied,
   refundPayload,
@@ -74,8 +80,11 @@ import {
   publicBill,
   publicBook,
   publicCategory,
+  publicCategoryIconGroup,
   publicCurrencyConversion,
   publicDebtAccount,
+  publicTag,
+  publicTagGroup,
   publicTagGroups,
 } from "./qianji-mappers.ts";
 import { QianjiClient, type BudgetPeriod, type PullPage, type SyncBillResult } from "./qianji-client.ts";
@@ -137,6 +146,56 @@ export interface GetBudgetInput {
   bookId?: string;
   period?: BudgetPeriod;
   includeDailyStatistics?: boolean;
+}
+
+export interface SetBudgetInput {
+  bookId: string;
+  period: BudgetPeriod;
+  target: { kind: "total" } | { kind: "category"; categoryId: string };
+  amount: number;
+}
+
+export interface CreateCategoryInput {
+  bookId?: BookIdInput;
+  name: string;
+  type: 0 | 1;
+  parentId?: ReferenceIdInput;
+  icon?: string;
+}
+
+export interface CategoryRenameInput {
+  categoryId: ReferenceIdInput;
+  name: string;
+}
+
+export interface CategoryDeletionInput {
+  categoryId: ReferenceIdInput;
+  transferTo?: ReferenceIdInput;
+  deleteBills?: boolean;
+}
+
+export interface TagGroupCreateInput {
+  name: string;
+}
+
+export interface TagCreateInput {
+  name: string;
+  groupId?: string;
+  color?: string;
+}
+
+export interface TagUpdateInput {
+  tagId: string;
+  name?: string;
+  groupId?: string;
+  color?: string;
+}
+
+export interface CreateMultipleCategoriesInput {
+  bookId?: BookIdInput;
+  parentId: ReferenceIdInput;
+  type: 0 | 1;
+  names: string[];
 }
 
 // 这些展示字段由钱迹服务端派生，更新完整对象前必须删除，随后按业务场景重新构造。
@@ -311,12 +370,378 @@ export class MoneyTrackService {
     });
   }
 
+  /** 一次提交创建一笔或多笔分类，写入后使本地分类快照失效。 */
+  async createCategories(
+    accountId: number,
+    inputs: CreateCategoryInput[],
+  ): Promise<{ categories: Record<string, unknown>[] }> {
+    if (inputs.length === 0) throw new AppError("INVALID_CATEGORIES", "categories 不能为空");
+    const normalized = inputs.map((input) => ({
+      bookId: normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID),
+      name: normalizeCategoryName(input.name),
+      type: input.type,
+      parentId: input.parentId === undefined ? undefined : normalizeCategoryParentId(input.parentId),
+      icon: input.icon,
+    }));
+    return this.withBillAccount(accountId, async (account) => {
+      for (const bookId of new Set(normalized.map((input) => input.bookId))) {
+        await this.requireWritableBook(account, bookId);
+      }
+      return this.withCatalogWrite(account, "categories", inputs.length, async (markRemoteSuccess) => {
+        const categories: Record<string, unknown>[] = [];
+        for (const input of normalized) {
+          const created = await this.client.createCategory(account, input);
+          markRemoteSuccess();
+          if (created) categories.push(publicCategory(created));
+        }
+        return { categories };
+      });
+    });
+  }
+
+  /** 一次提交批量重命名分类，写入后使本地分类快照失效。 */
+  async updateCategories(
+    accountId: number,
+    updates: CategoryRenameInput[],
+  ): Promise<{ categories: Array<{ categoryId: string; name: string }> }> {
+    if (updates.length === 0) throw new AppError("INVALID_CATEGORY_UPDATES", "updates 不能为空");
+    const ids = updates.map(({ categoryId }) => normalizeCategoryId(categoryId));
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_CATEGORY_UPDATES", "updates 不能包含重复 categoryId");
+    const names = updates.map(({ name }) => normalizeCategoryName(name));
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "categories", updates.length, async (markRemoteSuccess) => {
+        const contexts = await this.loadWritableCategoryContexts(account, ids);
+        const categories: Array<{ categoryId: string; name: string }> = [];
+        for (const [index] of updates.entries()) {
+          const categoryId = ids[index]!;
+          const name = names[index]!;
+          await this.client.updateCategory(account, categoryId, name, contexts.get(categoryId)!);
+          markRemoteSuccess();
+          categories.push({ categoryId, name });
+        }
+        return { categories };
+      }),
+    );
+  }
+
+  /** 一次提交批量删除分类，可把账单转移到其他分类或连同账单一起删除。 */
+  async deleteCategories(
+    accountId: number,
+    deletions: CategoryDeletionInput[],
+  ): Promise<{ deleted: Array<{ categoryId: string; transferredTo?: string; billsDeleted: boolean }> }> {
+    if (deletions.length === 0) throw new AppError("INVALID_CATEGORY_DELETIONS", "deletions 不能为空");
+    const ids = deletions.map(({ categoryId }) => normalizeCategoryId(categoryId));
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_CATEGORY_DELETIONS", "deletions 不能包含重复 categoryId");
+    const transfers = deletions.map((deletion) => {
+      const transferTo = deletion.transferTo === undefined ? undefined : normalizeCategoryId(deletion.transferTo);
+      if (transferTo !== undefined && ids.includes(transferTo)) {
+        throw new AppError("INVALID_CATEGORY_TRANSFER", "不能把账单转移到本批次待删除的分类");
+      }
+      if (transferTo !== undefined && deletion.deleteBills === true) {
+        throw new AppError("INVALID_CATEGORY_TRANSFER", "转移账单与删除账单不能同时选择");
+      }
+      return transferTo;
+    });
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "categories", deletions.length, async (markRemoteSuccess) => {
+        const deleted: Array<{ categoryId: string; transferredTo?: string; billsDeleted: boolean }> = [];
+        for (const [index, deletion] of deletions.entries()) {
+          const categoryId = ids[index]!;
+          const transferTo = transfers[index];
+          await this.client.deleteCategory(account, categoryId, {
+            transferTo,
+            deleteBills: deletion.deleteBills === true,
+          });
+          markRemoteSuccess();
+          deleted.push({
+            categoryId,
+            ...(transferTo !== undefined ? { transferredTo: transferTo } : {}),
+            billsDeleted: deletion.deleteBills === true,
+          });
+        }
+        return { deleted };
+      }, true),
+    );
+  }
+
+  /** 返回删除分类会影响的账单数量，不修改任何远端数据。 */
+  async checkCategoryDeletion(
+    accountId: number,
+    categoryIdInput: ReferenceIdInput,
+  ): Promise<{ categoryId: string; billCount: number }> {
+    const categoryId = normalizeCategoryId(categoryIdInput);
+    return this.withAccount(accountId, async (account) => {
+      const check = await this.client.deleteCategoryCheck(account, categoryId);
+      return { categoryId, billCount: check.count };
+    });
+  }
+
+  /** 移动分类或调整层级，父分类传 `-1` 时提升为一级分类。 */
+  async moveCategory(
+    accountId: number,
+    categoryIdInput: ReferenceIdInput,
+    parentIdInput: ReferenceIdInput,
+  ): Promise<{ categoryId: string; parentId: string }> {
+    const categoryId = normalizeCategoryId(categoryIdInput);
+    const parentId = normalizeCategoryParentId(parentIdInput);
+    if (parentId === categoryId) throw new AppError("INVALID_CATEGORY_PARENT", "父分类不能是分类本身");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
+        const contexts = await this.loadWritableCategoryContexts(account, parentId === "-1" ? [categoryId] : [categoryId, parentId]);
+        const source = contexts.get(categoryId)!;
+        if (parentId !== "-1") {
+          const parent = contexts.get(parentId)!;
+          if (!["-1", "0"].includes(parent.parentId) || parent.bookId !== source.bookId || parent.type !== source.type) {
+            throw new AppError("INVALID_CATEGORY_PARENT", "目标必须是同账本、同收支类型的一级分类");
+          }
+        }
+        if (parentId === "-1" || ["-1", "0"].includes(source.parentId)) await this.client.changeCategoryLevel(account, categoryId, parentId);
+        else await this.client.moveCategory(account, categoryId, parentId);
+        markRemoteSuccess();
+        return { categoryId, parentId };
+      }),
+    );
+  }
+
+  /** 按给定 ID 顺序重排分类，写入后使本地分类快照失效。 */
+  async reorderCategories(
+    accountId: number,
+    orderedIds: string[],
+  ): Promise<{ orderedCategoryIds: string[] }> {
+    if (orderedIds.length === 0) throw new AppError("INVALID_CATEGORY_ORDER", "orderedCategoryIds 不能为空");
+    const ids = orderedIds.map(normalizeCategoryId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_CATEGORY_ORDER", "orderedCategoryIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
+        await this.client.reorderCategories(account, ids);
+        markRemoteSuccess();
+        return { orderedCategoryIds: ids };
+      }),
+    );
+  }
+
+  /** 返回分类图标分组，图标库内容较少且稳定，不做本地快照。 */
+  async listCategoryIcons(accountId: number): Promise<Record<string, unknown>[]> {
+    return this.withAccount(accountId, async (account) =>
+      (await this.client.listCategoryIcons(account)).map(publicCategoryIconGroup),
+    );
+  }
+
+  /** 一次提交批量创建指定真实一级分类下的子分类。 */
+  async createMultipleCategories(
+    accountId: number,
+    input: CreateMultipleCategoriesInput,
+  ): Promise<{ categories: Record<string, unknown>[]; repeats: unknown[] }> {
+    const bookId = normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
+    const parentId = normalizeCategoryId(input.parentId);
+    const names = input.names.map((name) => normalizeCategoryName(name));
+    if (names.length === 0) throw new AppError("INVALID_CATEGORY_NAMES", "names 不能为空");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "categories", 1, async (markRemoteSuccess) => {
+        await this.requireWritableBook(account, bookId);
+        const result = await this.client.submitMultipleCategories(account, {
+          bookId,
+          parentId,
+          type: input.type,
+          names,
+        });
+        markRemoteSuccess();
+        return { categories: result.list.map(publicCategory), repeats: result.repeats };
+      }),
+    );
+  }
+
   /** 返回按钱迹分组组织的标签，分组标题本身不可选择。 */
   async listTags(accountId: number, status: -1 | 1 | 2): Promise<Record<string, unknown>[]> {
     return this.withAccount(accountId, async (account) => {
       const tags = await this.loadTags(account);
       return publicTagGroups(tags.filter((tag) => status === -1 || Number(tag.status ?? 1) === status));
     });
+  }
+
+  /** 一次提交创建一个或多个标签组，写入后使本地标签快照失效。 */
+  async createTagGroups(
+    accountId: number,
+    groups: TagGroupCreateInput[],
+  ): Promise<{ groups: Record<string, unknown>[] }> {
+    if (groups.length === 0) throw new AppError("INVALID_TAG_GROUPS", "groups 不能为空");
+    const names = groups.map(({ name }) => normalizeTagName(name));
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", groups.length, async (markRemoteSuccess) => {
+        const created: Record<string, unknown>[] = [];
+        for (const name of names) {
+          const group = await this.client.createTagGroup(account, name);
+          markRemoteSuccess();
+          if (group) created.push(publicTagGroup(group));
+        }
+        return { groups: created };
+      }),
+    );
+  }
+
+  /** 一次提交批量删除标签组，写入后使本地标签快照失效。 */
+  async deleteTagGroups(
+    accountId: number,
+    groupIds: string[],
+  ): Promise<{ deletedGroupIds: string[] }> {
+    if (groupIds.length === 0) throw new AppError("INVALID_TAG_GROUP_DELETIONS", "groupIds 不能为空");
+    const ids = groupIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_GROUP_DELETIONS", "groupIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", groupIds.length, async (markRemoteSuccess) => {
+        for (const groupId of ids) {
+          await this.client.deleteTagGroup(account, groupId);
+          markRemoteSuccess();
+        }
+        return { deletedGroupIds: ids };
+      }),
+    );
+  }
+
+  /** 一次提交创建一个或多个标签，写入后使本地标签快照失效。 */
+  async createTags(
+    accountId: number,
+    tags: TagCreateInput[],
+  ): Promise<{ tags: Record<string, unknown>[] }> {
+    if (tags.length === 0) throw new AppError("INVALID_TAGS", "tags 不能为空");
+    const normalized = tags.map((tag) => ({
+      name: normalizeTagName(tag.name),
+      groupId: tag.groupId === undefined ? undefined : normalizeTagGroupId(tag.groupId),
+      color: normalizeTagColor(tag.color),
+    }));
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", tags.length, async (markRemoteSuccess) => {
+        const created: Record<string, unknown>[] = [];
+        for (const tag of normalized) {
+          const result = await this.client.createTag(account, tag);
+          markRemoteSuccess();
+          if (result) created.push(publicTag(result));
+        }
+        return { tags: created };
+      }),
+    );
+  }
+
+  /** 一次提交批量修改标签名称、所属组或颜色，写入后使本地标签快照失效。 */
+  async updateTags(
+    accountId: number,
+    updates: TagUpdateInput[],
+  ): Promise<{ tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> }> {
+    if (updates.length === 0) throw new AppError("INVALID_TAG_UPDATES", "updates 不能为空");
+    const ids = updates.map(({ tagId }) => normalizeTagId(tagId));
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_UPDATES", "updates 不能包含重复 tagId");
+    const normalized = updates.map((update, index) => {
+      if (update.name === undefined && update.groupId === undefined && update.color === undefined) {
+        throw new AppError("INVALID_TAG_UPDATES", "updates 每项至少提供 name、groupId 或 color 之一");
+      }
+      return {
+        tagId: ids[index]!,
+        name: update.name === undefined ? undefined : normalizeTagName(update.name),
+        groupId: update.groupId === undefined ? undefined : normalizeTagGroupId(update.groupId),
+        color: normalizeTagColor(update.color),
+      };
+    });
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", updates.length, async (markRemoteSuccess) => {
+        // submit 接口是全字段覆盖；强制读取，避免用陈旧缓存覆盖用户在 App 的修改。
+        const current = await this.loadTags(account, { forceRefresh: true, allowStale: false });
+        const merged = normalized.map((update) => {
+          const tag = current.find((candidate) => String(candidate.id) === update.tagId);
+          if (!tag) throw crossAccount("标签");
+          return {
+            name: update.name ?? String(tag.name ?? ""),
+            groupId: update.groupId ?? String(tag.groupId ?? ""),
+            color: update.color ?? (tag.color == null ? null : String(tag.color)),
+          };
+        });
+        const tags: Array<{ tagId: string; name?: string; groupId?: string; color?: string }> = [];
+        for (const [index, update] of normalized.entries()) {
+          await this.client.updateTag(account, update.tagId, merged[index]!);
+          markRemoteSuccess();
+          tags.push({
+            tagId: update.tagId,
+            ...(update.name !== undefined ? { name: update.name } : {}),
+            ...(update.groupId !== undefined ? { groupId: update.groupId } : {}),
+            ...(update.color !== undefined ? { color: update.color } : {}),
+          });
+        }
+        return { tags };
+      }),
+    );
+  }
+
+  /** 一次提交批量删除标签，写入后使本地标签快照失效。 */
+  async deleteTags(accountId: number, tagIds: string[]): Promise<{ deletedTagIds: string[] }> {
+    if (tagIds.length === 0) throw new AppError("INVALID_TAG_DELETIONS", "tagIds 不能为空");
+    const ids = tagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_DELETIONS", "tagIds 不能包含重复 ID");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", tagIds.length, async (markRemoteSuccess) => {
+        for (const tagId of ids) {
+          await this.client.deleteTag(account, tagId);
+          markRemoteSuccess();
+        }
+        return { deletedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 一次提交批量归档标签，写入后使本地标签快照失效。 */
+  async archiveTags(accountId: number, tagIds: string[]): Promise<{ archivedTagIds: string[] }> {
+    if (tagIds.length === 0) throw new AppError("INVALID_TAG_ARCHIVES", "tagIds 不能为空");
+    const ids = tagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) throw new AppError("INVALID_TAG_ARCHIVES", "tagIds 不能包含重复 ID");
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", tagIds.length, async (markRemoteSuccess) => {
+        for (const tagId of ids) {
+          await this.client.archiveTag(account, tagId);
+          markRemoteSuccess();
+        }
+        return { archivedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 按给定 ID 顺序重排标签，写入后使本地标签快照失效。 */
+  async reorderTags(
+    accountId: number,
+    orderedTagIds: string[],
+  ): Promise<{ orderedTagIds: string[] }> {
+    if (orderedTagIds.length === 0) throw new AppError("INVALID_TAG_ORDER", "orderedTagIds 不能为空");
+    const ids = orderedTagIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_ORDER", "orderedTagIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", 1, async (markRemoteSuccess) => {
+        await this.client.reorderTags(account, ids);
+        markRemoteSuccess();
+        return { orderedTagIds: ids };
+      }),
+    );
+  }
+
+  /** 按给定 ID 顺序重排标签组，写入后使本地标签快照失效。 */
+  async reorderTagGroups(
+    accountId: number,
+    orderedGroupIds: string[],
+  ): Promise<{ orderedGroupIds: string[] }> {
+    if (orderedGroupIds.length === 0) throw new AppError("INVALID_TAG_GROUP_ORDER", "orderedGroupIds 不能为空");
+    const ids = orderedGroupIds.map(normalizeTagId);
+    if (new Set(ids).size !== ids.length) {
+      throw new AppError("INVALID_TAG_GROUP_ORDER", "orderedGroupIds 不能包含重复 ID");
+    }
+    return this.withBillAccount(accountId, async (account) =>
+      this.withCatalogWrite(account, "tags", 1, async (markRemoteSuccess) => {
+        await this.client.reorderTagGroups(account, ids);
+        markRemoteSuccess();
+        return { orderedGroupIds: ids };
+      }),
+    );
   }
 
   /** 强制刷新当前账号的用户、账单及全部目录快照。 */
@@ -601,6 +1026,72 @@ export class MoneyTrackService {
         currency: requireBaseCurrency(await this.loadUserWithCurrencyConfig(account)),
         includeDailyStatistics: input.includeDailyStatistics === true,
         nowMs,
+      });
+    });
+  }
+
+  /** 修改单项预算；提交后回读，其他总预算和分类额度必须保持。 */
+  async setBudget(accountId: number, input: SetBudgetInput): Promise<SetBudgetInput> {
+    const bookId = normalizeBookId(input.bookId);
+    requireNonnegativeMoney(input.amount, "预算额度");
+    if (!input.period) throw new AppError("INVALID_BUDGET_PERIOD", "设置预算必须指定期间");
+    if (!input.target || !["total", "category"].includes(input.target.kind)) {
+      throw new AppError("INVALID_BUDGET_TARGET", "必须指定总预算或分类预算");
+    }
+    const categoryId = input.target.kind === "category" ? normalizeCategoryId(input.target.categoryId) : undefined;
+    return this.withBillAccount(accountId, async (account) => {
+      const book = await this.requireBook(account, bookId, { forceRefresh: true, allowStale: false });
+      await this.requireWritableBook(account, bookId);
+      const range = budgetBookRange(book);
+      const period = resolveBudgetPeriod(input.period, range, this.now()).filter;
+      if (categoryId !== undefined) {
+        const roots = await this.loadCategories(account, bookId, { forceRefresh: true, allowStale: false });
+        const found = roots.flatMap((root) => [root, ...categoryChildren(root)])
+          .find((category) => String(category.id) === categoryId);
+        if (!found || Number(found.type) !== 0) throw new AppError("INVALID_BUDGET_CATEGORY", "预算分类必须是指定账本中的支出分类");
+      }
+      const key = (item: Record<string, unknown>) => Number(item.flag) === 1 ? "total" : `category:${item.cateid}`;
+      const targetKey = categoryId === undefined ? "total" : `category:${categoryId}`;
+      const before = await this.client.listBudgets(account, bookId, period, range);
+      const keys = new Set<string>();
+      const changes = before.map((item) => {
+        const flag = Number(item.flag);
+        const itemKey = key(item);
+        if (![1, 2].includes(flag) || String(item.bookid) !== bookId || keys.has(itemKey)) {
+          throw new AppError("QIANJI_RESPONSE_INVALID", "预算列表包含未知种类、其他账本或重复项，拒绝覆盖", 502);
+        }
+        keys.add(itemKey);
+        const amount = Number(item.money);
+        requireNonnegativeMoney(amount, "现有预算额度");
+        return {
+          ...(flag === 2 ? { categoryId: normalizeCategoryId(String(item.cateid)) } : {}),
+          amount: itemKey === targetKey ? input.amount : amount,
+          ...(item.budgetid && String(item.budgetid) !== "-1" ? { budgetId: String(item.budgetid) } : {}),
+        };
+      });
+      if (!keys.has(targetKey)) changes.push({ ...(categoryId ? { categoryId } : {}), amount: input.amount });
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        try {
+          // APK 输入分类额度 0 时从完整列表移除该项；发送 money=0 的分类会被上游拒绝。
+          await this.client.submitBudget(account, bookId, period,
+            changes.filter((change) => change.categoryId === undefined || change.amount > 0), range);
+        } catch (error) {
+          const cause = safeError(error);
+          throw new AppError(cause.code, `${cause.message}。预算写入结果未确认，请先用 get_budget 回读，勿直接重试。`, cause.httpStatus);
+        }
+        markRemoteSuccess();
+        try {
+          const after = await this.client.listBudgets(account, bookId, period, range);
+          const actual = after.find((item) => key(item) === targetKey);
+          if (Number(actual?.money ?? 0) !== input.amount) throw new AppError("BUDGET_CONFIRMATION_MISMATCH", "目标预算额度与提交值不同，请用 get_budget 核对");
+          const others = (items: Record<string, unknown>[]) => JSON.stringify(items
+            .filter((item) => key(item) !== targetKey && Number(item.money) !== 0)
+            .map((item) => [key(item), Number(item.money)]).sort(([a], [b]) => String(a).localeCompare(String(b))));
+          if (others(before) !== others(after)) throw new AppError("BUDGET_CONFIRMATION_MISMATCH", "其他预算发生变化，可能有并发编辑，请用 get_budget 核对；不要自动覆盖");
+        } catch (error) {
+          throw new AppError("WRITE_CONFIRMATION_FAILED", `预算已提交，但回读确认失败：${safeError(error).message}。请调用 get_budget 核对，操作不会自动回滚，不得盲目重试。`, 502);
+        }
+        return { bookId, period, target: input.target, amount: input.amount };
       });
     });
   }
@@ -1518,6 +2009,69 @@ export class MoneyTrackService {
     });
   }
 
+  /** 目录批量写入不是事务：失败也清缓存，按输入顺序报告已完成和未确认项。 */
+  private async withCatalogWrite<T>(
+    account: QianjiAccount,
+    kind: "categories" | "tags",
+    total: number,
+    operation: (markRemoteSuccess: () => void) => Promise<T>,
+    refreshBills = false,
+  ): Promise<T> {
+    return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+      let completed = 0;
+      let result: T | undefined;
+      let failed = false;
+      let failure: unknown;
+      try {
+        result = await operation(() => {
+          completed += 1;
+          markRemoteSuccess();
+        });
+      } catch (error) {
+        failed = true;
+        failure = error;
+      }
+      // 不依赖账本列表是否存在；也清除默认作用域和已不在列表里的缓存。
+      // 即使请求报错也清除，因为响应丢失不能证明远端没有写入。
+      let cacheFailure: unknown;
+      try {
+        await this.store.invalidateCatalogCache(account.id, kind);
+        if (refreshBills && completed > 0) {
+          await this.store.invalidateCatalogCache(account.id, "assets", "");
+          await this.syncUnlocked(account);
+        }
+      } catch (error) {
+        cacheFailure = error;
+      }
+      if (failed || cacheFailure !== undefined) {
+        if (completed > 0) {
+          const progress = {
+            completed: Array.from({ length: completed }, (_, index) => index + 1),
+            unconfirmed: failed && completed < total ? [completed + 1] : [],
+            notAttempted: failed ? Array.from({ length: Math.max(0, total - completed - 1) }, (_, index) => completed + index + 2) : [],
+          };
+          const cause = safeError(failed ? failure : cacheFailure);
+          throw new AppError(
+            failed ? "WRITE_PARTIAL" : "WRITE_CONFIRMATION_FAILED",
+            `目录写入结果（序号从 1 开始）：${JSON.stringify(progress)}。${cause.code}：${cause.message}。` +
+              (cacheFailure !== undefined ? "本地缓存更新失败，请先调用 refresh_cache。" : "请查询目录核对未确认项。") +
+              "已完成项不得重试，未确认项不代表失败，不得直接重试整个批次。",
+            502,
+          );
+        }
+        if (failed) {
+          const cause = safeError(failure);
+          throw new AppError(cause.code,
+            `${cause.message}。第 1 项未确认，后续项未执行；请先刷新并核对目录，不得直接重试。` +
+              (cacheFailure !== undefined ? "本地缓存清理失败，请先调用 refresh_cache。" : ""),
+            cause.httpStatus);
+        }
+        throw cacheFailure;
+      }
+      return result as T;
+    });
+  }
+
   /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留。 */
   private async withBusinessWrite<T>(
     account: QianjiAccount,
@@ -1838,6 +2392,32 @@ export class MoneyTrackService {
       return { ...asset, money: decimalAdd(money, delta) };
     });
     await this.store.setCatalogCache(accountId, "assets", "", data, cached.refreshedAtMs);
+  }
+
+  /** 强制读取并校验分类上下文，供改名和层级调整使用，避免陈旧缓存选错接口。 */
+  private async loadWritableCategoryContexts(account: QianjiAccount, ids: string[]) {
+    const options = { forceRefresh: true, allowStale: false };
+    const books = await this.loadBooks(account, options);
+    const contexts = new Map<string, { bookId: string; type: 0 | 1; parentId: string; icon?: string }>();
+    for (const bookId of new Set([GLOBAL_SYNC_BOOK_ID, ...books.map((book) => String(book.bookid))])) {
+      const roots = await this.loadCategories(account, bookId, options);
+      for (const root of roots) {
+        for (const category of [root, ...categoryChildren(root)]) {
+          const id = String(category.id);
+          if (!ids.includes(id)) continue;
+          const type = Number(category.type);
+          if (type !== 0 && type !== 1) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效分类类型", 502);
+          contexts.set(id, { bookId, type, parentId: String(category.parentid ?? "-1"),
+            ...(typeof category.icon === "string" ? { icon: category.icon } : {}) });
+        }
+      }
+      if (contexts.size === ids.length) break;
+    }
+    if (contexts.size !== ids.length) throw crossAccount("分类");
+    for (const bookId of new Set([...contexts.values()].map((context) => context.bookId))) {
+      await this.requireWritableBook(account, bookId);
+    }
+    return contexts;
   }
 
   /** 读取指定账本的完整分类目录。 */

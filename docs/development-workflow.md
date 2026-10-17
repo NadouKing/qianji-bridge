@@ -58,12 +58,12 @@
 
 ## 本 fork 的远端与验证
 
-本仓库为 `NadouKing/qianji-mcp`：`origin` 指向自己的 fork，`upstream` 指向
+本仓库为 `NadouKing/qianji-bridge`：`origin` 指向自己的 fork，`upstream` 指向
 `fangzhengjin/qianji-mcp`。开始时仍需核对本地实际配置；上游仅作参考，同步上游属于单独任务，
 不能用上游版本覆盖本 fork 的修改。
 
 GitHub CLI 在 fork 内可能默认选择上游；查询或创建 PR 时显式指定
-`--repo NadouKing/qianji-mcp`。本 fork 的日常维护向自己的 `main` 提 PR，不自动向上游贡献。
+`--repo NadouKing/qianji-bridge`。本 fork 的日常维护向自己的 `main` 提 PR，不自动向上游贡献。
 多账号环境核对实际身份与目标仓库，不为本次任务修改其他项目依赖的全局账号设置。
 
 验证按实际修改范围选择：源码改动使用 README 指定的 Bun 版本和锁文件，运行相关测试及

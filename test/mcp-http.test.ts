@@ -16,14 +16,23 @@ import test from "./context.ts";
 
 const ADMIN_PAT = `mt_pat_${"a".repeat(43)}`;
 const BUSINESS_TOOLS = [
-  "create_bills",
-  "connect_qianji",
-  "create_refund",
-  "create_transfer",
+  "archive_tags",
   "cancel_reimbursements",
+  "check_category_deletion",
+  "create_bills",
+  "create_categories",
+  "create_refund",
+  "create_subcategories",
+  "create_tag_groups",
+  "create_tags",
+  "create_transfer",
+  "connect_qianji",
   "delete_bills",
+  "delete_categories",
   "delete_reimbursement",
   "delete_refund",
+  "delete_tag_groups",
+  "delete_tags",
   "disconnect_qianji",
   "get_bill",
   "get_bill_statistics",
@@ -34,12 +43,20 @@ const BUSINESS_TOOLS = [
   "list_book_members",
   "list_books",
   "list_categories",
+  "list_category_icons",
   "list_debt_accounts",
   "list_tags",
+  "move_category",
   "refresh_cache",
   "reimburse_bills",
+  "reorder_categories",
+  "reorder_tag_groups",
+  "reorder_tags",
+  "set_budget",
   "update_bills",
+  "update_categories",
   "update_refund",
+  "update_tags",
   "update_transfer",
 ].sort();
 
@@ -771,6 +788,37 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   }
 });
 
+test("set_budget 通过 MCP 校验必填范围、写入与回读确认", async (t) => {
+  let limit = 100;
+  let writes = 0;
+  const { store, app, token } = setupApp({ fetch: async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/book/list") return Response.json({ ec: 200, data: { list: [{ bookid: 1 }] } });
+    if (path === "/budget/list") return Response.json({ ec: 200, data: { list: [{ bookid: 1, flag: 1, cateid: -1, money: limit }] } });
+    if (path === "/budget/submitv2") {
+      writes++;
+      limit = JSON.parse(new URLSearchParams(String(init?.body)).get("changelist")!)[0].money;
+      return Response.json({ ec: 200, data: {} });
+    }
+    throw new Error(`unexpected path: ${path}`);
+  } });
+  t.after(async () => { await app.close(); store.close(); });
+  const accountId = store.verifyPat(token)!.accountId!;
+  store.setUserCache(accountId, { id: "uid-test", viptype: -1 }, Date.now());
+  const client = new Client({ name: "budget-write", version: "1" });
+  t.after(() => client.close()); await client.connect(transport(app, token));
+  const input = { bookId: "1", period: { kind: "year", year: 2026 }, target: { kind: "total" }, amount: 120 };
+  for (const bad of [{ ...input, period: undefined }, { ...input, target: undefined }, { ...input, amount: -1 }, { ...input, target: { kind: "category" } }]) {
+    const result = await client.callTool({ name: "set_budget", arguments: bad });
+    assert.equal(result.isError, true);
+  }
+  assert.equal(writes, 0);
+  const result = await client.callTool({ name: "set_budget", arguments: input });
+  assert.equal(result.isError, undefined, JSON.stringify(result.content));
+  assert.deepEqual(result.structuredContent, { setting: input });
+  assert.equal(writes, 1);
+});
+
 test("get_budget 通过 MCP 返回已校验的只读预算结构", async (t) => {
   const { store, app, token } = setupApp({
     fetch: async (input) => {
@@ -840,7 +888,7 @@ test("普通 PAT 默认 legacy 可协商 2025-11-25", async (t) => {
   await client.connect(transport(app, token));
   assert.equal(client.getProtocolEra(), "legacy");
   assert.equal(client.getNegotiatedProtocolVersion(), "2025-11-25");
-  assert.equal((await client.listTools()).tools.length, 25);
+  assert.equal((await client.listTools()).tools.length, BUSINESS_TOOLS.length);
 });
 
 test("MCP 输入 schema 接受边界并在进入业务逻辑前拒绝越界字段", async (t) => {
@@ -1449,7 +1497,7 @@ test("get_bill 兼容上游省略 remark、assetId 和 updateTime", async (t) =>
   assert.deepEqual(returned.imageUrls, []);
 });
 
-test("超级管理员 PAT 取得 25 个业务工具和 3 个 PAT 管理工具", async (t) => {
+test("超级管理员 PAT 取得全部业务工具和 3 个 PAT 管理工具", async (t) => {
   const { store, app, token } = setupApp({
     role: "admin",
     bound: true,

@@ -26,7 +26,14 @@ import {
   PARENT_ID_PATTERN,
   POSITIVE_ID_PATTERN,
 } from "./ids.ts";
-import { MAX_BILL_CURSOR_LENGTH, MAX_MONEY, MAX_SEARCH_KEYWORD_LENGTH } from "./bill-rules.ts";
+import {
+  MAX_BILL_CURSOR_LENGTH,
+  MAX_CATEGORY_NAME_LENGTH,
+  MAX_MONEY,
+  MAX_SEARCH_KEYWORD_LENGTH,
+  MAX_TAG_NAME_LENGTH,
+  TAG_COLOR_PATTERN,
+} from "./bill-rules.ts";
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
 
@@ -230,6 +237,20 @@ const categorySchema = z.object({
   ...categoryFields,
   children: z.array(categoryChildSchema).describe("直属二级分类，没有二级分类时为空数组"),
 });
+const categoryNameText = z.string().trim().min(1).max(MAX_CATEGORY_NAME_LENGTH)
+  .describe("分类名称");
+const tagNameText = z.string().trim().min(1).max(MAX_TAG_NAME_LENGTH)
+  .describe("标签名称");
+const tagColorText = z.string().trim().regex(TAG_COLOR_PATTERN)
+  .describe("标签颜色，六位十六进制色值，如 \"ff0000\"");
+const createdTagGroupSchema = z.object({
+  groupId: opaqueIdText.describe("标签组 ID，不透明非空字符串"),
+  name: z.string().describe("标签组名称"),
+});
+const categoryIconSchema = z.object({
+  group: z.string().describe("图标分组标识"),
+  groupName: z.string().describe("图标分组名称"),
+}).passthrough();
 const tagSchema = z.object({
   id: z.string().min(1).describe("标签 ID，不透明非空字符串"),
   name: z.string().describe("标签名称"),
@@ -570,6 +591,10 @@ const budgetRangeFields = {
   endTime: z.number().int().describe("实际预算期间终点，Unix 秒，包含边界"),
   timezoneOffsetSeconds: z.literal(28_800).describe("预算日期固定使用 UTC+08:00"),
 };
+const budgetTargetSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("total").describe("总预算") }),
+  z.strictObject({ kind: z.literal("category").describe("分类预算"), categoryId: positiveIdText.describe("本账本的支出分类 ID") }),
+]).describe("预算设置目标");
 const budgetPeriodOutputSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("month").describe("月度预算"),
@@ -634,7 +659,7 @@ export function createMoneyTrackMcp(
   bindingTickets: BindingTicketManager,
 ): McpServer {
   const server = new McpServer(
-    { name: "qianji-remote-mcp", version: "0.1.0" },
+    { name: "qianji-bridge", version: "0.1.0" },
     { instructions: serverInstructions.trim() },
   );
 
@@ -861,11 +886,11 @@ export function createMoneyTrackMcp(
           categoryIds: z.array(positiveIdText).min(1).max(100).optional()
             .describe("多个分类 ID 筛选"),
           includeSubcategories: z.boolean().optional().meta({
-            description: "是否同时匹配所选一级分类的子分类",
+            description: "是否同时匹配 categoryIds 所选一级分类的子分类，不作用于 categoryId",
             default: true,
           }),
           categoryId: positiveIdText.optional()
-            .describe("单个分类 ID 筛选"),
+            .describe("单个分类 ID 精确筛选，不包含子分类，需要包含子分类时使用 categoryIds"),
           tagIds: tagIdsSchema.min(1).optional().describe("多个标签 ID 筛选"),
           tagMatch: tagMatchSchema.optional().meta({
             description: "标签匹配方式",
@@ -1006,6 +1031,27 @@ export function createMoneyTrackMcp(
     },
     async (input, ctx) => toolResult(async () => ({
       budget: await service.getBudget(await userId(principal, store), input),
+    }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "set_budget",
+    {
+      description: "设置指定账本月份或年份的一项总预算或分类预算，其他额度保持，金额为 0 清除此项额度，写入后回读确认",
+      inputSchema: z.strictObject({
+        bookId: bookIdText.describe("明确指定的账本 ID"),
+        period: budgetPeriodInputSchema.describe("必须明确指定预算期间"),
+        target: budgetTargetSchema.describe("明确选择总预算或一个支出分类预算"),
+        amount: nonnegativeMoneySchema.describe("本位币预算额度，0 清除此项额度，不删除账单"),
+      }),
+      outputSchema: z.object({ setting: z.object({
+        bookId: bookIdText, period: budgetPeriodInputSchema.describe("预算期间"), target: budgetTargetSchema,
+        amount: nonnegativeMoneySchema.describe("回读确认的本位币额度"),
+      }).describe("回读确认的单项设置，有效总额度和使用情况请查询 get_budget") }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (input, ctx) => toolResult(async () => ({
+      setting: await service.setBudget(await userId(principal, store), input),
     }), ctx, principal, bindingTickets),
   );
 
@@ -1204,6 +1250,331 @@ export function createMoneyTrackMcp(
     },
     async ({ sourceBillIds }, ctx) =>
       toolResult(async () => service.cancelReimbursements(await userId(principal, store), sourceBillIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_categories",
+    {
+      description: "批量创建支出或收入分类，可挂在一级分类下或指定图标",
+      inputSchema: z.strictObject({
+        categories: z.array(z.strictObject({
+          bookId: bookIdText.optional().meta({
+            description: "账本 ID，\"-1\" 表示默认账本",
+            default: "-1",
+          }),
+          name: categoryNameText,
+          type: categoryTypeSchema,
+          parentId: parentIdText.optional()
+            .describe("所属一级分类 ID，省略时创建为一级分类"),
+          icon: z.string().min(1).max(100).optional()
+            .describe("分类图标标识，可从 list_category_icons 获取"),
+        })).min(1).max(100).describe("待创建分类列表"),
+      }),
+      outputSchema: z.object({
+        categories: z.array(categorySchema).describe("钱迹返回并确认的已创建分类列表，顺序与输入一致"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ categories }, ctx) =>
+      toolResult(async () => service.createCategories(await userId(principal, store), categories), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_subcategories",
+    {
+      description: "批量创建指定真实一级分类下的子分类",
+      inputSchema: z.strictObject({
+        bookId: bookIdText.optional().meta({
+          description: "账本 ID，\"-1\" 表示默认账本",
+          default: "-1",
+        }),
+        parentId: positiveIdText.describe("所属的真实一级分类 ID"),
+        type: categoryTypeSchema,
+        names: z.array(categoryNameText).min(1).max(100)
+          .describe("待创建子分类名称列表"),
+      }),
+      outputSchema: z.object({
+        categories: z.array(categorySchema).describe("钱迹返回并确认的已创建子分类列表，顺序与输入一致"),
+        repeats: z.array(z.unknown()).describe("钱迹标记为重复而未创建的项目"),
+      }),
+      annotations: writeAnnotations,
+    },
+    async ({ bookId, parentId, type, names }, ctx) =>
+      toolResult(async () => service.createMultipleCategories(
+        await userId(principal, store),
+        { bookId, parentId, type, names },
+      ), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "update_categories",
+    {
+      description: "批量重命名支出或收入分类",
+      inputSchema: z.strictObject({
+        updates: z.array(z.strictObject({
+          categoryId: positiveIdText.describe("要改名的分类 ID"),
+          name: categoryNameText,
+        })).min(1).max(100).describe("待改名分类列表"),
+      }),
+      outputSchema: z.object({
+        categories: z.array(z.object({
+          categoryId: positiveIdText.describe("已改名的分类 ID 十进制字符串"),
+          name: z.string().describe("改名后的分类名称"),
+        })).describe("已改名的分类列表，顺序与输入一致"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ updates }, ctx) =>
+      toolResult(async () => service.updateCategories(await userId(principal, store), updates), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "delete_categories",
+    {
+      description: "批量永久删除分类，可把原账单转移到其他分类或连同账单一起删除",
+      inputSchema: z.strictObject({
+        deletions: z.array(z.strictObject({
+          categoryId: positiveIdText.describe("要永久删除的分类 ID"),
+          transferTo: positiveIdText.optional()
+            .describe("删除后原账单转入的分类 ID，分类非空且不删除账单时必须指定，省略不会清空分类关联"),
+          deleteBills: z.boolean().optional().default(false)
+            .describe("是否同时永久删除原分类下的全部账单。钱迹此路径不回滚资产余额。如需回滚余额，先用 delete_bills 删除已确认范围的账单，再删除空分类"),
+        })).min(1).max(100).describe("待删除分类列表"),
+      }),
+      outputSchema: z.object({
+        deleted: z.array(z.object({
+          categoryId: positiveIdText.describe("已删除的分类 ID 十进制字符串"),
+          transferredTo: positiveIdText.optional()
+            .describe("账单转移目标分类 ID，未提供转移时省略该字段"),
+          billsDeleted: z.boolean().describe("是否同时删除了原分类下的账单"),
+        })).describe("已删除范围，顺序与输入一致"),
+      }),
+      annotations: destructiveAnnotations,
+    },
+    async ({ deletions }, ctx) =>
+      toolResult(async () => service.deleteCategories(await userId(principal, store), deletions), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "check_category_deletion",
+    {
+      description: "返回删除分类会影响的账单数量，不修改任何远端数据",
+      inputSchema: z.strictObject({
+        categoryId: positiveIdText.describe("要检查删除影响的分类 ID"),
+      }),
+      outputSchema: z.object({
+        categoryId: positiveIdText.describe("被检查的分类 ID 十进制字符串"),
+        billCount: z.number().int().nonnegative().describe("删除分类会影响的账单数量，单位为条"),
+      }),
+      annotations: readAnnotations,
+    },
+    async ({ categoryId }, ctx) =>
+      toolResult(async () => service.checkCategoryDeletion(await userId(principal, store), categoryId), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "move_category",
+    {
+      description: "把分类移动到其他一级分类下，或传 \"-1\" 提升为一级分类",
+      inputSchema: z.strictObject({
+        categoryId: positiveIdText.describe("要移动或调整层级的分类 ID"),
+        parentId: parentIdText.describe("新的父分类 ID，\"-1\" 表示提升为一级分类"),
+      }),
+      outputSchema: z.object({
+        categoryId: positiveIdText.describe("已移动的分类 ID 十进制字符串"),
+        parentId: parentIdText.describe("移动后的父分类 ID，\"-1\" 表示一级分类"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ categoryId, parentId }, ctx) =>
+      toolResult(async () => service.moveCategory(
+        await userId(principal, store),
+        categoryId,
+        parentId,
+      ), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "reorder_categories",
+    {
+      description: "按给定 ID 顺序重排分类的展示顺序",
+      inputSchema: z.strictObject({
+        orderedCategoryIds: z.array(positiveIdText).min(1).max(100)
+          .describe("按新顺序排列的分类 ID 列表"),
+      }),
+      outputSchema: z.object({
+        orderedCategoryIds: z.array(positiveIdText).describe("按新顺序保存的分类 ID 列表"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ orderedCategoryIds }, ctx) =>
+      toolResult(async () => service.reorderCategories(await userId(principal, store), orderedCategoryIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "list_category_icons",
+    {
+      description: "列出创建分类时可选的图标分组",
+      inputSchema: z.strictObject({}).meta({ required: [] }),
+      outputSchema: z.object({ results: z.array(categoryIconSchema).describe("分类图标分组列表") }),
+      annotations: readAnnotations,
+    },
+    async (_input, ctx) =>
+      toolResult(async () => ({ results: await service.listCategoryIcons(await userId(principal, store)) }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_tag_groups",
+    {
+      description: "批量创建标签组",
+      inputSchema: z.strictObject({
+        groups: z.array(z.strictObject({
+          name: tagNameText,
+        })).min(1).max(100).describe("待创建标签组列表"),
+      }),
+      outputSchema: z.object({
+        groups: z.array(createdTagGroupSchema).describe("钱迹返回并确认的已创建标签组列表，顺序与输入一致"),
+      }),
+      annotations: writeAnnotations,
+    },
+    async ({ groups }, ctx) =>
+      toolResult(async () => service.createTagGroups(await userId(principal, store), groups), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "delete_tag_groups",
+    {
+      description: "批量永久删除标签组，组内标签移到默认组，不会随组删除",
+      inputSchema: z.strictObject({
+        groupIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要永久删除的标签组 ID 列表"),
+      }),
+      outputSchema: z.object({
+        deletedGroupIds: z.array(opaqueIdText).describe("已删除的标签组 ID 列表，顺序与输入一致"),
+      }),
+      annotations: destructiveAnnotations,
+    },
+    async ({ groupIds }, ctx) =>
+      toolResult(async () => service.deleteTagGroups(await userId(principal, store), groupIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_tags",
+    {
+      description: "批量创建标签，可挂到已有标签组下并指定颜色",
+      inputSchema: z.strictObject({
+        tags: z.array(z.strictObject({
+          name: tagNameText,
+          groupId: opaqueIdText.optional()
+            .describe("所属标签组 ID，省略时创建在默认组"),
+          color: tagColorText.optional()
+            .describe("标签颜色，六位十六进制色值，如 \"ff0000\""),
+        })).min(1).max(100).describe("待创建标签列表"),
+      }),
+      outputSchema: z.object({
+        tags: z.array(tagSchema).describe("钱迹返回并确认的已创建标签列表，顺序与输入一致"),
+      }),
+      annotations: writeAnnotations,
+    },
+    async ({ tags }, ctx) =>
+      toolResult(async () => service.createTags(await userId(principal, store), tags), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "update_tags",
+    {
+      description: "批量修改标签名称、所属组或颜色",
+      inputSchema: z.strictObject({
+        updates: z.array(z.strictObject({
+          tagId: opaqueIdText.describe("要修改的标签 ID"),
+          name: tagNameText.optional().describe("新的标签名称"),
+          groupId: opaqueIdText.optional()
+            .describe("新的所属标签组 ID"),
+          color: tagColorText.optional()
+            .describe("新的标签颜色，六位十六进制色值，如 \"ff0000\""),
+        })).min(1).max(100)
+          .describe("待修改标签列表，每项至少提供 name、groupId 或 color 之一"),
+      }),
+      outputSchema: z.object({
+        tags: z.array(z.object({
+          tagId: opaqueIdText.describe("已修改的标签 ID"),
+          name: z.string().optional().describe("修改后的标签名称"),
+          groupId: opaqueIdText.optional().describe("修改后的所属标签组 ID"),
+          color: tagColorText.optional().describe("修改后的标签颜色"),
+        })).describe("已修改的标签列表，顺序与输入一致"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ updates }, ctx) =>
+      toolResult(async () => service.updateTags(await userId(principal, store), updates), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "delete_tags",
+    {
+      description: "批量永久删除标签",
+      inputSchema: z.strictObject({
+        tagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要永久删除的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        deletedTagIds: z.array(opaqueIdText).describe("已删除的标签 ID 列表，顺序与输入一致"),
+      }),
+      annotations: destructiveAnnotations,
+    },
+    async ({ tagIds }, ctx) =>
+      toolResult(async () => service.deleteTags(await userId(principal, store), tagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "archive_tags",
+    {
+      description: "批量归档标签，归档后不再出现在正常标签列表中",
+      inputSchema: z.strictObject({
+        tagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("要归档的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        archivedTagIds: z.array(opaqueIdText).describe("已归档的标签 ID 列表，顺序与输入一致"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ tagIds }, ctx) =>
+      toolResult(async () => service.archiveTags(await userId(principal, store), tagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "reorder_tags",
+    {
+      description: "按给定 ID 顺序重排标签的展示顺序",
+      inputSchema: z.strictObject({
+        orderedTagIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("按新顺序排列的标签 ID 列表"),
+      }),
+      outputSchema: z.object({
+        orderedTagIds: z.array(opaqueIdText).describe("按新顺序保存的标签 ID 列表"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ orderedTagIds }, ctx) =>
+      toolResult(async () => service.reorderTags(await userId(principal, store), orderedTagIds), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "reorder_tag_groups",
+    {
+      description: "按给定 ID 顺序重排标签组的展示顺序",
+      inputSchema: z.strictObject({
+        orderedGroupIds: z.array(opaqueIdText).min(1).max(100)
+          .describe("按新顺序排列的标签组 ID 列表"),
+      }),
+      outputSchema: z.object({
+        orderedGroupIds: z.array(opaqueIdText).describe("按新顺序保存的标签组 ID 列表"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ orderedGroupIds }, ctx) =>
+      toolResult(async () => service.reorderTagGroups(await userId(principal, store), orderedGroupIds), ctx, principal, bindingTickets),
   );
 
   if (principal.role === "admin") registerAdminTools(server, store, principal, bindingTickets);

@@ -1,6 +1,6 @@
-# qianji-mcp 开发导航
+# qianji-bridge 开发导航
 
-本仓库是 `NadouKing/qianji-mcp` 个人 fork，提供钱迹的 HTTP MCP 服务。
+本仓库是 `NadouKing/qianji-bridge` 个人 fork，提供钱迹的 HTTP MCP 服务。
 
 - 修改前阅读 [分支与工作目录规范](docs/development-workflow.md)，核对当前仓库、远端、工作区及已有 PR；先更新主分支，再创建任务分支。
 - [README](README.md) 拥有使用方式、部署配置、开发命令和接口边界。`src/server-instructions.md` 是服务返回给模型的运行说明，不是开发操作手册。

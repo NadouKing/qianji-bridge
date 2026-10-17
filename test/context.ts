@@ -14,6 +14,8 @@ export default function test(name: string, body: (context: TestContext) => void 
       await body({ after: (cleanup) => cleanups.push(cleanup) });
     } finally {
       for (let index = cleanups.length - 1; index >= 0; index -= 1) {
+        // Bun 的临时 SQLite statement 可能延后释放句柄；Windows 不允许删除仍打开的文件。
+        if (process.platform === "win32") Bun.gc(true);
         await cleanups[index]!();
       }
     }

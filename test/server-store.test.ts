@@ -6,6 +6,25 @@ import { ServerStore } from "../src/server-store.ts";
 
 const urls = [process.env.QIANJI_TEST_POSTGRES_URL, process.env.QIANJI_TEST_MYSQL_URL].filter(Boolean) as string[];
 
+test("服务端目录失效同时保留账号与种类边界，并区分全作用域和单作用域", async () => {
+  const store = new ServerStore(new URL("postgres://unused:unused@127.0.0.1:1/unused"));
+  const internal = store as unknown as {
+    query(client: unknown, statement: string, params: unknown[]): Promise<unknown[]>;
+  };
+  const calls: Array<{ statement: string; params: unknown[] }> = [];
+  internal.query = async (_client, statement, params) => { calls.push({ statement, params }); return []; };
+  try {
+    await store.invalidateCatalogCache(7, "categories");
+    await store.invalidateCatalogCache(7, "categories", "-1");
+    assert.deepEqual(calls, [
+      { statement: "DELETE FROM catalog_cache WHERE account_id = ? AND kind = ?", params: [7, "categories"] },
+      { statement: "DELETE FROM catalog_cache WHERE account_id = ? AND kind = ? AND scope = ?", params: [7, "categories", "-1"] },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
 test("服务端解绑在断开 PAT 前锁定账号行", async () => {
   const store = new ServerStore(new URL("postgres://unused:unused@127.0.0.1:1/unused"));
   const internal = store as unknown as {

@@ -208,12 +208,29 @@ function publicCategoryParentId(value: unknown): string {
   return text;
 }
 
+/** 将分类图标分组转换为公开结构，并保留未知字段。 */
+export function publicCategoryIconGroup(icon: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...icon,
+    group: String(icon.group ?? ""),
+    groupName: String(icon.groupname ?? ""),
+  };
+}
+
 /** 将钱迹标签转换为稳定的公开字段。 */
-function publicTag(tag: Record<string, unknown>): Record<string, unknown> {
+export function publicTag(tag: Record<string, unknown>): Record<string, unknown> {
   return {
     id: String(tag.id),
     name: String(tag.name ?? ""),
     status: Number(tag.status ?? 1),
+  };
+}
+
+/** 将钱迹标签组转换为稳定的公开字段。 */
+export function publicTagGroup(group: Record<string, unknown>): Record<string, unknown> {
+  return {
+    groupId: String(group.id),
+    name: String(group.name ?? ""),
   };
 }
 

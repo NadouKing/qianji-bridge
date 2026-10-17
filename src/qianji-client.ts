@@ -18,9 +18,9 @@ const CLIENT_PROFILE = {
   os: "1",
   osvs: "36",
   pkg: "com.mutangtech.qianji",
-  vs: "1207",
-  vsn: "4.5.1b3",
-  mk: "beta",
+  vs: "1234",
+  vsn: "4.5.4",
+  mk: "guanwang",
   devbrand: "MCP",
   devname: "MCP",
 } as const;
@@ -112,13 +112,13 @@ export function extractCtrlAct(path: string): { ctrl: string; act: string } {
   return { ctrl: parts[0]!, act: parts[1]! };
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算路径对应的 `tok`。 */
+/** 沿用已验证签名算法，由请求标识和接口路径计算 `tok`。 */
 export function createTok(reqidv2: string, ctrl: string, act: string): string {
   const encReqid = md5(reqidv2 + TOK_SECRET);
   return md5(reqidv2 + "1172020" + ctrl + encReqid + act);
 }
 
-/** 按 Android 4.5.1b3 实际请求算法计算 `reqidv2`，时间可注入以支持确定性测试。 */
+/** 沿用已验证签名算法，并使用当前 Android 请求版本计算 `reqidv2`，时间可注入以支持确定性测试。 */
 export function createReqidv2(ctrl: string, act: string, epochMs = Date.now()): string {
   const shiftedMs = epochMs + Number(CLIENT_PROFILE.vs) + 9_081_127;
   return md5(CLIENT_PROFILE.pkg + String(shiftedMs) + ctrl + act + REQID_SECRET);
@@ -191,6 +191,23 @@ function stringifyQianjiIdList(ids: string[]): string {
   return JSON.stringify(ids.map((id) => {
     if (!isPositiveLongId(id)) throw new AppError("QIANJI_PAYLOAD_INVALID", "钱迹账单 ID 无效");
     return json.rawJSON(id);
+  }));
+}
+
+/** 将分类 ID 列表序列化为保持精度的 JSON 数字数组。 */
+function stringifyQianjiCategoryIdList(ids: string[]): string {
+  const json = JSON as JsonWithRaw;
+  return JSON.stringify(ids.map((id) => {
+    if (!isPositiveLongId(id)) throw new AppError("QIANJI_PAYLOAD_INVALID", "钱迹分类 ID 无效");
+    return json.rawJSON(id);
+  }));
+}
+
+/** 将不透明标签 ID 列表序列化为 JSON 字符串数组。 */
+function stringifyTagIdList(ids: string[], resource: string): string {
+  return JSON.stringify(ids.map((id) => {
+    if (!id) throw new AppError("QIANJI_PAYLOAD_INVALID", `钱迹${resource} ID 无效`);
+    return id;
   }));
 }
 
@@ -331,6 +348,101 @@ export class QianjiClient {
     return asObjectArray(data.list).map(normalizeCategory);
   }
 
+  /** 创建分类；`v` 直接使用分类名称纯文本，响应携带分类对象时返回其规范化结果。 */
+  async createCategory(
+    account: QianjiAccount,
+    input: { bookId: string; name: string; type: 0 | 1; parentId?: string; icon?: string },
+  ): Promise<Record<string, unknown> | undefined> {
+    const body: Record<string, string | number> = {
+      bookid: input.bookId,
+      v: input.name,
+      t: input.type,
+    };
+    if (input.parentId !== undefined && input.parentId !== "-1") body.parentid = input.parentId;
+    if (input.icon !== undefined) body.icon = input.icon;
+    const data = await this.authPost(account, "/category/submitv2", body);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined && object.cateid === undefined ? undefined : normalizeCategory(object);
+  }
+
+  /** 改名须携带原账本、类型及可选父级/图标，避免服务端拒绝或覆盖上下文。 */
+  async updateCategory(
+    account: QianjiAccount, categoryId: string, name: string,
+    context: { bookId: string; type: 0 | 1; parentId?: string; icon?: string },
+  ): Promise<void> {
+    const body: Record<string, string | number> = { did: categoryId, v: name, bookid: context.bookId, t: context.type };
+    if (context.parentId && context.parentId !== "-1" && context.parentId !== "0") body.parentid = context.parentId;
+    if (context.icon) body.icon = context.icon;
+    await this.authPost(account, "/category/submitv2", body);
+  }
+
+  /** 删除分类，可把账单转移到其他分类或连同账单一起删除。 */
+  async deleteCategory(
+    account: QianjiAccount,
+    categoryId: string,
+    options: { transferTo?: string; deleteBills?: boolean } = {},
+  ): Promise<void> {
+    const body: Record<string, string | number> = { did: categoryId, deletebills: options.deleteBills ? 1 : 0 };
+    if (options.transferTo !== undefined) body.newcateid = options.transferTo;
+    await this.authPost(account, "/category/deletev2", body);
+  }
+
+  /** 检查删除分类会影响的账单数量。 */
+  async deleteCategoryCheck(
+    account: QianjiAccount,
+    categoryId: string,
+  ): Promise<{ count: number; other?: unknown }> {
+    const data = asObject(await this.authPost(account, "/category/deletecheckv2", { did: categoryId }));
+    const count = data.count === undefined || data.count === null ? Number.NaN : Number(data.count);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹返回了无效账单数", 502);
+    }
+    return { count, ...(data.other !== undefined ? { other: data.other } : {}) };
+  }
+
+  /** 将分类移动到另一一级分类下。 */
+  async moveCategory(account: QianjiAccount, categoryId: string, parentId: string): Promise<void> {
+    await this.authPost(account, "/category/movesubcate", { did: categoryId, parentid: parentId });
+  }
+
+  /** 调整分类层级，`parentId` 传 `-1` 时提升为一级分类。 */
+  async changeCategoryLevel(account: QianjiAccount, categoryId: string, parentId: string): Promise<void> {
+    await this.authPost(account, "/category/changelevel", { did: categoryId, ...(parentId !== "-1" ? { parentid: parentId } : {}) });
+  }
+
+  /** 重排同一层级的分类；reorder3 接收分组的二维 ID 数组。 */
+  async reorderCategories(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/category/reorder3", { v: `[${stringifyQianjiCategoryIdList(orderedIds)}]` });
+  }
+
+  /** 批量创建指定真实一级分类下的子分类。 */
+  async submitMultipleCategories(
+    account: QianjiAccount,
+    input: { bookId: string; parentId: string; type: 0 | 1; names: string[] },
+  ): Promise<{ list: Record<string, unknown>[]; repeats: unknown[] }> {
+    const data = asObject(await this.authPost(account, "/category/submitmultiple", {
+      bookid: input.bookId,
+      t: input.type,
+      parentid: input.parentId,
+      v: JSON.stringify(input.names.map((name) => ({ name }))),
+    }));
+    return {
+      list: asObjectArray(data.list).map(normalizeCategory),
+      repeats: data.repeats === undefined ? [] : asArray(data.repeats),
+    };
+  }
+
+  /** 读取分类图标分组。 */
+  async listCategoryIcons(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/category/iconlist", {}));
+    return asObjectArray(data.list).map((icon) => ({
+      ...icon,
+      group: String(icon.group ?? ""),
+      groupName: String(icon.groupname ?? ""),
+    }));
+  }
+
   /** 读取指定账本和月份或年份的预算定义。 */
   async listBudgets(
     account: QianjiAccount,
@@ -352,10 +464,38 @@ export class QianjiClient {
       if (budget.cateid !== undefined && budget.cateid !== null) {
         normalized.cateid = referenceIdText(budget.cateid, "预算分类");
       }
+      if (budget.budgetid !== undefined && budget.budgetid !== null) {
+        normalized.budgetid = optionalPositiveIdText(budget.budgetid, "预算");
+      }
       if (budget.category !== undefined && budget.category !== null) {
         normalized.category = normalizeCategory(asObject(budget.category));
       }
       return normalized;
+    });
+  }
+
+  /** submitv2 替换期间预算列表，调用方必须传入合并后的完整定义。 */
+  async submitBudget(
+    account: QianjiAccount,
+    bookId: string,
+    period: BudgetPeriod,
+    changes: Array<{ categoryId?: string; amount: number; budgetId?: string }>,
+    range?: string,
+  ): Promise<void> {
+    const rawId = (id: string) => (JSON as JsonWithRaw).rawJSON(optionalPositiveIdText(id, "预算引用"));
+    const typeInfo = period.kind === "month" ? `${period.year},${period.month}` : String(period.year);
+    const entries = changes.map((change) => ({
+      bookid: rawId(bookId), userid: account.uid,
+      type: period.kind === "month" ? 1 : 2, typeinfo: typeInfo,
+      flag: change.categoryId === undefined ? 1 : 2,
+      cateid: rawId(change.categoryId ?? "-1"), money: change.amount,
+      ...(change.budgetId ? { budgetid: rawId(change.budgetId) } : {}),
+    }));
+    await this.authPost(account, "/budget/submitv2", {
+      bookid: bookId,
+      flts: JSON.stringify({ [period.kind]: typeInfo }),
+      changelist: JSON.stringify(entries),
+      ...(range ? { range } : {}),
     });
   }
 
@@ -372,6 +512,63 @@ export class QianjiClient {
         groupName,
       }));
     });
+  }
+
+  /** 创建或重命名标签组；`v` 直接使用组名纯文本，响应携带 ID 时返回其规范化结果。 */
+  async createTagGroup(account: QianjiAccount, name: string): Promise<Record<string, unknown> | undefined> {
+    const data = await this.authPost(account, "/tag/submitgroup", { v: name });
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined ? undefined : { ...object, id: opaqueIdText(object.id, "标签组") };
+  }
+
+  /** 按标签组 ID 删除标签组。 */
+  async deleteTagGroup(account: QianjiAccount, groupId: string): Promise<void> {
+    await this.authPost(account, "/tag/deletegroup", { did: groupId });
+  }
+
+  /** 创建标签；`v` 使用 JSON 字符串载荷，响应携带 ID 时返回其规范化结果。 */
+  async createTag(
+    account: QianjiAccount,
+    input: { name: string; groupId?: string; color?: string },
+  ): Promise<Record<string, unknown> | undefined> {
+    const payload: Record<string, string> = { name: input.name };
+    if (input.groupId !== undefined) payload.groupid = input.groupId;
+    if (input.color !== undefined) payload.color = input.color;
+    const data = await this.authPost(account, "/tag/submittag", { v: JSON.stringify(payload) });
+    if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const object = data as Record<string, unknown>;
+    return object.id === undefined ? undefined : { ...object, id: opaqueIdText(object.id, "标签") };
+  }
+
+  /** 提交标签完整可编辑字段；服务端会清空未提供的字段，调用方须先读取并合并。 */
+  async updateTag(
+    account: QianjiAccount,
+    tagId: string,
+    patch: { name: string; groupId: string; color: string | null },
+  ): Promise<void> {
+    const payload = { name: patch.name, groupid: patch.groupId, color: patch.color };
+    await this.authPost(account, "/tag/submittag", { did: tagId, v: JSON.stringify(payload) });
+  }
+
+  /** 按标签 ID 删除标签。 */
+  async deleteTag(account: QianjiAccount, tagId: string): Promise<void> {
+    await this.authPost(account, "/tag/deletetag", { did: tagId });
+  }
+
+  /** 按标签 ID 归档标签。 */
+  async archiveTag(account: QianjiAccount, tagId: string): Promise<void> {
+    await this.authPost(account, "/tag/archivetag", { did: tagId });
+  }
+
+  /** 按给定 ID 顺序重排标签，`v` 使用 JSON 字符串 ID 数组。 */
+  async reorderTags(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/tag/reordertag", { v: stringifyTagIdList(orderedIds, "标签") });
+  }
+
+  /** 按给定 ID 顺序重排标签组，`v` 使用 JSON 字符串 ID 数组。 */
+  async reorderTagGroups(account: QianjiAccount, orderedIds: string[]): Promise<void> {
+    await this.authPost(account, "/tag/reordergroup", { v: stringifyTagIdList(orderedIds, "标签组") });
   }
 
   /** 从钱迹增量同步协议读取一页数据。 */
