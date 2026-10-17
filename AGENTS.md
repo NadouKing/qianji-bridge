@@ -3,7 +3,7 @@
 本仓库是 `NadouKing/qianji-bridge` 个人 fork，提供钱迹的 HTTP MCP 服务。
 
 - 修改前阅读 [分支与工作目录规范](docs/development-workflow.md)，核对当前仓库、远端、工作区及已有 PR；先更新主分支，再创建任务分支。
-- [README](README.md) 拥有使用方式、部署配置、开发命令和接口边界。`src/server-instructions.md` 是服务返回给模型的运行说明，不是开发操作手册。
+- [README](README.md) 提供项目概览、快速启动和开发命令；[使用与部署参考](docs/usage.md) 拥有完整工具、部署配置和接口边界。`src/server-instructions.md` 是服务返回给模型的运行说明，不是开发操作手册。
 - 保留本 fork 的附件图片链接能力、PAT 认证及账号隔离；不顺带重置到上游或调整实际部署。
 - 凭据、数据库、账单、附件、真实响应和运行日志不进入 Git 或公开 PR；本仓库为公开仓库。
 - 保护现有本地修改和运行数据；源码维护授权不包含真实记账、删除账单、部署或重启服务。

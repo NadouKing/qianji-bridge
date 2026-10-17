@@ -70,6 +70,6 @@ GitHub CLI 在 fork 内可能默认选择上游；查询或创建 PR 时显式�
 `bun run typecheck`；纯文档修改检查事实、相对链接和 `git diff --check`。
 测试不得连接个人生产数据库或为验证而新增真实账单。需要真实财务操作时另行取得明确授权。
 
-本 fork 已提供账单附件 `imageUrls`，维护时保留 README 说明的详情、摘要及账号隔离边界。
-服务运行说明在 README，模型使用说明在 `src/server-instructions.md`；开发规范不写入模型运行说明。
+本 fork 已提供账单附件 `imageUrls`，维护时保留[使用与部署参考](usage.md)说明的详情、摘要及账号隔离边界。
+README 保留快速启动，完整服务运行说明在 `docs/usage.md`，模型使用说明在 `src/server-instructions.md`；开发规范不写入模型运行说明。
 合并主分支会触发现有容器镜像构建与推送，提交 PR 不等于授权合并、发布或重启本地服务。
