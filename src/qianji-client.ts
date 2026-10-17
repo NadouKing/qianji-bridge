@@ -464,10 +464,38 @@ export class QianjiClient {
       if (budget.cateid !== undefined && budget.cateid !== null) {
         normalized.cateid = referenceIdText(budget.cateid, "预算分类");
       }
+      if (budget.budgetid !== undefined && budget.budgetid !== null) {
+        normalized.budgetid = optionalPositiveIdText(budget.budgetid, "预算");
+      }
       if (budget.category !== undefined && budget.category !== null) {
         normalized.category = normalizeCategory(asObject(budget.category));
       }
       return normalized;
+    });
+  }
+
+  /** submitv2 替换期间预算列表，调用方必须传入合并后的完整定义。 */
+  async submitBudget(
+    account: QianjiAccount,
+    bookId: string,
+    period: BudgetPeriod,
+    changes: Array<{ categoryId?: string; amount: number; budgetId?: string }>,
+    range?: string,
+  ): Promise<void> {
+    const rawId = (id: string) => (JSON as JsonWithRaw).rawJSON(optionalPositiveIdText(id, "预算引用"));
+    const typeInfo = period.kind === "month" ? `${period.year},${period.month}` : String(period.year);
+    const entries = changes.map((change) => ({
+      bookid: rawId(bookId), userid: account.uid,
+      type: period.kind === "month" ? 1 : 2, typeinfo: typeInfo,
+      flag: change.categoryId === undefined ? 1 : 2,
+      cateid: rawId(change.categoryId ?? "-1"), money: change.amount,
+      ...(change.budgetId ? { budgetid: rawId(change.budgetId) } : {}),
+    }));
+    await this.authPost(account, "/budget/submitv2", {
+      bookid: bookId,
+      flts: JSON.stringify({ [period.kind]: typeInfo }),
+      changelist: JSON.stringify(entries),
+      ...(range ? { range } : {}),
     });
   }
 

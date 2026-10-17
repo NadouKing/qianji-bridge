@@ -591,6 +591,10 @@ const budgetRangeFields = {
   endTime: z.number().int().describe("实际预算期间终点，Unix 秒，包含边界"),
   timezoneOffsetSeconds: z.literal(28_800).describe("预算日期固定使用 UTC+08:00"),
 };
+const budgetTargetSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("total").describe("总预算") }),
+  z.strictObject({ kind: z.literal("category").describe("分类预算"), categoryId: positiveIdText.describe("本账本的支出分类 ID") }),
+]).describe("预算设置目标");
 const budgetPeriodOutputSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("month").describe("月度预算"),
@@ -1027,6 +1031,27 @@ export function createMoneyTrackMcp(
     },
     async (input, ctx) => toolResult(async () => ({
       budget: await service.getBudget(await userId(principal, store), input),
+    }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "set_budget",
+    {
+      description: "设置指定账本月份或年份的一项总预算或分类预算，其他额度保持，金额为 0 清除此项额度，写入后回读确认",
+      inputSchema: z.strictObject({
+        bookId: bookIdText.describe("明确指定的账本 ID"),
+        period: budgetPeriodInputSchema.describe("必须明确指定预算期间"),
+        target: budgetTargetSchema.describe("明确选择总预算或一个支出分类预算"),
+        amount: nonnegativeMoneySchema.describe("本位币预算额度，0 清除此项额度，不删除账单"),
+      }),
+      outputSchema: z.object({ setting: z.object({
+        bookId: bookIdText, period: budgetPeriodInputSchema.describe("预算期间"), target: budgetTargetSchema,
+        amount: nonnegativeMoneySchema.describe("回读确认的本位币额度"),
+      }).describe("回读确认的单项设置，有效总额度和使用情况请查询 get_budget") }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    },
+    async (input, ctx) => toolResult(async () => ({
+      setting: await service.setBudget(await userId(principal, store), input),
     }), ctx, principal, bindingTickets),
   );
 

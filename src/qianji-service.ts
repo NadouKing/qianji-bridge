@@ -148,6 +148,13 @@ export interface GetBudgetInput {
   includeDailyStatistics?: boolean;
 }
 
+export interface SetBudgetInput {
+  bookId: string;
+  period: BudgetPeriod;
+  target: { kind: "total" } | { kind: "category"; categoryId: string };
+  amount: number;
+}
+
 export interface CreateCategoryInput {
   bookId?: BookIdInput;
   name: string;
@@ -1019,6 +1026,72 @@ export class MoneyTrackService {
         currency: requireBaseCurrency(await this.loadUserWithCurrencyConfig(account)),
         includeDailyStatistics: input.includeDailyStatistics === true,
         nowMs,
+      });
+    });
+  }
+
+  /** 修改单项预算；提交后回读，其他总预算和分类额度必须保持。 */
+  async setBudget(accountId: number, input: SetBudgetInput): Promise<SetBudgetInput> {
+    const bookId = normalizeBookId(input.bookId);
+    requireNonnegativeMoney(input.amount, "预算额度");
+    if (!input.period) throw new AppError("INVALID_BUDGET_PERIOD", "设置预算必须指定期间");
+    if (!input.target || !["total", "category"].includes(input.target.kind)) {
+      throw new AppError("INVALID_BUDGET_TARGET", "必须指定总预算或分类预算");
+    }
+    const categoryId = input.target.kind === "category" ? normalizeCategoryId(input.target.categoryId) : undefined;
+    return this.withBillAccount(accountId, async (account) => {
+      const book = await this.requireBook(account, bookId, { forceRefresh: true, allowStale: false });
+      await this.requireWritableBook(account, bookId);
+      const range = budgetBookRange(book);
+      const period = resolveBudgetPeriod(input.period, range, this.now()).filter;
+      if (categoryId !== undefined) {
+        const roots = await this.loadCategories(account, bookId, { forceRefresh: true, allowStale: false });
+        const found = roots.flatMap((root) => [root, ...categoryChildren(root)])
+          .find((category) => String(category.id) === categoryId);
+        if (!found || Number(found.type) !== 0) throw new AppError("INVALID_BUDGET_CATEGORY", "预算分类必须是指定账本中的支出分类");
+      }
+      const key = (item: Record<string, unknown>) => Number(item.flag) === 1 ? "total" : `category:${item.cateid}`;
+      const targetKey = categoryId === undefined ? "total" : `category:${categoryId}`;
+      const before = await this.client.listBudgets(account, bookId, period, range);
+      const keys = new Set<string>();
+      const changes = before.map((item) => {
+        const flag = Number(item.flag);
+        const itemKey = key(item);
+        if (![1, 2].includes(flag) || String(item.bookid) !== bookId || keys.has(itemKey)) {
+          throw new AppError("QIANJI_RESPONSE_INVALID", "预算列表包含未知种类、其他账本或重复项，拒绝覆盖", 502);
+        }
+        keys.add(itemKey);
+        const amount = Number(item.money);
+        requireNonnegativeMoney(amount, "现有预算额度");
+        return {
+          ...(flag === 2 ? { categoryId: normalizeCategoryId(String(item.cateid)) } : {}),
+          amount: itemKey === targetKey ? input.amount : amount,
+          ...(item.budgetid && String(item.budgetid) !== "-1" ? { budgetId: String(item.budgetid) } : {}),
+        };
+      });
+      if (!keys.has(targetKey)) changes.push({ ...(categoryId ? { categoryId } : {}), amount: input.amount });
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        try {
+          // APK 输入分类额度 0 时从完整列表移除该项；发送 money=0 的分类会被上游拒绝。
+          await this.client.submitBudget(account, bookId, period,
+            changes.filter((change) => change.categoryId === undefined || change.amount > 0), range);
+        } catch (error) {
+          const cause = safeError(error);
+          throw new AppError(cause.code, `${cause.message}。预算写入结果未确认，请先用 get_budget 回读，勿直接重试。`, cause.httpStatus);
+        }
+        markRemoteSuccess();
+        try {
+          const after = await this.client.listBudgets(account, bookId, period, range);
+          const actual = after.find((item) => key(item) === targetKey);
+          if (Number(actual?.money ?? 0) !== input.amount) throw new AppError("BUDGET_CONFIRMATION_MISMATCH", "目标预算额度与提交值不同，请用 get_budget 核对");
+          const others = (items: Record<string, unknown>[]) => JSON.stringify(items
+            .filter((item) => key(item) !== targetKey && Number(item.money) !== 0)
+            .map((item) => [key(item), Number(item.money)]).sort(([a], [b]) => String(a).localeCompare(String(b))));
+          if (others(before) !== others(after)) throw new AppError("BUDGET_CONFIRMATION_MISMATCH", "其他预算发生变化，可能有并发编辑，请用 get_budget 核对；不要自动覆盖");
+        } catch (error) {
+          throw new AppError("WRITE_CONFIRMATION_FAILED", `预算已提交，但回读确认失败：${safeError(error).message}。请调用 get_budget 核对，操作不会自动回滚，不得盲目重试。`, 502);
+        }
+        return { bookId, period, target: input.target, amount: input.amount };
       });
     });
   }

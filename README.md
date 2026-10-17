@@ -186,6 +186,7 @@ https://qianjiga.litangkj.com
 | 查询借入或借出详情 | `list_debt_accounts` |
 | 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bill_statistics`、`refresh_cache` |
 | 查询预算使用情况 | `get_budget` |
+| 设置单项总预算或分类预算 | `set_budget` |
 | 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
 | 删除普通收支、待报销支出、转账或还款 | `delete_bills` |
 | 转账与信用卡还款 | `create_transfer`、`update_transfer` |
@@ -204,6 +205,8 @@ https://qianjiga.litangkj.com
 - `bookId: "-1"` 只表示钱迹默认账本，`categoryId` 不接受 `"-1"`
 - `create_bills`、`update_bills`和 `delete_bills` 即使只操作一笔也使用单项列表，级联删除在对应 `deletions[]` 项中显式设置 `cascadeRelatedBills: true`
 - 批量写入只部分成功时，错误会按输入序号列出逐项结果，成功项已经写入，不得重试
+- `set_budget` 必须指定 `bookId`、`period`、`target` 和本位币 `amount`，`target` 为 `{ "kind": "total" }` 或 `{ "kind": "category", "categoryId": "…" }`，0 清除此项额度，不删除账单
+- 钱迹预算写入接口替换整个期间的预算列表，服务会先读取最新完整定义、合并单项修改、提交并回读核对其他额度；这不是跨客户端原子操作，请避免在 App 同时改预算，结果未确认时先用 `get_budget` 查询
 
 `money`、`fee` 和 `discount` 均使用币种主单位，不使用分、美分等最小货币单位。
 
