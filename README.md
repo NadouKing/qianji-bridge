@@ -16,6 +16,8 @@
 
 完整功能与工具名称见[工具与能力说明](docs/features.md)。
 
+批量对账可用配套的[本地对账客户端](docs/reconciliation.md)：解析微信 XLSX／支付宝 CSV、生成只读候选、批量查询详情，并在明确授权后使用私人回执串行执行写入计划。
+
 ## 快速开始
 
 需要 [Bun](https://bun.sh/) **1.3.14 或更高版本**，以及支持 **Streamable HTTP** 和自定义 Authorization Header 的 MCP 客户端。

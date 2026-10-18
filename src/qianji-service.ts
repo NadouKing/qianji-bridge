@@ -220,6 +220,8 @@ export class MoneyTrackService {
   private readonly client: QianjiClient;
   private readonly now: () => number;
   private readonly locks = new Map<string, Promise<void>>();
+  // 仅记录本进程确认的同步；重启后保持未知，不把读取缓存的时间当作同步时间。
+  private readonly billSyncTimes = new Map<number, number>();
   private readonly initializingAccounts = new Set<number>();
   private readonly initialSyncs = new Map<number, Promise<void>>();
   private readonly initialSyncFailures = new Map<number, AppError>();
@@ -956,6 +958,31 @@ export class MoneyTrackService {
       const bill = await this.store.getBill(account.id, id);
       if (!bill) throw new AppError("BILL_NOT_FOUND", "账单不存在", 404);
       return publicBill(cachedBillObject(bill));
+    });
+  }
+
+  /** 一次账号锁内读取所选完整详情，可先同步账单而不强制刷新全部目录。 */
+  async getBills(accountId: number, billIds: BillIdInput[], refresh = false) {
+    const ids = [...new Set(billIds.map(normalizeBillId))];
+    if (billIds.length < 1 || billIds.length > 100) {
+      throw new AppError("INVALID_BILL_IDS", "每批提供 1 至 100 个账单 ID");
+    }
+    return this.withBillAccount(accountId, async (account) => {
+      const needsSync = refresh || await this.store.getSyncState(account.id) === undefined;
+      if (needsSync) await this.syncUnlocked(account);
+      const results = [];
+      for (const billId of ids) {
+        const row = await this.store.getBill(account.id, billId);
+        results.push({ billId, bill: row ? publicBill(cachedBillObject(row)) : null });
+      }
+      return {
+        results,
+        cache: {
+          readAt: Math.floor(this.now() / 1000),
+          lastSyncedAt: this.billSyncTimes.get(account.id) ?? null,
+          refreshed: needsSync,
+        },
+      };
     });
   }
 
@@ -2281,6 +2308,7 @@ export class MoneyTrackService {
         invalidatedCategoryScopes,
         lasttimes: finalLasttimes,
       });
+      this.billSyncTimes.set(account.id, Math.floor(this.now() / 1000));
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError("DATABASE_TRANSACTION_FAILED", "同步事务失败并已回滚", 500);

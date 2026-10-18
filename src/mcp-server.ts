@@ -980,6 +980,31 @@ export function createMoneyTrackMcp(
   );
 
   server.registerTool(
+    "get_bills",
+    {
+      description: "批量读取完整账单及附件地址，可先同步账单并返回缓存状态",
+      inputSchema: z.strictObject({
+        billIds: z.array(positiveIdText).min(1).max(100).describe("账单 ID 列表，重复 ID 保留首次出现顺序"),
+        refresh: z.boolean().optional().default(false).describe("先增量同步当前账号账单，不强制刷新全部目录"),
+      }),
+      outputSchema: z.object({
+        results: z.array(z.object({
+          billId: positiveIdText.describe("请求的账单 ID"),
+          bill: billSchema.nullable().describe("完整详情，不存在或不属于当前账号时为 null"),
+        })).describe("按 ID 首次出现顺序返回的结果"),
+        cache: z.object({
+          readAt: z.number().int().describe("读取缓存的时间，Unix 秒，不表示已经同步"),
+          lastSyncedAt: z.number().int().nullable().describe("本进程确认的最近账单同步时间，Unix 秒，未知为 null"),
+          refreshed: z.boolean().describe("本次调用是否成功完成账单同步"),
+        }).describe("账单缓存读取和同步状态"),
+      }),
+      annotations: readAnnotations,
+    },
+    async ({ billIds, refresh }, ctx) => toolResult(async () =>
+      service.getBills(await userId(principal, store), billIds, refresh), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
     "get_bill_statistics",
     {
       description: "聚合本地账单并返回固定统计结果，金额统计采用钱迹 APK 已确认的主报表规则，日均分母只计已经完整结束的日历日",

@@ -35,6 +35,7 @@ const BUSINESS_TOOLS = [
   "delete_tags",
   "disconnect_qianji",
   "get_bill",
+  "get_bills",
   "get_bill_statistics",
   "get_budget",
   "get_user_info",
@@ -1439,6 +1440,17 @@ test("get_bill 通过 MCP 返回缓存附件地址，列表不包含地址且不
   assert.equal(denied.isError, true);
   assert.match(JSON.stringify(denied.content), /BILL_NOT_FOUND/);
   assert.doesNotMatch(JSON.stringify(denied), /other-private-image/);
+  const batch = await client.callTool({ name: "get_bills", arguments: { billIds: [billId, otherBillId, billId] } });
+  assert.equal(batch.isError, undefined, JSON.stringify(batch.content));
+  const batchData = batch.structuredContent as { results: Array<{ billId: string; bill: { imageUrls: string[] } | null }>; cache: { refreshed: boolean } };
+  assert.equal(batchData.results.length, 2);
+  assert.equal(batchData.results[1]!.bill, null);
+  assert.equal(batchData.cache.refreshed, false);
+  assert.deepEqual(batchData.results[0]!.bill!.imageUrls, [
+    "https://billimg.qianjiapp.com/fixture-image!webporigin",
+    "https://billimg.qianjiapp.com/fixture-image_hg!huge",
+  ]);
+  assert.doesNotMatch(JSON.stringify(batch), /other-private-image/);
   assert.equal(upstreamCalls, 1, "附件映射只读已同步缓存，不额外访问 API 或 CDN");
 });
 

@@ -10,7 +10,8 @@
     "start": "bun src/http-server.ts",
     "dev": "bun --watch src/http-server.ts",
     "typecheck": "bun run tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "reconcile": "bun src/reconcile-cli.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",

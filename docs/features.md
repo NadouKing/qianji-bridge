@@ -4,14 +4,14 @@
 
 ## 现在能做什么
 
-以下功能以当前检出的代码为准；未合并分支或本地改动不会自动出现在已部署服务中。当前普通用户有 **42 个工具**，超级管理员额外有 **3 个 PAT 管理工具**。
+以下功能以当前检出的代码为准；未合并分支或本地改动不会自动出现在已部署服务中。当前普通用户有 **43 个工具**，超级管理员额外有 **3 个 PAT 管理工具**。
 
 | 使用场景 | 工具 |
 |---|---|
 | 账号登录与解绑 | `connect_qianji`、`disconnect_qianji` |
 | 查询基础数据 | `list_books`、`list_book_members`、`list_assets`、`list_categories`、`list_tags`、`get_user_info` |
 | 查询借入或借出详情 | `list_debt_accounts` |
-| 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bill_statistics`、`refresh_cache` |
+| 查询、统计与刷新账单 | `list_bills`、`get_bill`、`get_bills`、`get_bill_statistics`、`refresh_cache` |
 | 查询预算使用情况 | `get_budget` |
 | 设置单项总预算或分类预算 | `set_budget` |
 | 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
