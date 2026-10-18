@@ -117,8 +117,9 @@ def parse(path):
             "kind": data.get("交易分类", data.get("交易类型", "")),
             "note": data.get("备注", ""),
         }
+        identity = {key: value for key, value in record.items() if key != "sourceRow"}
         record["id"] = source + ":" + (record["orderId"] or hashlib.sha256(
-            json.dumps(record, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
+            json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
         if record["id"] in seen:
             raise ValueError("Duplicate transaction at source row " + str(row_number))
         seen.add(record["id"])

@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { checkWriteScope, main } from "../src/reconcile-cli.ts";
 import {
-  billFingerprint, executeJournal, OperationFailure, planSchema, privatePath, proposeMatches, rulesSchema,
+  billFingerprint, executeJournal, OperationFailure, planHash, planSchema, privatePath, proposeMatches, rulesSchema,
   type SourceRecord, type LedgerBill,
 } from "../src/reconciliation.ts";
 import test from "./context.ts";
@@ -93,6 +94,50 @@ test("apply defaults to validation without connecting or writing; preflight reje
   await assert.rejects(checkWriteScope(other, async () => ({ user: { id: "fixture-uid" } })), /another book/);
   const missingBook = { ...plan, operations: [{ ...plan.operations[0]!, arguments: { bills: [{ money: 3 }] } }] };
   await assert.rejects(checkWriteScope(missingBook, async () => ({ user: { id: "fixture-uid" } })), /explicit allowed/);
+});
+
+test("durable receipt takes precedence over a stale or missing JSON mirror", async t => {
+  const dir = await directory(t), path = join(dir, "journal.json");
+  let calls = 0;
+  await executeJournal(plan, path, async () => {
+    const db = new Database(path + ".sqlite", { readonly: true });
+    try {
+      const saved = db.query<{ payload: string }, []>("SELECT payload FROM receipt WHERE id = 1").get();
+      assert.equal(JSON.parse(saved!.payload).operations.at(-1).status, "pending");
+    } finally { db.close(); }
+    calls++; return {};
+  });
+  await writeFile(path, JSON.stringify({ version: 1, hash: planHash(plan), batchId: plan.batchId, operations: [] }));
+  await executeJournal(plan, path, async () => { calls++; return {}; });
+  await rm(path);
+  await executeJournal(plan, path, async () => { calls++; return {}; });
+  assert.equal(calls, 2);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).operations.length, 2);
+});
+
+test("journal resume validates only unfinished work under its lock", async t => {
+  const dir = await directory(t), path = join(dir, "journal.json");
+  const before = ledger("101", 3);
+  const update = planSchema.parse({ ...plan,
+    expectedBills: [{ billId: "101", hash: billFingerprint(before) }],
+    operations: [{ id: "edit", tool: "update_bills", arguments: { updates: [{ billId: "101", patch: { remark: "reviewed" } }] } }, plan.operations[1]],
+  });
+  await writeFile(path, JSON.stringify({ version: 1, hash: planHash(update), batchId: update.batchId,
+    operations: [{ id: "edit", status: "confirmed" }] }));
+  const reads: string[] = [], writes: string[] = [];
+  const call = async (name: string) => {
+    reads.push(name);
+    if (name === "get_bills") throw new Error("Completed bill must not be checked against its old fingerprint");
+    return name === "get_user_info" ? { user: { id: update.accountUid } } : {};
+  };
+  await executeJournal(update, path, async tool => { writes.push(tool); return {}; }, async remaining => {
+    await assert.rejects(executeJournal(update, path, async () => ({})), /EEXIST/);
+    await checkWriteScope(remaining, call);
+  });
+  assert.deepEqual(writes, ["create_transfer"]);
+  reads.length = 0;
+  await executeJournal(update, path, async () => { throw new Error("Must not replay"); }, remaining => checkWriteScope(remaining, call));
+  assert.deepEqual(reads, ["get_user_info"]);
 });
 
 test("write preflight rejects source changes after review and accepts unchanged fingerprints", async () => {

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
+import { Database } from "bun:sqlite";
 
 export const recordSchema = z.object({
   id: z.string().min(1), source: z.enum(["wechat", "alipay"]), sourceRow: z.number().int().positive(),
@@ -171,14 +172,28 @@ export class OperationFailure extends Error {
   constructor(detail: unknown) { super("MCP operation failed; review the private journal"); this.detail = detail; }
 }
 /** Persist before every call. Unknown/partial results never replay, including after restart. */
-export async function executeJournal(plan: WritePlan, path: string, execute: (tool: string, args: Record<string, unknown>) => Promise<unknown>) {
+export async function executeJournal(
+  plan: WritePlan, path: string,
+  execute: (tool: string, args: Record<string, unknown>) => Promise<unknown>,
+  beforeExecute?: (remaining: WritePlan) => Promise<void>,
+) {
   const target = await privatePath(path);
+  const databasePath = await privatePath(target + ".sqlite");
   const lockPath = target + ".lock";
   const lock = await open(lockPath, "wx", 0o600);
+  let database: Database | undefined;
   try {
+    // SQLite's native VFS handles crash-safe commits on Windows as well as POSIX.
+    // The JSON file is a readable mirror, never the authority for replay decisions.
+    try { const file = await open(databasePath, "wx", 0o600); await file.close(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    database = new Database(databasePath, { strict: true });
+    database.exec("PRAGMA journal_mode = DELETE; PRAGMA synchronous = EXTRA; PRAGMA fullfsync = ON;");
+    database.exec("CREATE TABLE IF NOT EXISTS receipt (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL)");
+    const stored = database.query<{ payload: string }, []>("SELECT payload FROM receipt WHERE id = 1").get();
     let journal: Journal;
     try {
-      journal = JSON.parse(await readFile(target, "utf8")) as Journal;
+      journal = JSON.parse(stored?.payload ?? await readFile(target, "utf8")) as Journal;
       if (journal.version !== 1 || journal.hash !== planHash(plan) || journal.batchId !== plan.batchId) throw new Error("Journal does not match plan");
       if (!Array.isArray(journal.operations) || journal.operations.some((entry, i) =>
         entry.id !== plan.operations[i]?.id || entry.status !== "confirmed")) {
@@ -188,26 +203,35 @@ export async function executeJournal(plan: WritePlan, path: string, execute: (to
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       journal = { version: 1, hash: planHash(plan), batchId: plan.batchId, operations: [] };
-      await writePrivateJson(target, journal);
     }
-    for (const operation of plan.operations.slice(journal.operations.length)) {
+    const persist = async () => {
+      database!.query("INSERT INTO receipt (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload")
+        .run(JSON.stringify(journal));
+      await writePrivateJson(target, journal, true);
+    };
+    await persist();
+    const remaining = plan.operations.slice(journal.operations.length);
+    // Hold the same lock while checking only work that has not already succeeded.
+    await beforeExecute?.({ ...plan, operations: remaining });
+    for (const operation of remaining) {
       const entry: Journal["operations"][number] = { id: operation.id, status: "pending" };
       journal.operations.push(entry);
-      await writePrivateJson(target, journal, true);
+      await persist();
       try {
         entry.result = await execute(operation.tool, operation.arguments);
         entry.status = "confirmed";
-        await writePrivateJson(target, journal, true);
+        await persist();
       } catch (error) {
         entry.status = "uncertain";
         entry.failure = error instanceof OperationFailure ? error.detail : { message: "Request or confirmation failed" };
         // Partial success is also uncertain. Preserve successful earlier operations and stop.
-        await writePrivateJson(target, journal, true);
+        await persist();
         throw new Error("Operation result uncertain; stopped without retry. Inspect the journal and refreshed ledger.");
       }
     }
     return { batchId: journal.batchId, confirmed: journal.operations.length };
   } finally {
+    database?.close();
     await lock.close();
     await unlink(lockPath);
   }

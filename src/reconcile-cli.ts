@@ -103,6 +103,7 @@ function references(value: unknown, ids = new Set<string>(), books = new Set<str
 export async function checkWriteScope(plan: WritePlan, call: Call) {
   const user = (await call("get_user_info", {})).user as { id?: string } | undefined;
   if (user?.id !== plan.accountUid) throw new Error("Plan belongs to another account");
+  if (plan.operations.length === 0) return;
   const { ids, books } = references(plan.operations);
   const expected = new Map(plan.expectedBills.map(b => [b.billId, b.hash]));
   if ([...ids].some(id => !expected.has(id))) throw new Error("Every referenced bill needs a reviewed fingerprint from details");
@@ -166,7 +167,7 @@ export async function main(args: string[]) {
         const result = await call("list_bills", cursor ? { cursor } : { bookId, startTime, endTime, limit: 100, sort: "timeAsc" });
         for (const bill of z.array(billSchema).parse(result.results)) {
           if (ids.has(bill.id)) throw new Error("Repeated bill across pages");
-          if (bill.bookId !== bookId && bookId !== "-1") throw new Error("Unexpected book");
+          if (bill.bookId !== bookId) throw new Error("Unexpected book");
           ids.add(bill.id); bills.push(bill);
         }
         if (result.nextCursor !== null && typeof result.nextCursor !== "string") throw new Error("Invalid next cursor");
@@ -208,8 +209,7 @@ export async function main(args: string[]) {
     }
     const journal = await privatePath(opts.require("journal"));
     await connect(async call => {
-      await checkWriteScope(plan, call);
-      console.log(JSON.stringify(await executeJournal(plan, journal, call)));
+      console.log(JSON.stringify(await executeJournal(plan, journal, call, remaining => checkWriteScope(remaining, call))));
     });
   } else throw new Error("Unknown command; use --help");
 }

@@ -43,6 +43,20 @@ class ReaderTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cent"):
                 reader.parse(self.csv_file(folder, amount="3.211"))
 
+    def test_fallback_identity_ignores_row_location(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.csv_file(folder, duplicate=True)
+            path.write_bytes(path.read_bytes().replace(b"fixture-order", b""))
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                reader.parse(path)
+            path = self.csv_file(folder)
+            path.write_bytes(path.read_bytes().replace(b"fixture-order", b""))
+            first = reader.parse(path)["records"][0]
+            path.write_bytes(b"\n" + path.read_bytes())
+            second = reader.parse(path)["records"][0]
+            self.assertNotEqual(first["sourceRow"], second["sourceRow"])
+            self.assertEqual(first["id"], second["id"])
+
     def test_xlsx_sheet_relationships_shared_strings_and_source_rows(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "fixture.xlsx"
