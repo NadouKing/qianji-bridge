@@ -108,6 +108,7 @@ MCP Client 必须支持配置自定义 `Authorization` Header。
 | `QIANJI_MCP_DATABASE_PATH` | 否 | `data/qianji.db` | SQLite 文件路径，Docker 镜像默认为 `/data/qianji.db` |
 | `QIANJI_MCP_DATABASE_URL` | 否 | 无 | PostgreSQL 或 MySQL 连接 URL，设置后不使用 SQLite |
 | `QIANJI_MCP_API_SERVER` | 否 | `https://api.qianjiapp.com` | 钱迹 API 基础地址，只能包含 HTTP(S) 协议和主机 |
+| `QIANJI_MCP_RECOVERY_ROOT` | 否 | 关闭 | 显式启用本机恢复功能的私人备份根目录，备份 SQLite 仅只读访问，不放入源码或公开目录 |
 | `QIANJI_MCP_DEBUG_LOG_PATH` | 否 | 关闭 | 钱迹上游请求日志的 JSONL 文件路径，可能包含未脱敏的个人资料和账单，仅限短时排查，详见[调试日志说明](security.md#调试日志注意事项) |
 
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readRecoveryBackup, remapBillAsset, recoveryFingerprint, saveRecoveryRecord } from "./bill-recovery.ts";
 
 import {
   applyPatch,
@@ -148,6 +149,16 @@ export interface GetBudgetInput {
   includeDailyStatistics?: boolean;
 }
 
+export interface RecoverAssetBillsInput {
+  oldAssetId: string;
+  newAssetId: string;
+  billIds: string[];
+  currency: string;
+  backupPath?: string;
+  dryRun?: boolean;
+  recreateMissing?: boolean;
+}
+
 export interface SetBudgetInput {
   bookId: string;
   period: BudgetPeriod;
@@ -219,6 +230,7 @@ export class MoneyTrackService {
   private readonly store: DataStore;
   private readonly client: QianjiClient;
   private readonly now: () => number;
+  private readonly recoveryRoot?: string;
   private readonly locks = new Map<string, Promise<void>>();
   // 仅记录本进程确认的同步；重启后保持未知，不把读取缓存的时间当作同步时间。
   private readonly billSyncTimes = new Map<number, number>();
@@ -227,10 +239,11 @@ export class MoneyTrackService {
   private readonly initialSyncFailures = new Map<number, AppError>();
 
   /** 创建业务服务，时间函数可注入，以便确定性验证缓存和配额边界。 */
-  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now) {
+  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now, options: { recoveryRoot?: string } = {}) {
     this.store = store;
     this.client = client;
     this.now = now;
+    this.recoveryRoot = options.recoveryRoot;
   }
 
   /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储。 */
@@ -747,7 +760,7 @@ export class MoneyTrackService {
   }
 
   /** 强制刷新当前账号的用户、账单及全部目录快照。 */
-  async refreshCache(accountId: number): Promise<{
+  async refreshCache(accountId: number, fullBillSync = false): Promise<{
     userRefreshed: true;
     bookCount: number;
     visibleBookCount: number;
@@ -764,7 +777,7 @@ export class MoneyTrackService {
       if (retryingInitialSync) this.initializingAccounts.add(account.id);
       try {
         await this.loadUser(account, true);
-        await this.syncUnlocked(account);
+        await this.syncUnlocked(account, fullBillSync);
       } catch (error) {
         if (retryingInitialSync) this.initialSyncFailures.set(account.id, this.initialSyncFailure(error));
         throw error;
@@ -2036,6 +2049,414 @@ export class MoneyTrackService {
     });
   }
 
+  /** Restore a category through the supported batch patch, preserving the special bill ID. */
+  async restoreBillCategory(accountId: number, input: { billId: string; categoryId: string; expectedCategoryId: string | null; asOrdinaryExpense?: boolean }): Promise<Record<string, unknown>> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const id = normalizeBillId(input.billId), categoryId = normalizeCategoryId(input.categoryId);
+      await this.syncUnlocked(account);
+      const row = await this.store.getBill(account.id, id);
+      if (!row) throw new AppError("BILL_NOT_FOUND", "账单不存在", 404);
+      const raw = cachedBillObject(row), before = publicBill(raw);
+      requireOwnedBill(raw, account.uid, true);
+      if (![0, 1, 5, 10, 11].includes(Number(raw.type)) || before.categoryId !== input.expectedCategoryId) {
+        throw new AppError("RECOVERY_CATEGORY_CONFLICT", "类型或预期当前分类不符", 409);
+      }
+      if (before.categoryId === categoryId && !input.asOrdinaryExpense) return before;
+      if ([10, 11].includes(Number(raw.type)) && !input.asOrdinaryExpense) {
+        throw new AppError("RECOVERY_INTEREST_CONSENT_REQUIRED", "旧利息分类需明确允许兼容的普通支出请求方式，不能用通用更新清空分类", 409);
+      }
+      await this.validateWriteReferences(account, String(raw.bookid), [1, 11].includes(Number(raw.type)) ? 1 : 0,
+        categoryId, normalizeAssetId((raw.assetid ?? "-1") as string), tagIdsFrom(raw));
+      if (input.asOrdinaryExpense && Number(raw.type) !== 10) throw new AppError("RECOVERY_SCENARIO_INVALID", "仅可将已明确获准的旧利息支出改为普通支出");
+      const expected = input.asOrdinaryExpense ? { ...before, type: 0, categoryId, fromId: null, targetId: null, discount: 0 }
+        : { ...before, categoryId };
+      return this.withBusinessWrite(account, tagIdsFrom(raw), async (markRemoteSuccess) => {
+        if (Number(raw.type) === 10 || Number(raw.type) === 11) {
+          const changed = { ...raw, cateid: categoryId, status: 2, updatetime: Math.floor(this.now() / 1000),
+            type: input.asOrdinaryExpense ? 0 : raw.type,
+            fromid: input.asOrdinaryExpense ? "-1" : raw.fromid ?? "-1", targetid: raw.targetid ?? "-1", images: raw.images ?? [] };
+          for (const field of DISPLAY_FIELDS) delete (changed as Record<string, unknown>)[field];
+          const result = await this.client.syncBills(account, { bills: { changelist: [changed] } });
+          await this.acceptSyncBillResult(account, result, [id], markRemoteSuccess);
+        } else {
+          await this.client.modifyBillCategory(account, id, categoryId);
+          markRemoteSuccess();
+        }
+        await this.confirmWrite(() => this.syncUnlocked(account));
+        const confirmed = await this.store.getBill(account.id, id);
+        const actual = confirmed && publicBill(cachedBillObject(confirmed));
+        const originalTypeRestored = input.asOrdinaryExpense && actual
+          && recoveryFingerprint(actual) === recoveryFingerprint({ ...before, categoryId });
+        if (!actual || (!originalTypeRestored && recoveryFingerprint(actual) !== recoveryFingerprint(expected))) {
+          throw writeConfirmationFailed("原分类恢复后未完全确认，请刷新核对，不得重试");
+        }
+        return actual;
+      });
+    });
+  }
+
+  /** Repair the funding account on a debt asset; the opening bill is generated by the server. */
+  async recoverDebtWallet(accountId: number, input: { billId: string; oldAssetId: string; newAssetId: string; currency: string; dryRun?: boolean }): Promise<{ dryRun: boolean; bill: Record<string, unknown> }> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const id = normalizeBillId(input.billId), oldId = normalizeRequiredAssetId(input.oldAssetId), newId = normalizeRequiredAssetId(input.newAssetId);
+      await this.syncUnlocked(account);
+      const row = await this.store.getBill(account.id, id);
+      if (!row) throw new AppError("BILL_NOT_FOUND", "原借贷账单不存在", 404);
+      const raw = cachedBillObject(row);
+      requireOwnedBill(raw, account.uid, true);
+      if (![6, 7].includes(Number(raw.type)) || ![raw.fromid, raw.targetid].some((value) => [oldId, newId].includes(String(value)))) {
+        throw new AppError("RECOVERY_SCENARIO_INVALID", "不符合借贷起始记录恢复条件");
+      }
+      const assets = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+      const target = assets.find((asset) => String(asset.id) === newId && Number(asset.status) === 0);
+      if (assets.some((asset) => String(asset.id) === oldId) || !target || await this.resolvedAssetCurrency(account, target) !== input.currency) {
+        throw new AppError("RECOVERY_ASSET_INVALID", "新旧钱包状态或币种不符");
+      }
+      const direction = Number(raw.type) === 6 ? 51 : 52;
+      const candidates = (await Promise.all(([0, 1] as const).map((status) => this.client.listDebtAccounts(account, direction, status)))).flat();
+      const debt = candidates.find((value) => String(value.id) === String(raw.assetid));
+      const loan = debt?.loan as Record<string, unknown> | undefined;
+      if (!debt || !loan || publicUserId(debt.userid) !== account.uid || await this.resolvedAssetCurrency(account, debt) !== input.currency
+        || !["0", oldId, newId].includes(String(loan.accountId))) throw new AppError("RECOVERY_DEBT_CONFLICT", "借贷资料或原资金账户不符");
+      const expected = publicBill(remapBillAsset(raw, oldId, newId));
+      if (input.dryRun !== false) return { dryRun: true, bill: expected };
+      if (String(loan.accountId) === newId && recoveryFingerprint(publicBill(raw)) === recoveryFingerprint(expected)) {
+        return { dryRun: false, bill: expected };
+      }
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        saveRecoveryRecord(this.recoveryRoot!, account.uid, id, { bill: raw, debt, newAssetId: newId, at: this.now() });
+        if (recoveryFingerprint(publicBill(raw)) !== recoveryFingerprint(expected)) {
+          const opening = { ...remapBillAsset(raw, oldId, newId), status: 2, updatetime: Math.floor(this.now() / 1000) };
+          for (const field of DISPLAY_FIELDS) delete (opening as Record<string, unknown>)[field];
+          for (const field of ["cateid", "assetid", "fromid", "targetid"]) if ((opening as Record<string, unknown>)[field] === null) delete (opening as Record<string, unknown>)[field];
+          const result = await this.client.syncBills(account, { bills: { changelist: [opening] } });
+          await this.acceptSyncBillResult(account, result, [id], markRemoteSuccess);
+          await this.syncUnlocked(account);
+          const confirmed = await this.store.getBill(account.id, id);
+          if (!confirmed || recoveryFingerprint(publicBill(cachedBillObject(confirmed))) !== recoveryFingerprint(expected)) {
+            throw writeConfirmationFailed("借贷起始账单账户变更未完全确认，禁止重放，请核对私人回执");
+          }
+        }
+        const changed = { ...debt, loan: { ...loan, accountId: newId } };
+        if (String(loan.accountId) !== newId) {
+          await this.client.submitAssetBalance(account, changed, Number(debt.money), {
+            bookid: String(raw.bookid), accountId: newId, images: raw.images ?? [], remark: String(raw.remark ?? ""),
+          });
+          markRemoteSuccess();
+        }
+        const confirmedDebts = await this.client.listDebtAccounts(account, direction, Number(debt.status) as 0 | 1);
+        const confirmedDebt = confirmedDebts.find((value) => String(value.id) === String(debt.id));
+        if (!confirmedDebt || recoveryFingerprint(confirmedDebt) !== recoveryFingerprint(changed)) {
+          throw writeConfirmationFailed("借贷资金账户恢复后未完全确认，请先刷新核对");
+        }
+        // These synthetic opening records do not always receive an incremental timestamp.
+        let cursor = { bookid: GLOBAL_SYNC_BOOK_ID, pageoffset: 0, pagesign: "" };
+        let confirmedRaw: Record<string, unknown> | undefined;
+        for (let pageIndex = 0; pageIndex < MAX_SYNC_PAGES; pageIndex++) {
+          const page = await this.client.pullBills(account, cursor);
+          confirmedRaw ??= page.changes.find((bill) => String(bill.id) === id);
+          if (page.hasmore === 0) break;
+          cursor = { bookid: page.bookid, pageoffset: page.pageoffset, pagesign: page.pagesign };
+        }
+        if (!confirmedRaw || recoveryFingerprint(publicBill(confirmedRaw)) !== recoveryFingerprint(expected)) {
+          throw writeConfirmationFailed("借贷资产已更新，原起始账单尚未完全确认，请先核对，禁止重放");
+        }
+        await this.store.saveConfirmedBills(account.id, [confirmedRaw], true);
+        await this.store.invalidateCatalogCache(account.id, "assets", "");
+        return { dryRun: false, bill: publicBill(confirmedRaw) };
+      });
+    });
+  }
+
+  /** Rebuild one immutable receipt with explicit new-ID consent and a private pre-deletion receipt. */
+  async rebuildReimbursement(accountId: number, input: {
+    reimbursementBillId: string; oldAssetId: string; newAssetId: string; currency: string;
+    confirmNewId: boolean; dryRun?: boolean;
+  }): Promise<{ dryRun: boolean; previousBillId: string; bill: Record<string, unknown> }> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const id = normalizeBillId(input.reimbursementBillId), oldId = normalizeRequiredAssetId(input.oldAssetId), newId = normalizeRequiredAssetId(input.newAssetId);
+      await this.syncUnlocked(account);
+      const row = await this.store.getBill(account.id, id);
+      if (!row) throw new AppError("BILL_NOT_FOUND", "原报销到账不存在，请核对是否已经重建", 404);
+      const child = cachedBillObject(row), originalChild = publicBill(child);
+      requireOwnedBill(child, account.uid, true);
+      if (Number(child.type) !== 21 || String(child.assetid) !== oldId || !input.confirmNewId) {
+        throw new AppError("RECOVERY_SCENARIO_INVALID", "仅支持已明确允许更换编号的原报销到账");
+      }
+      const assets = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+      const target = assets.find((asset) => String(asset.id) === newId && Number(asset.status) === 0);
+      if (!target || assets.some((asset) => String(asset.id) === oldId) || await this.resolvedAssetCurrency(account, target) !== input.currency) {
+        throw new AppError("RECOVERY_ASSET_INVALID", "新旧资产状态或币种不符");
+      }
+      const sourceId = relationshipSourceId(billExtra(child).bxsid, "报销");
+      const sourceRow = await this.store.getBill(account.id, sourceId);
+      if (!sourceRow) throw new AppError("BILL_NOT_FOUND", "报销源账单不存在", 404);
+      const source = cachedBillObject(sourceRow), originalSource = publicBill(source);
+      requireOwnedBill(source, account.uid, true);
+      const relationships = reimbursementRelationshipMap(source);
+      if (Number(source.type) !== 5 || relationships.size !== 1 || !relationships.has(id)
+        || String(source.bookid) !== String(child.bookid)) throw new AppError("RECOVERY_RELATIONSHIP_CONFLICT", "报销关系不符合单条恢复条件");
+      if (originalChild.excludeFromIncomeExpense || originalChild.excludeFromBudget) {
+        throw new AppError("RECOVERY_FLAGS_UNSUPPORTED", "不能重建带特殊统计标志的报销到账");
+      }
+      const category = normalizeCategoryId(child.cateid as string), sourceCategory = normalizeCategoryId(source.cateid as string);
+      await this.validateWriteReferences(account, String(child.bookid), 0, category, newId, tagIdsFrom(child));
+      const currency = billExtra(child).curr as Record<string, unknown> | undefined;
+      if (currency && String(currency.ts ?? input.currency) !== input.currency) throw new AppError("RECOVERY_CURRENCY_MISMATCH", "原换算币种不符");
+      if (input.dryRun !== false) return { dryRun: true, previousBillId: id, bill: { ...originalChild, assetId: newId } };
+      return this.withBusinessWrite(account, tagIdsFrom(child), async (markRemoteSuccess) => {
+        saveRecoveryRecord(this.recoveryRoot!, account.uid, id, { child, source, newAssetId: newId, at: this.now() });
+        let phase = "before-delete";
+        let newIdValue: string | undefined;
+        try {
+          const deletion = await this.client.syncBills(account, { bills: { dellist: [id] } });
+          await this.acceptSyncBillResult(account, deletion, [id], markRemoteSuccess);
+          phase = "deleted";
+          await this.syncUnlocked(account);
+          const afterDelete = await this.store.getBill(account.id, sourceId);
+          if (await this.store.getBill(account.id, id) || !afterDelete || reimbursementRelationshipMap(cachedBillObject(afterDelete)).size !== 0) {
+            throw writeConfirmationFailed("未确认原报销到账删除及关系清空");
+          }
+          if (category !== sourceCategory) {
+            await this.client.modifyBillCategory(account, sourceId, category);
+            phase = "temporary-source-category";
+          }
+          const returned = await this.client.reimburseBills(account, {
+            allocations: { [sourceId]: currency ? { curr: currency } : { money: Number(child.money) } },
+            assetId: newId, time: Number(child.time), remark: String(child.remark ?? ""), tagIds: tagIdsFrom(child),
+            imageKeys: Array.isArray(child.images) ? child.images as string[] : [],
+          });
+          phase = "created";
+          await this.saveConfirmedBillsAndSync(account, returned.bills);
+          const currentSource = await this.store.getBill(account.id, sourceId);
+          const map = currentSource && reimbursementRelationshipMap(cachedBillObject(currentSource));
+          if (!map || map.size !== 1) throw writeConfirmationFailed("未确认唯一的新报销到账");
+          newIdValue = [...map.keys()][0]!;
+          if (category !== sourceCategory) {
+            await this.client.modifyBillCategory(account, sourceId, sourceCategory);
+            await this.syncUnlocked(account);
+          }
+          const [newChildRow, newSourceRow] = await Promise.all([this.store.getBill(account.id, newIdValue), this.store.getBill(account.id, sourceId)]);
+          const actual = newChildRow && publicBill(cachedBillObject(newChildRow));
+          const ignoreCreation = (value: Record<string, unknown>) => {
+            const { id: _, createTime: __, updateTime: ___, ...rest } = value;
+            return recoveryFingerprint(rest);
+          };
+          if (!actual || ignoreCreation(actual) !== ignoreCreation({ ...originalChild, assetId: newId })
+            || !newSourceRow || recoveryFingerprint(publicBill(cachedBillObject(newSourceRow))) !== recoveryFingerprint({
+              ...originalSource, reimbursementBillIds: [newIdValue],
+            })) throw writeConfirmationFailed("新报销到账或原支出的字段未完全匹配");
+          return { dryRun: false, previousBillId: id, bill: actual };
+        } catch (error) {
+          throw new AppError("RECOVERY_PARTIAL", `报销恢复停在 ${phase}，原编号 ${id}，新编号 ${newIdValue ?? "尚未确认"}，私人回执已保存。${safeError(error).message}。必须刷新核查，禁止重放`, 502);
+        } finally { await this.store.invalidateCatalogCache(account.id, "assets", ""); }
+      });
+    });
+  }
+
+  /** Discard a wallet created by an unsuccessful recovery, never one referenced by bills. */
+  async discardUnusedWallet(accountId: number, input: { assetId: string; expectedBalance: number }): Promise<{ assetId: string }> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const id = normalizeRequiredAssetId(input.assetId);
+      await this.syncUnlocked(account);
+      const assets = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+      const asset = assets.find((value) => String(value.id) === id);
+      if (!asset || publicUserId(asset.userid) !== account.uid || Number(asset.type) !== 1 || Number(asset.stype) !== 14
+        || Number(asset.money) !== input.expectedBalance) throw new AppError("RECOVERY_ASSET_INVALID", "钱包所有者、类型或预期余额不符");
+      const rows = await this.store.listBills(account.id, { limit: BILL_SCAN_LIMIT });
+      if (rows.map(cachedBillObject).some((bill) => [bill.assetid, bill.fromid, bill.targetid].some((value) => String(value) === id))) {
+        throw new AppError("RECOVERY_ASSET_IN_USE", "钱包仍关联账单，禁止删除", 409);
+      }
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        try {
+          await this.client.deleteUnusedWallet(account, id);
+          markRemoteSuccess();
+          const refreshed = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+          if (refreshed.some((value) => String(value.id) === id)) throw writeConfirmationFailed("未确认无账单钱包已移除");
+          return { assetId: id };
+        } finally { await this.store.invalidateCatalogCache(account.id, "assets", ""); }
+      });
+    });
+  }
+
+  /** Conditional balance restoration after authorized historical recovery; creates no bill. */
+  async restoreAssetBalance(accountId: number, input: {
+    assetId: string; currency: string; expectedBalance: number; balance: number;
+  }): Promise<{ assetId: string; balance: number }> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const id = normalizeRequiredAssetId(input.assetId);
+      for (const money of [input.expectedBalance, input.balance]) {
+        if (!Number.isFinite(money) || Math.abs(money) > MAX_MONEY || binaryRound(money, 2) !== money) {
+          throw new AppError("RECOVERY_INPUT_INVALID", "恢复余额必须是有效的两位小数金额");
+        }
+      }
+      await this.syncUnlocked(account);
+      const assets = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+      const asset = assets.find((candidate) => String(candidate.id) === id);
+      if (!asset || ![1, 2, 3].includes(Number(asset.type)) || ![0, 2].includes(Number(asset.status))
+        || publicUserId(asset.userid) !== account.uid || await this.resolvedAssetCurrency(account, asset) !== input.currency) {
+        throw new AppError("RECOVERY_ASSET_INVALID", "资产所有者、类型、状态或币种不符", 403);
+      }
+      if (Number(asset.money) !== input.expectedBalance) {
+        throw new AppError("RECOVERY_BALANCE_CONFLICT", "当前余额已改变，必须重新核对，不能覆盖", 409);
+      }
+      if (input.balance === input.expectedBalance) return { assetId: id, balance: input.balance };
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        try {
+          await this.client.submitAssetBalance(account, asset, input.balance);
+          markRemoteSuccess();
+          const refreshed = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+          const confirmed = refreshed.find((candidate) => String(candidate.id) === id);
+          if (!confirmed || recoveryFingerprint(confirmed) !== recoveryFingerprint({ ...asset, money: input.balance })) {
+            throw writeConfirmationFailed("资产余额恢复后字段未完全确认，请刷新核对，不得直接重试");
+          }
+          return { assetId: id, balance: input.balance };
+        } finally {
+          await this.store.invalidateCatalogCache(account.id, "assets", "");
+        }
+      });
+    });
+  }
+
+  /** Asset-only relinking, or explicitly authorized new-ID restoration of missing transfers. */
+  async recoverAssetBills(accountId: number, input: RecoverAssetBillsInput): Promise<{
+    dryRun: boolean; bills: Record<string, unknown>[]; skippedBillIds: string[];
+    replacements: { previousBillId: string; billId: string }[];
+  }> {
+    if (!this.recoveryRoot) throw new AppError("RECOVERY_DISABLED", "本机尚未启用账单恢复", 403);
+    return this.withBillAccount(accountId, async (account) => {
+      const ids = input.billIds.map(normalizeBillId);
+      if (!ids.length || ids.length > 100 || new Set(ids).size !== ids.length) {
+        throw new AppError("RECOVERY_INPUT_INVALID", "恢复范围必须为 1 至 100 个不同账单 ID");
+      }
+      const oldId = normalizeRequiredAssetId(input.oldAssetId);
+      const newId = normalizeRequiredAssetId(input.newAssetId);
+      if (oldId === newId) throw new AppError("RECOVERY_INPUT_INVALID", "新旧资产不能相同");
+      await this.syncUnlocked(account);
+      const assets = await this.loadAssets(account, { forceRefresh: true, allowStale: false });
+      const oldAsset = assets.find((asset) => String(asset.id) === oldId);
+      if (oldAsset) {
+        throw new AppError("RECOVERY_OLD_ASSET_EXISTS", "旧资产仍存在，不能按删除资产恢复");
+      }
+      const target = assets.find((asset) => String(asset.id) === newId && Number(asset.status) === 0);
+      if (!target || await this.resolvedAssetCurrency(account, target) !== input.currency) {
+        throw new AppError("RECOVERY_CURRENCY_MISMATCH", "新资产不存在、不可用或币种不符");
+      }
+      const backup = input.backupPath === undefined ? undefined
+        : readRecoveryBackup(this.recoveryRoot, input.backupPath, account.uid, ids);
+      if (backup) {
+        const oldAsset = backup.assets.find((asset) => String(asset.id) === oldId);
+        if (!oldAsset || await this.resolvedAssetCurrency(account, oldAsset) !== input.currency) {
+          throw new AppError("RECOVERY_CURRENCY_MISMATCH", "备份中的旧资产币种不符");
+        }
+      }
+      const all = backup ? (await this.store.listBills(account.id, { limit: BILL_SCAN_LIMIT })).map(cachedBillObject) : [];
+      const usedIds = new Set(all.map((raw) => String(raw.id)));
+      const prepared: Record<string, unknown>[] = [];
+      const skippedBillIds: string[] = [];
+      const replacements: { previousBillId: string; billId: string }[] = [];
+      for (let index = 0; index < ids.length; index++) {
+        const id = ids[index]!;
+        const row = await this.store.getBill(account.id, id);
+        const current = row ? cachedBillObject(row) : undefined;
+        const original = backup?.bills[index] ?? current;
+        if (!original || String(original.id) !== id) throw new AppError("RECOVERY_BILL_MISSING", "原始账单不存在", 404);
+        requireOwnedBill(original, account.uid, true);
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 9].includes(Number(original.type))) {
+          throw new AppError("RECOVERY_SCENARIO_INVALID", "旧退款、报销到账与利息记录不能通过通用关联工具改写，请使用专用恢复工具并核实分类");
+        }
+        await this.requireWritableBook(account, String(original.bookid));
+        const referencesOld = [original.assetid, original.fromid, original.targetid].some((value) => String(value) === oldId);
+        if (!referencesOld) {
+          if (!backup && [original.assetid, original.fromid, original.targetid].some((value) => String(value) === newId)) {
+            skippedBillIds.push(id);
+            continue;
+          }
+          throw new AppError("RECOVERY_REFERENCE_MISMATCH", "账单不关联指定的旧资产");
+        }
+        const raw = remapBillAsset(original, oldId, newId);
+        if (backup) {
+          if (![2, 3].includes(Number(raw.type))) throw new AppError("RECOVERY_SCENARIO_INVALID", "备份恢复仅支持转账和还款");
+          if (current) {
+            if (recoveryFingerprint(publicBill(current)) !== recoveryFingerprint(publicBill(raw))) {
+              throw new AppError("RECOVERY_ID_CONFLICT", "原编号已有不同账单，禁止覆盖", 409);
+            }
+            skippedBillIds.push(id);
+            continue;
+          }
+          const candidate = all.find((bill) => Number(bill.type) === Number(raw.type)
+            && String(bill.fromid) === String(raw.fromid) && String(bill.targetid) === String(raw.targetid)
+            && Number(bill.money) === Number(raw.money) && Math.abs(Number(bill.time) - Number(raw.time)) <= 120);
+          if (candidate) {
+            if (recoveryFingerprint({ ...publicBill(candidate), id }) !== recoveryFingerprint(publicBill(raw))) {
+              throw new AppError("RECOVERY_DUPLICATE_CANDIDATE", `发现可能重复的账单 ${String(candidate.id)}，请先核实`, 409);
+            }
+            skippedBillIds.push(id);
+            replacements.push({ previousBillId: id, billId: String(candidate.id) });
+            continue;
+          }
+          if (input.dryRun === false && !input.recreateMissing) {
+            throw new AppError("RECOVERY_NEW_ID_CONSENT_REQUIRED", "已删除的原编号可能有服务端删除标记，执行前须明确允许新编号恢复", 409);
+          }
+          if (input.recreateMissing && input.dryRun === false) {
+            do raw.id = createBillId(this.now()); while (usedIds.has(String(raw.id)));
+            usedIds.add(String(raw.id));
+            replacements.push({ previousBillId: id, billId: String(raw.id) });
+          }
+        }
+        // status=1 means already synced; even a restored original ID must be uploaded as changed.
+        raw.status = 2;
+        raw.updatetime = Math.floor(this.now() / 1000);
+        for (const field of DISPLAY_FIELDS) delete raw[field];
+        // API snapshots contain null references; Gson omits these optional fields on upload.
+        for (const field of ["cateid", "assetid", "fromid", "targetid"]) if (raw[field] === null) delete raw[field];
+        if (backup) {
+          const from = assets.find((asset) => String(asset.id) === String(raw.fromid));
+          const to = assets.find((asset) => String(asset.id) === String(raw.targetid));
+          if (!from || !to || await this.resolvedAssetCurrency(account, from) !== input.currency
+            || await this.resolvedAssetCurrency(account, to) !== input.currency) {
+            throw new AppError("RECOVERY_CURRENCY_MISMATCH", "历史转账的资产不存在或币种不符");
+          }
+          raw.cateid = "-1";
+          raw.assetid = "-1";
+          raw.fromact = String(from.name ?? "");
+          raw.targetact = String(to.name ?? "");
+          raw.descinfo = `${raw.fromact}->${raw.targetact}`;
+          raw.extra ??= { transfee: 0 };
+        }
+        prepared.push(raw);
+      }
+      if (input.dryRun !== false || prepared.length === 0) {
+        return { dryRun: input.dryRun !== false, bills: prepared.map(publicBill), skippedBillIds, replacements };
+      }
+      const maxTags = Math.max(...prepared.map((raw) => tagIdsFrom(raw).length));
+      return this.withBusinessWrite(account, Array(maxTags).fill(""), async (markRemoteSuccess) => {
+        try {
+          const result = await this.client.syncBills(account, { bills: { changelist: prepared } });
+          await this.acceptSyncBillResult(account, result, prepared.map((raw) => String(raw.id)), markRemoteSuccess);
+          await this.confirmWrite(() => this.syncUnlocked(account));
+          const confirmed: Record<string, unknown>[] = [];
+          for (const expected of prepared) {
+            const row = await this.store.getBill(account.id, String(expected.id));
+            const actual = row && publicBill(cachedBillObject(row));
+            if (!actual || recoveryFingerprint(actual) !== recoveryFingerprint(publicBill(expected))) {
+              throw writeConfirmationFailed(`恢复后字段未完全确认：${String(expected.id)}；请刷新核查，不得重放整批`);
+            }
+            confirmed.push(actual);
+          }
+          return { dryRun: false, bills: confirmed, skippedBillIds, replacements };
+        } finally {
+          await this.store.invalidateCatalogCache(account.id, "assets", "");
+        }
+      });
+    });
+  }
+
   /** 目录批量写入不是事务：失败也清缓存，按输入顺序报告已完成和未确认项。 */
   private async withCatalogWrite<T>(
     account: QianjiAccount,
@@ -2250,8 +2671,8 @@ export class MoneyTrackService {
   }
 
   /** 拉取完整增量分页，并把数据变化与最终游标作为一个事务提交。 */
-  private async syncUnlocked(account: QianjiAccount): Promise<void> {
-    const initialLasttimes = await this.store.getSyncState(account.id);
+  private async syncUnlocked(account: QianjiAccount, full = false): Promise<void> {
+    const initialLasttimes = full ? undefined : await this.store.getSyncState(account.id);
     let bookid = GLOBAL_SYNC_BOOK_ID;
     let pageoffset = 0;
     let pagesign = "";
@@ -2302,9 +2723,13 @@ export class MoneyTrackService {
       const invalidatedCategoryScopes = pages.flatMap((page) => page.categories
         .map((category) => String(category.bookid ?? page.bookid))
         .filter((bookId) => bookId !== GLOBAL_SYNC_BOOK_ID));
+      const changes = pages.flatMap((page) => page.changes);
+      const currentIds = new Set(changes.map((bill) => String(bill.id)));
+      const absentIds = full ? (await this.store.listBills(account.id, { limit: BILL_SCAN_LIMIT }))
+        .filter((row) => !currentIds.has(row.id)).map((row) => row.id) : [];
       await this.store.applySyncBatch(account.id, {
-        changes: pages.flatMap((page) => page.changes),
-        deletes: pages.flatMap((page) => page.deletes),
+        changes,
+        deletes: [...new Set([...pages.flatMap((page) => page.deletes), ...absentIds])],
         invalidatedCategoryScopes,
         lasttimes: finalLasttimes,
       });

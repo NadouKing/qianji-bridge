@@ -288,6 +288,31 @@ export class QianjiClient {
     return asObjectArray(data.list).map(normalizeBook);
   }
 
+  /** APK AssetAccount submit protocol: change balance without diffparams or an adjustment bill. */
+  async submitAssetBalance(account: QianjiAccount, asset: Record<string, unknown>, money: number, extra?: Record<string, unknown>): Promise<void> {
+    const raw: Record<string, unknown> = { ...asset, money };
+    delete raw.groupName;
+    delete raw.groupOrder;
+    const encode = (value: Record<string, unknown>) => JSON.stringify(value, (key, item) =>
+      ["id", "accountId", "bookid"].includes(key) && typeof item === "string"
+        && (isPositiveLongId(item) || (key === "accountId" && item === "0") || (key === "bookid" && item === "-1"))
+        ? (JSON as JsonWithRaw).rawJSON(item) : item);
+    await this.authPost(account, "/asset/submit", { v: encode(raw), ...(extra ? { extra: encode(extra) } : {}) });
+  }
+
+  /** Delete only an unused wallet after the service has checked ownership and all bill references. */
+  async deleteUnusedWallet(account: QianjiAccount, assetId: string): Promise<void> {
+    await this.authPost(account, "/asset/delete", { did: assetId });
+  }
+
+  /** APK bill-batch category patch preserves special bill IDs and attachments. */
+  async modifyBillCategory(account: QianjiAccount, billId: string, categoryId: string): Promise<void> {
+    await this.authPost(account, "/billbatch/modify", {
+      billIds: stringifyQianjiIdList([billId]),
+      values: `{"category":${categoryId}}`,
+    });
+  }
+
   /** 读取指定账本的成员候选。 */
   async listBookMembers(account: QianjiAccount, bookId: string): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/book/members", { bookid: bookId }));
@@ -329,7 +354,13 @@ export class QianjiClient {
     status: 0 | 1,
   ): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/asset/listloan", { t: direction, status }));
-    return asObjectArray(data.list).map((asset) => ({ ...asset, id: positiveIdText(asset.id, "借入或借出记录") }));
+    return asObjectArray(data.list).map((asset) => {
+      const loan = asObject(asset.loan);
+      if (loan.accountId === undefined || loan.accountId === null) return { ...asset, id: positiveIdText(asset.id, "借入或借出记录") };
+      const accountId = numericText(loan.accountId);
+      if (accountId !== "0" && !isPositiveLongId(accountId)) throw new AppError("QIANJI_RESPONSE_INVALID", "借贷资金账户无效", 502);
+      return { ...asset, id: positiveIdText(asset.id, "借入或借出记录"), loan: { ...loan, accountId } };
+    });
   }
 
   /** 读取跨币种写入所需的币种标识、价格和价格时间。 */
@@ -648,6 +679,7 @@ export class QianjiClient {
       time?: number;
       remark?: string;
       tagIds?: string[];
+      imageKeys?: string[];
     },
   ): Promise<{ asset?: Record<string, unknown>; bills: Record<string, unknown>[] }> {
     const body: Record<string, string | number> = {
@@ -657,6 +689,7 @@ export class QianjiClient {
     if (input.time !== undefined) body.bxtime = input.time;
     if (input.remark) body.remark = input.remark;
     if (input.tagIds && input.tagIds.length > 0) body.tags = JSON.stringify(input.tagIds);
+    if (input.imageKeys && input.imageKeys.length > 0) body.images = JSON.stringify(input.imageKeys);
     const data = asObject(await this.authPost(account, "/baoxiao/baoxiao", body));
     const asset = data.asset === undefined ? undefined : asObject(data.asset);
     return {
