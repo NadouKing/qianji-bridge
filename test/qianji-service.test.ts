@@ -20,6 +20,7 @@ import { AppError } from "../src/errors.ts";
 import { md5, parseQianjiJson, QianjiClient, type QianjiFetch } from "../src/qianji-client.ts";
 import { publicAssetGroups, publicBill, publicCurrencyConversion, publicDebtAccount } from "../src/qianji-mappers.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
+import { readRecoveryBackup } from "../src/bill-recovery.ts";
 import test from "./context.ts";
 
 async function createOneBill(
@@ -3239,6 +3240,277 @@ test("迁移成功但报销失败时明确报告部分成功且不重复迁移",
   assert.deepEqual(store.getWriteQuota(account.id), { date: "2026-08-17", used: 0 });
 });
 
+test("资产关联恢复保留源账单报销关系和图片，预览不写入，重跑跳过", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000;
+  const upstream = createBusinessUpstream();
+  const ids = [0, 1, 5].map((type, index) => {
+    const id = `177000000000080000${index}`;
+    upstream.seed({ ...bill(id, "保留原备注"), type, assetid: "99", images: ["fixture-image"],
+      extra: { bxs: { "1770000000000800099": 1 }, opaque: { retain: true } } });
+    return id;
+  });
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now, { recoveryRoot: tmpdir() });
+  const input = { oldAssetId: "99", newAssetId: "3", currency: "CNY", billIds: ids };
+  const preview = await service.recoverAssetBills(accountId, input);
+  assert.equal(preview.bills.length, 3);
+  assert.equal(upstream.syncPayloads.length, 0);
+  const result = await service.recoverAssetBills(accountId, { ...input, dryRun: false });
+  assert.deepEqual(result.bills.map((value) => value.assetId), Array(3).fill("3"));
+  const change = (upstream.syncPayloads[0]!.bills as { changelist: Record<string, unknown>[] }).changelist[0]!;
+  assert.deepEqual(change.images, ["fixture-image"]);
+  assert.deepEqual(change.extra, { bxs: { "1770000000000800099": 1 }, opaque: { retain: true } });
+  assert.equal((await service.recoverAssetBills(accountId, { ...input, dryRun: false })).skippedBillIds.length, 3);
+  assert.equal(upstream.syncPayloads.length, 1);
+  await assert.rejects(service.recoverAssetBills(accountId, { ...input, newAssetId: "6" }), /币种/);
+  await assert.rejects(service.recoverAssetBills(accountId, { ...input, oldAssetId: "4" }), /旧资产仍存在/);
+});
+
+test("只读备份以新编号恢复附件，拒绝越界、错账号、重复候选和编号冲突", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qianji-recovery-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "backup.db");
+  const backup = new Store(path);
+  const pat = backup.createPat("fixture", null);
+  const backupAccount = backup.bindPat(pat.id, "uid-1", "fixture", "fixture");
+  const id = "1770000000000810001";
+  const original = { ...bill(id, "历史转账"), type: 2, cateid: null, fromid: "99", targetid: "4", images: ["fixture-image"],
+    extra: { transfee: 0.02, opaque: "retain" } };
+  backup.upsertBill(backupAccount.id, original);
+  backup.setCatalogCache(backupAccount.id, "assets", "", [{ id: "99", name: "fixture-wallet", userid: "uid-1", type: 1, stype: 14, status: 0, money: 20, currency: "CNY" }], 0);
+  backup.close();
+  assert.equal(readRecoveryBackup(dir, "backup.db", "uid-1", [id]).bills.length, 1);
+  assert.throws(() => readRecoveryBackup(undefined, "backup.db", "uid-1", [id]), /未配置/);
+  assert.throws(() => readRecoveryBackup(dir, "backup.db", "uid-2", [id]), /当前绑定/);
+  assert.throws(() => readRecoveryBackup(join(dir, ".."), "..", "uid-1", [id]), /目录内/);
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000;
+  const upstream = createBusinessUpstream();
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now, { recoveryRoot: dir });
+  const input = { oldAssetId: "99", newAssetId: "3", currency: "CNY", billIds: [id], backupPath: "backup.db", dryRun: false, recreateMissing: true };
+  await assert.rejects(service.recoverAssetBills(accountId, { ...input, recreateMissing: false }), /明确允许新编号/);
+  const result = await service.recoverAssetBills(accountId, input);
+  assert.notEqual(result.bills[0]!.id, id);
+  assert.equal(result.replacements[0]!.previousBillId, id);
+  assert.equal(result.replacements[0]!.billId, result.bills[0]!.id);
+  assert.equal((upstream.syncPayloads[0]!.bills as { changelist: { status: number }[] }).changelist[0]!.status, 2);
+  assert.equal(result.bills[0]!.fromId, "3");
+  assert.equal((result.bills[0]!.imageUrls as string[]).length, 1);
+  await service.recoverAssetBills(accountId, input);
+  assert.equal(upstream.syncPayloads.length, 1);
+  upstream.seed({ ...original, fromid: "3", money: 11 });
+  await assert.rejects(service.recoverAssetBills(accountId, input), /编号已有不同/);
+  const nextId = "1770000000000810002";
+  const nextBackup = new Store(path);
+  nextBackup.upsertBill(backupAccount.id, { ...original, id: nextId, money: 11, remark: "不同用途" });
+  nextBackup.close();
+  await assert.rejects(service.recoverAssetBills(accountId, { ...input, billIds: [nextId] }), /可能重复/);
+});
+
+test("余额恢复校验当前值、所有者与币种，只使用 asset/submit 且不生成抵扣账单", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000;
+  const upstream = createBusinessUpstream();
+  let asset = { id: "3", userid: "uid-1", name: "fixture", type: 1, stype: 12, currency: "CNY", status: 0, money: 10, extra: { keep: true } };
+  let submits = 0;
+  const fetch: QianjiFetch = async (input, init) => {
+    const path = new URL(String(input)).pathname;
+    const form = new URLSearchParams(String(init?.body));
+    if (path === "/asset/list") return ok({ list: form.get("status") === "0" ? [asset] : [] });
+    if (path === "/asset/submit") {
+      submits++;
+      assert.equal(form.has("diffparams"), false);
+      assert.equal(form.has("extra"), false);
+      const change = JSON.parse(form.get("v")!) as typeof asset;
+      assert.deepEqual(change.extra, asset.extra);
+      asset = { ...change, id: "3" };
+      return ok({});
+    }
+    return upstream.fetch(input, init);
+  };
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: tmpdir() });
+  const input = { assetId: "3", currency: "CNY", expectedBalance: 10, balance: 12.34 };
+  await assert.rejects(service.restoreAssetBalance(accountId, { ...input, expectedBalance: 11 }), /当前余额/);
+  await assert.rejects(service.restoreAssetBalance(accountId, { ...input, currency: "USD" }), /币种/);
+  await service.restoreAssetBalance(accountId, input);
+  assert.equal(asset.money, 12.34);
+  assert.equal(submits, 1);
+  assert.equal(upstream.syncPayloads.length, 0);
+  await assert.rejects(service.restoreAssetBalance(accountId, input), /当前余额/);
+});
+
+test("明确获准后将旧利息改为普通支出恢复分类，保留编号、金额、日期与图片", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000, id = "1770000000000840001";
+  const upstream = createBusinessUpstream();
+  upstream.seed({ ...bill(id, "债务利息"), type: 10, cateid: null, assetid: "3", fromid: "5", images: ["fixture-image"], money: 0.25 });
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now, { recoveryRoot: tmpdir() });
+  const result = await service.restoreBillCategory(accountId, { billId: id, categoryId: "2", expectedCategoryId: null, asOrdinaryExpense: true });
+  assert.equal(result.id, id);
+  assert.equal(result.type, 0);
+  assert.equal(result.money, 0.25);
+  assert.equal(result.time, 1_770_000_000);
+  assert.equal(result.remark, "债务利息");
+  assert.equal((result.imageUrls as string[]).length, 1);
+});
+
+test("利息分类兼容请求接受上游保留原类型，未授权时拒绝写入，已恢复时跳过", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000, id = "1770000000000840002";
+  const upstream = createBusinessUpstream();
+  const original = { ...bill(id, "历史利息"), type: 10, cateid: null, assetid: "3", fromid: "5", images: ["fixture-image"], money: 0.25 };
+  upstream.seed(original);
+  let writes = 0;
+  const fetch: QianjiFetch = async (input, init) => {
+    if (new URL(String(input)).pathname === "/bill/syncall") {
+      const form = new URLSearchParams(String(init?.body));
+      const payload = parseQianjiJson(form.get("v")!) as { bills: { changelist: Record<string, unknown>[] } };
+      const change = payload.bills.changelist[0]!;
+      assert.equal(change.type, 0);
+      assert.equal(String(change.fromid), "-1");
+      assert.equal(String(change.cateid), "2");
+      writes++;
+      upstream.seed({ ...original, cateid: "2" });
+      return syncOk([], [id], []);
+    }
+    return upstream.fetch(input, init);
+  };
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: tmpdir() });
+  const input = { billId: id, categoryId: "2", expectedCategoryId: null };
+  await assert.rejects(service.restoreBillCategory(accountId, input), /明确允许/);
+  await assert.rejects(service.recoverAssetBills(accountId, {
+    oldAssetId: "99", newAssetId: "3", currency: "CNY", billIds: [id], dryRun: false,
+  }), /利息/);
+  assert.equal(writes, 0);
+  const result = await service.restoreBillCategory(accountId, { ...input, asOrdinaryExpense: true });
+  assert.equal(result.type, 10);
+  assert.equal(result.fromId, "5");
+  assert.equal(result.categoryId, "2");
+  assert.equal(result.money, original.money);
+  assert.equal((result.imageUrls as string[]).length, 1);
+  await service.restoreBillCategory(accountId, { ...input, expectedCategoryId: "2" });
+  assert.equal(writes, 1);
+});
+
+test("旧报销重建逐条保留图片、日期、备注及不同于原支出的分类，并阻止重放", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const dir = mkdtempSync(join(tmpdir(), "qianji-receipt-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const now = 1_770_000_000_000, sourceId = "1770000000000820001", childId = "1770000000000820002";
+  const upstream = createBusinessUpstream();
+  upstream.seed({ ...bill(sourceId, "原支出"), type: 5, cateid: "20", assetid: "3", extra: { bxs: { [childId]: 10 } } });
+  upstream.seed({ ...bill(childId, "保留到账说明", 1_760_000_123), type: 21, assetid: "99", images: ["fixture-one", "fixture-two"], extra: { bxsid: sourceId } });
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch: upstream.fetch }), () => now, { recoveryRoot: dir });
+  const input = { reimbursementBillId: childId, oldAssetId: "99", newAssetId: "3", currency: "CNY", confirmNewId: true };
+  assert.equal((await service.rebuildReimbursement(accountId, input)).dryRun, true);
+  assert.equal(upstream.syncPayloads.length, 0);
+  await assert.rejects(service.rebuildReimbursement(accountId, { ...input, confirmNewId: false, dryRun: false }), /明确允许/);
+  const result = await service.rebuildReimbursement(accountId, { ...input, dryRun: false });
+  assert.notEqual(result.bill.id, childId);
+  assert.equal(result.bill.categoryId, "2");
+  assert.equal(result.bill.assetId, "3");
+  assert.equal(result.bill.time, 1_760_000_123);
+  assert.equal(result.bill.remark, "保留到账说明");
+  assert.equal((result.bill.imageUrls as string[]).length, 2);
+  assert.equal((await service.getBill(accountId, sourceId)).categoryId, "20");
+  await assert.rejects(service.rebuildReimbursement(accountId, { ...input, dryRun: false }), /原报销到账不存在/);
+});
+
+test("起始账单已关联新钱包但借贷资金账户为空时，拒绝通用恢复并通过专用入口补齐", async (t) => {
+  // Mirrors the captured recovery state: confirmed type 6/7 bills, but loan.accountId still 0.
+  for (const type of [6, 7]) {
+    const { store, accountId, account } = setup();
+    t.after(() => store.close());
+    const dir = mkdtempSync(join(tmpdir(), "qianji-debt-route-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const now = 1_770_000_000_000, id = `177000000000083001${type}`;
+    const opening = { ...bill(id, "起始记录"), type, assetid: "5", images: ["fixture-image"],
+      fromid: type === 7 ? "3" : "-1", targetid: type === 6 ? "3" : "-1" };
+    const upstream = createBusinessUpstream();
+    upstream.seed(opening);
+    const direction = type === 6 ? 51 : 52;
+    let debt: Record<string, unknown> = { id: "5", userid: "uid-1", type: 5, stype: direction, status: 1, money: 0, currency: "CNY",
+      loan: { accountId: 0, money: -10, totalpay: 10, startdate: "2020-01-01", enddate: "" } };
+    let metadataWrites = 0;
+    const fetch: QianjiFetch = async (input, init) => {
+      const path = new URL(String(input)).pathname, form = new URLSearchParams(String(init?.body));
+      if (path === "/asset/listloan") return ok({ list: form.get("status") === "1" && form.get("t") === String(direction) ? [debt] : [] });
+      if (path === "/asset/submit") {
+        metadataWrites++;
+        debt = { ...JSON.parse(form.get("v")!), id: "5" };
+        return ok({});
+      }
+      if (path === "/syncv2/pull" && !form.has("lasttimes")) return ok(pullData({ changes: [opening] }));
+      return upstream.fetch(input, init);
+    };
+    cacheBusinessContext(store, account, now, true);
+    const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: dir });
+    const input = { oldAssetId: "99", newAssetId: "3", currency: "CNY", dryRun: false };
+    await assert.rejects(service.recoverAssetBills(accountId, { ...input, billIds: [id] }),
+      (error: unknown) => error instanceof AppError && error.code === "RECOVERY_DEBT_TOOL_REQUIRED");
+    assert.equal(metadataWrites, 0);
+    assert.equal(upstream.syncPayloads.length, 0);
+    const result = await service.recoverDebtWallet(accountId, { ...input, billId: id });
+    assert.equal(metadataWrites, 1);
+    assert.equal(upstream.syncPayloads.length, 0);
+    assert.equal(result.bill.id, id);
+    assert.equal(result.bill.type, type);
+    assert.equal(type === 6 ? result.bill.targetId : result.bill.fromId, "3");
+    assert.equal((result.bill.imageUrls as string[]).length, 1);
+    assert.equal((debt.loan as Record<string, unknown>).accountId, 3);
+    assert.equal(debt.status, 1);
+    assert.equal(debt.money, 0);
+    assert.equal((debt.loan as Record<string, unknown>).totalpay, 10);
+  }
+});
+
+test("借贷恢复只修改资金账户，保留结清状态及原起始账单编号", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const dir = mkdtempSync(join(tmpdir(), "qianji-debt-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const now = 1_770_000_000_000, id = "1770000000000830001";
+  const upstream = createBusinessUpstream();
+  let opening = { ...bill(id, "起始记录"), type: 6, assetid: "5", fromid: "-1", targetid: "99" };
+  upstream.seed(opening);
+  let debt: Record<string, unknown> = { id: "5", userid: "uid-1", type: 5, stype: 51, status: 1, money: 0, currency: "CNY",
+    loan: { accountId: 0, money: -10, totalpay: 10, startdate: "2020-01-01", enddate: "" } };
+  const fetch: QianjiFetch = async (input, init) => {
+    const path = new URL(String(input)).pathname, form = new URLSearchParams(String(init?.body));
+    if (path === "/asset/listloan") return ok({ list: form.get("status") === "1" ? [debt] : [] });
+    if (path === "/asset/submit") {
+      debt = { ...JSON.parse(form.get("v")!), id: "5" };
+      opening = { ...opening, targetid: String((debt.loan as Record<string, unknown>).accountId) };
+      upstream.seed(opening);
+      return ok({});
+    }
+    if (path === "/syncv2/pull" && !form.has("lasttimes")) return ok(pullData({ changes: [opening] }));
+    return upstream.fetch(input, init);
+  };
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: dir });
+  // Establish the initial cache with the same official full-pull response.
+  await service.getBill(accountId, id);
+  const result = await service.recoverDebtWallet(accountId, { billId: id, oldAssetId: "99", newAssetId: "3", currency: "CNY", dryRun: false });
+  assert.equal(result.bill.id, id);
+  assert.equal(result.bill.targetId, "3");
+  assert.equal(debt.status, 1);
+  assert.equal(debt.money, 0);
+  assert.equal((debt.loan as Record<string, unknown>).totalpay, 10);
+});
+
 function cacheBusinessContext(store: Store, account: QianjiAccount, now: number, vip: boolean): void {
   store.setUserCache(account.id, {
     id: account.uid,
@@ -3378,6 +3650,12 @@ function createBusinessUpstream(): {
       }
       return syncOk(newIds, updateIds, deleteIds);
     }
+    if (path === "/billbatch/modify") {
+      const id = exactId((parseQianjiJson(form.get("billIds")!) as unknown[])[0]);
+      const values = JSON.parse(form.get("values")!);
+      save({ ...bills.get(id)!, cateid: values.category });
+      return ok(1);
+    }
     if (path === "/bill/refund2") {
       const sourceId = form.get("did")!;
       const source = bills.get(sourceId);
@@ -3427,7 +3705,8 @@ function createBusinessUpstream(): {
         sourceExtra.bxs = { ...((sourceExtra.bxs as Record<string, unknown> | undefined) ?? {}), [childId]: money };
         const updatedSource = { ...source, extra: sourceExtra };
         const child = {
-          ...bill(childId, "报销", Number(source.time)),
+          ...bill(childId, form.get("remark") ?? "", Number(form.get("bxtime") ?? source.time)),
+          images: JSON.parse(form.get("images") ?? "[]"),
           type: 21,
           money,
           cateid: source.cateid,

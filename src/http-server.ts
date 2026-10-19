@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { pathToFileURL } from "node:url";
+import { isAbsolute } from "node:path";
 
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
@@ -29,6 +30,7 @@ export interface AppConfig {
   apiServer: URL;
   superadminPat: string;
   debugLogPath?: string;
+  recoveryRoot?: string;
 }
 
 export interface HttpApplication {
@@ -70,6 +72,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error("QIANJI_MCP_ADMIN_PAT must start with mt_pat_ and contain at least 32 random characters");
   }
   const databaseUrl = parseDatabaseUrl(env.QIANJI_MCP_DATABASE_URL);
+  if (env.QIANJI_MCP_RECOVERY_ROOT && !isAbsolute(env.QIANJI_MCP_RECOVERY_ROOT)) {
+    throw new Error("QIANJI_MCP_RECOVERY_ROOT must be an absolute private directory");
+  }
   return {
     host,
     port,
@@ -79,6 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     apiServer,
     superadminPat,
     debugLogPath: env.QIANJI_MCP_DEBUG_LOG_PATH,
+    recoveryRoot: env.QIANJI_MCP_RECOVERY_ROOT,
   };
 }
 
@@ -140,7 +146,7 @@ export async function startServer(config = loadConfig()): Promise<{
     const service = new MoneyTrackService(store, new QianjiClient({
       baseUrl: config.apiServer,
       debugLogPath: config.debugLogPath,
-    }));
+    }), Date.now, { recoveryRoot: config.recoveryRoot });
     const app = createHttpApplication(config, store, service);
     const nodeHandler = toNodeHandler(app, { onerror: (error: unknown) => console.error("HTTP adapter error:", error) });
     const server = createServer((request, response) => {

@@ -842,7 +842,9 @@ export function createMoneyTrackMcp(
     "refresh_cache",
     {
       description: "立即刷新当前钱迹账号的用户、账单、账本、资产、分类、标签和币种目录缓存",
-      inputSchema: z.strictObject({}).meta({ required: [] }),
+      inputSchema: z.strictObject({
+        fullBillSync: z.boolean().optional().default(false).describe("读取完整云端账单并移除本地已失效缓存，不修改云端账单"),
+      }).meta({ required: [] }),
       outputSchema: z.object({
         userRefreshed: z.literal(true).describe("用户信息已刷新"),
         bookCount: z.number().int().nonnegative().describe("刷新后的账本总数，包含隐藏账本，单位为个"),
@@ -855,8 +857,8 @@ export function createMoneyTrackMcp(
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async (_input, ctx) =>
-      toolResult(async () => service.refreshCache(await userId(principal, store)), ctx, principal, bindingTickets),
+    async ({ fullBillSync }, ctx) =>
+      toolResult(async () => service.refreshCache(await userId(principal, store), fullBillSync), ctx, principal, bindingTickets),
   );
 
   server.registerTool(
@@ -1132,6 +1134,121 @@ export function createMoneyTrackMcp(
     },
     async ({ deletions }, ctx) =>
       toolResult(async () => service.deleteBills(await userId(principal, store), deletions), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "restore_bill_category",
+    {
+      description: "通过客户端批量分类协议恢复已核实的原分类，保留账单编号及图片，预期当前分类不符时拒绝",
+      inputSchema: z.strictObject({
+        billId: positiveIdText.describe("需恢复原分类的账单 ID"),
+        categoryId: positiveIdText.describe("有依据的原分类 ID"),
+        expectedCategoryId: positiveIdText.nullable().describe("预期当前分类 ID，无分类为 null"),
+        asOrdinaryExpense: z.boolean().optional().default(false).describe("仅在用户明确允许可能改变交易类型后，以普通支出格式兼容提交旧利息分类，上游也可能保留原利息类型，保留编号、金额、日期及备注"),
+      }),
+      outputSchema: z.object({ bill: billSchema.describe("已确认恢复原分类的账单") }),
+      annotations: writeAnnotations,
+    },
+    async (input, ctx) => toolResult(async () => ({ bill: await service.restoreBillCategory(await userId(principal, store), input) }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "recover_debt_wallet",
+    {
+      description: "恢复借贷资产的原资金账户，保留借贷编号、金额、日期和结清状态，回读资产及服务端生成的原起始账单，默认仅预览",
+      inputSchema: z.strictObject({
+        billId: positiveIdText.describe("原借入或借出起始账单 ID"),
+        oldAssetId: positiveIdText.describe("已删除的原资金账户 ID"),
+        newAssetId: positiveIdText.describe("经确认的新资金账户 ID"),
+        currency: z.string().refine(isCurrencySymbol).describe("已确认的币种"),
+        dryRun: z.boolean().optional().default(true).describe("仅预览，false 才恢复借贷资金账户"),
+      }),
+      outputSchema: z.object({ dryRun: z.boolean().describe("是否仅预览"), bill: billSchema.describe("原借贷起始账单") }),
+      annotations: writeAnnotations,
+    },
+    async (input, ctx) => toolResult(async () => service.recoverDebtWallet(await userId(principal, store), input), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "rebuild_reimbursement",
+    {
+      description: "用户明确允许更换编号后，逐条重建旧报销到账，保留原支出及到账日期、金额、备注、分类、图片和关系。执行前保存私人回执，失败必须刷新核查，不得重放",
+      inputSchema: z.strictObject({
+        reimbursementBillId: positiveIdText.describe("原报销到账子记录 ID"),
+        oldAssetId: positiveIdText.describe("已删除的原收款资产 ID"),
+        newAssetId: positiveIdText.describe("经确认的新收款资产 ID"),
+        currency: z.string().refine(isCurrencySymbol).describe("已确认的收款币种"),
+        confirmNewId: z.boolean().describe("用户明确允许到账子记录更换编号"),
+        dryRun: z.boolean().optional().default(true).describe("仅预览，false 才删除原到账并重建"),
+      }),
+      outputSchema: z.object({
+        dryRun: z.boolean().describe("是否仅预览"),
+        previousBillId: positiveIdText.describe("原到账子记录 ID"),
+        bill: billSchema.describe("拟恢复或已确认的新到账记录"),
+      }),
+      annotations: { ...writeAnnotations, destructiveHint: true },
+    },
+    async (input, ctx) => toolResult(async () => service.rebuildReimbursement(await userId(principal, store), input), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "discard_unused_wallet",
+    {
+      description: "清理恢复失败时产生的无账单钱包，需明确授权及预期余额。查询全部账本后，只要仍有关联账单就拒绝",
+      inputSchema: z.strictObject({
+        assetId: positiveIdText.describe("本次恢复产生且明确授权移除的钱包 ID"),
+        expectedBalance: z.number().min(-MAX_MONEY).max(MAX_MONEY).describe("当前钱包预期余额"),
+      }),
+      outputSchema: z.object({ assetId: positiveIdText.describe("已确认移除的无账单钱包 ID") }),
+      annotations: { ...writeAnnotations, destructiveHint: true },
+    },
+    async (input, ctx) => toolResult(async () => service.discardUnusedWallet(await userId(principal, store), input), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "restore_asset_balance",
+    {
+      description: "授权恢复历史账单后，条件式恢复已核实的资金/信用卡/充值资产余额，只改资产 money，不创建抵扣账单。不得用来掩盖未解释差额。当前余额与 expectedBalance 不符则拒绝",
+      inputSchema: z.strictObject({
+        assetId: positiveIdText.describe("明确授权恢复余额的资产 ID"),
+        currency: z.string().refine(isCurrencySymbol).describe("已核实的资产币种"),
+        expectedBalance: z.number().min(-MAX_MONEY).max(MAX_MONEY).describe("操作前预期余额，用于阻止覆盖后续变动"),
+        balance: z.number().min(-MAX_MONEY).max(MAX_MONEY).describe("有依据且获授权恢复的余额"),
+      }),
+      outputSchema: z.object({
+        assetId: positiveIdText.describe("已回读确认的资产 ID"),
+        balance: z.number().describe("已回读确认的余额"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: false },
+    },
+    async (input, ctx) => toolResult(async () => service.restoreAssetBalance(await userId(principal, store), input), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "recover_asset_bills",
+    {
+      description: "明确授权后恢复已删除资产的账单关联，保留原 ID、图片与关系。默认仅预览。可从本机配置的只读备份恢复缺失转账/还款，不自动平账，写后须核对所有受影响余额，结果不明先刷新，禁止重放整批",
+      inputSchema: z.strictObject({
+        oldAssetId: positiveIdText.describe("已删除的原资产 ID"),
+        newAssetId: positiveIdText.describe("同币种的新资产 ID"),
+        billIds: z.array(positiveIdText).min(1).max(100).describe("本次明确授权的原始账单 ID"),
+        currency: z.string().refine(isCurrencySymbol).describe("经核实的新旧资产币种"),
+        backupPath: z.string().min(1).max(1024).optional().describe("配置恢复目录内的 SQLite 备份相对路径，省略时只修复现存账单"),
+        dryRun: z.boolean().optional().default(true).describe("仅预览，false 才正式恢复"),
+        recreateMissing: z.boolean().optional().default(false).describe("明确允许以新编号恢复已删除的转账或还款，保留备份内容，仍检查疑似重复"),
+      }),
+      outputSchema: z.object({
+        dryRun: z.boolean().describe("是否仅预览"),
+        bills: z.array(billSchema).describe("拟恢复或已回读确认的原账单"),
+        skippedBillIds: z.array(positiveIdText).describe("已恢复且未重复写入的账单 ID"),
+        replacements: z.array(z.object({
+          previousBillId: positiveIdText.describe("备份中的原转账编号"),
+          billId: positiveIdText.describe("已确认的新转账编号"),
+        })).describe("明确允许新编号时的对应关系"),
+      }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async (input, ctx) => toolResult(async () => service.recoverAssetBills(await userId(principal, store), input), ctx, principal, bindingTickets),
   );
 
   server.registerTool(

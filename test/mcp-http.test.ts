@@ -49,6 +49,12 @@ const BUSINESS_TOOLS = [
   "list_tags",
   "move_category",
   "refresh_cache",
+  "recover_asset_bills",
+  "restore_asset_balance",
+  "restore_bill_category",
+  "rebuild_reimbursement",
+  "recover_debt_wallet",
+  "discard_unused_wallet",
   "reimburse_bills",
   "reorder_categories",
   "reorder_tag_groups",
@@ -1139,6 +1145,16 @@ test("refresh_cache 立即刷新全部目录缓存并返回数量", async (t) =>
   );
   assert.equal(calls.find(({ path }) => path === "/syncv2/pull")?.body.get("lasttimes"), '{"cursor":7}');
   assert.equal((store.db.prepare("SELECT COUNT(*) AS count FROM catalog_cache").get() as { count: bigint }).count, 6n);
+  // Full synchronization removes stale local entries without a cloud bill mutation.
+  const staleId = "1770000000000850001";
+  store.upsertBill(accountId, { id: staleId, userid: "uid-test", bookid: "1", type: 0, time: 1_770_000_000,
+    createtime: 1_770_000_000, status: 1, money: 1, cateid: "6", assetid: "3", remark: "stale fixture" });
+  calls.length = 0;
+  const full = await client.callTool({ name: "refresh_cache", arguments: { fullBillSync: true } });
+  assert.equal((full.structuredContent as { billCount: number }).billCount, 0);
+  assert.equal(store.getBill(accountId, staleId), undefined);
+  assert.equal(calls.find(({ path }) => path === "/syncv2/pull")?.body.get("lasttimes"), null);
+  assert.equal(calls.some(({ path }) => path === "/bill/syncall"), false);
 });
 
 test("64 位 bookId 在列表、分类和账单同步中精确往返", async (t) => {
