@@ -3362,6 +3362,46 @@ test("明确获准后将旧利息改为普通支出恢复分类，保留编号�
   assert.equal((result.imageUrls as string[]).length, 1);
 });
 
+test("利息分类兼容请求接受上游保留原类型，未授权时拒绝写入，已恢复时跳过", async (t) => {
+  const { store, accountId, account } = setup();
+  t.after(() => store.close());
+  const now = 1_770_000_000_000, id = "1770000000000840002";
+  const upstream = createBusinessUpstream();
+  const original = { ...bill(id, "历史利息"), type: 10, cateid: null, assetid: "3", fromid: "5", images: ["fixture-image"], money: 0.25 };
+  upstream.seed(original);
+  let writes = 0;
+  const fetch: QianjiFetch = async (input, init) => {
+    if (new URL(String(input)).pathname === "/bill/syncall") {
+      const form = new URLSearchParams(String(init?.body));
+      const payload = parseQianjiJson(form.get("v")!) as { bills: { changelist: Record<string, unknown>[] } };
+      const change = payload.bills.changelist[0]!;
+      assert.equal(change.type, 0);
+      assert.equal(String(change.fromid), "-1");
+      assert.equal(String(change.cateid), "2");
+      writes++;
+      upstream.seed({ ...original, cateid: "2" });
+      return syncOk([], [id], []);
+    }
+    return upstream.fetch(input, init);
+  };
+  cacheBusinessContext(store, account, now, true);
+  const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: tmpdir() });
+  const input = { billId: id, categoryId: "2", expectedCategoryId: null };
+  await assert.rejects(service.restoreBillCategory(accountId, input), /明确允许/);
+  await assert.rejects(service.recoverAssetBills(accountId, {
+    oldAssetId: "99", newAssetId: "3", currency: "CNY", billIds: [id], dryRun: false,
+  }), /利息/);
+  assert.equal(writes, 0);
+  const result = await service.restoreBillCategory(accountId, { ...input, asOrdinaryExpense: true });
+  assert.equal(result.type, 10);
+  assert.equal(result.fromId, "5");
+  assert.equal(result.categoryId, "2");
+  assert.equal(result.money, original.money);
+  assert.equal((result.imageUrls as string[]).length, 1);
+  await service.restoreBillCategory(accountId, { ...input, expectedCategoryId: "2" });
+  assert.equal(writes, 1);
+});
+
 test("旧报销重建逐条保留图片、日期、备注及不同于原支出的分类，并阻止重放", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());

@@ -1144,7 +1144,7 @@ export function createMoneyTrackMcp(
         billId: positiveIdText.describe("需恢复原分类的账单 ID"),
         categoryId: positiveIdText.describe("有依据的原分类 ID"),
         expectedCategoryId: positiveIdText.nullable().describe("预期当前分类 ID，无分类为 null"),
-        asOrdinaryExpense: z.boolean().optional().default(false).describe("仅在用户明确允许后，将旧利息记录改为普通支出并恢复分类，保留原编号、金额、日期及备注"),
+        asOrdinaryExpense: z.boolean().optional().default(false).describe("仅在用户明确允许可能改变交易类型后，以普通支出格式兼容提交旧利息分类，上游也可能保留原利息类型，保留编号、金额、日期及备注"),
       }),
       outputSchema: z.object({ bill: billSchema.describe("已确认恢复原分类的账单") }),
       annotations: writeAnnotations,
