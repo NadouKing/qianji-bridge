@@ -3428,6 +3428,54 @@ test("旧报销重建逐条保留图片、日期、备注及不同于原支出�
   await assert.rejects(service.rebuildReimbursement(accountId, { ...input, dryRun: false }), /原报销到账不存在/);
 });
 
+test("起始账单已关联新钱包但借贷资金账户为空时，拒绝通用恢复并通过专用入口补齐", async (t) => {
+  // Mirrors the captured recovery state: confirmed type 6/7 bills, but loan.accountId still 0.
+  for (const type of [6, 7]) {
+    const { store, accountId, account } = setup();
+    t.after(() => store.close());
+    const dir = mkdtempSync(join(tmpdir(), "qianji-debt-route-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const now = 1_770_000_000_000, id = `177000000000083001${type}`;
+    const opening = { ...bill(id, "起始记录"), type, assetid: "5", images: ["fixture-image"],
+      fromid: type === 7 ? "3" : "-1", targetid: type === 6 ? "3" : "-1" };
+    const upstream = createBusinessUpstream();
+    upstream.seed(opening);
+    const direction = type === 6 ? 51 : 52;
+    let debt: Record<string, unknown> = { id: "5", userid: "uid-1", type: 5, stype: direction, status: 1, money: 0, currency: "CNY",
+      loan: { accountId: 0, money: -10, totalpay: 10, startdate: "2020-01-01", enddate: "" } };
+    let metadataWrites = 0;
+    const fetch: QianjiFetch = async (input, init) => {
+      const path = new URL(String(input)).pathname, form = new URLSearchParams(String(init?.body));
+      if (path === "/asset/listloan") return ok({ list: form.get("status") === "1" && form.get("t") === String(direction) ? [debt] : [] });
+      if (path === "/asset/submit") {
+        metadataWrites++;
+        debt = { ...JSON.parse(form.get("v")!), id: "5" };
+        return ok({});
+      }
+      if (path === "/syncv2/pull" && !form.has("lasttimes")) return ok(pullData({ changes: [opening] }));
+      return upstream.fetch(input, init);
+    };
+    cacheBusinessContext(store, account, now, true);
+    const service = new MoneyTrackService(store, new QianjiClient({ fetch }), () => now, { recoveryRoot: dir });
+    const input = { oldAssetId: "99", newAssetId: "3", currency: "CNY", dryRun: false };
+    await assert.rejects(service.recoverAssetBills(accountId, { ...input, billIds: [id] }),
+      (error: unknown) => error instanceof AppError && error.code === "RECOVERY_DEBT_TOOL_REQUIRED");
+    assert.equal(metadataWrites, 0);
+    assert.equal(upstream.syncPayloads.length, 0);
+    const result = await service.recoverDebtWallet(accountId, { ...input, billId: id });
+    assert.equal(metadataWrites, 1);
+    assert.equal(upstream.syncPayloads.length, 0);
+    assert.equal(result.bill.id, id);
+    assert.equal(result.bill.type, type);
+    assert.equal(type === 6 ? result.bill.targetId : result.bill.fromId, "3");
+    assert.equal((result.bill.imageUrls as string[]).length, 1);
+    assert.equal((debt.loan as Record<string, unknown>).accountId, 3);
+    assert.equal(debt.status, 1);
+    assert.equal(debt.money, 0);
+    assert.equal((debt.loan as Record<string, unknown>).totalpay, 10);
+  }
+});
+
 test("借贷恢复只修改资金账户，保留结清状态及原起始账单编号", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());

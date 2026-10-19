@@ -2367,7 +2367,10 @@ export class MoneyTrackService {
         const original = backup?.bills[index] ?? current;
         if (!original || String(original.id) !== id) throw new AppError("RECOVERY_BILL_MISSING", "原始账单不存在", 404);
         requireOwnedBill(original, account.uid, true);
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 9].includes(Number(original.type))) {
+        if ([6, 7].includes(Number(original.type))) {
+          throw new AppError("RECOVERY_DEBT_TOOL_REQUIRED", "借贷起始记录必须使用 recover_debt_wallet，同时恢复并核验起始账单和借贷资金账户");
+        }
+        if (![0, 1, 2, 3, 4, 5, 9].includes(Number(original.type))) {
           throw new AppError("RECOVERY_SCENARIO_INVALID", "旧退款、报销到账与利息记录不能通过通用关联工具改写，请使用专用恢复工具并核实分类");
         }
         await this.requireWritableBook(account, String(original.bookid));
