@@ -2454,6 +2454,13 @@ test("优雅停机只执行一次并按 HTTP、MCP、数据库顺序关闭", asy
         calls.push("http");
         return server.close(callback);
       },
+      // 转发 keep-alive 设置，让停机逻辑作用于真实 server（Bun 下默认要等 6 秒）
+      get keepAliveTimeout() {
+        return (server as unknown as { keepAliveTimeout: number }).keepAliveTimeout;
+      },
+      set keepAliveTimeout(value: number) {
+        (server as unknown as { keepAliveTimeout: number }).keepAliveTimeout = value;
+      },
     },
     app: { close: async () => { calls.push("mcp"); } },
     store: { close: () => { calls.push("database"); } },
