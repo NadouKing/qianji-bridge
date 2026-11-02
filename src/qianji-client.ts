@@ -288,6 +288,26 @@ export class QianjiClient {
     return asObjectArray(data.list).map(normalizeBook);
   }
 
+  /** APK page=0 请求返回完整目录，服务端不按 page 分页。 */
+  async listRepeatTasks(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/repeat_task/list", { page: 0 }));
+    return asObjectArray(data.list).map(normalizeRepeatTask);
+  }
+
+  /** 按 APK Gson 字段提交新任务，不通过账单同步伪造周期设置。 */
+  async submitRepeatTask(account: QianjiAccount, task: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const v = JSON.stringify(task, (key, value) =>
+      ["id", "bookid", "cateid", "fromid", "targetid"].includes(key) && typeof value === "string"
+        && isOptionalPositiveLongId(value) ? (JSON as JsonWithRaw).rawJSON(value) : value);
+    const data = asObject(await this.authPost(account, "/repeat_task/submit", { v }));
+    return normalizeRepeatTask(asObject(data.task));
+  }
+
+  /** APK toggle 没有目标状态参数；调用方必须先读取、按当前状态决定是否切换。 */
+  async toggleRepeatTask(account: QianjiAccount, taskId: string): Promise<void> {
+    await this.authPost(account, "/repeat_task/toggle", { did: taskId });
+  }
+
   /** APK AssetAccount submit protocol: change balance without diffparams or an adjustment bill. */
   async submitAssetBalance(account: QianjiAccount, asset: Record<string, unknown>, money: number, extra?: Record<string, unknown>): Promise<void> {
     const raw: Record<string, unknown> = { ...asset, money };
@@ -919,6 +939,19 @@ function positiveIdText(value: unknown, resource: string): string {
     throw new AppError("QIANJI_RESPONSE_INVALID", `钱迹返回了无效${resource} ID`, 502);
   }
   return text;
+}
+
+/** 保留周期任务及其账本、资产引用的长整数精度。 */
+function normalizeRepeatTask(raw: Record<string, unknown>): Record<string, unknown> {
+  const data = { ...asObject(raw.data) };
+  for (const key of ["bookid", "cateid", "fromid", "targetid"]) {
+    // 上游省略未选择的引用，尤其转账任务不返回 cateid。
+    if (!(key in data)) continue;
+    // RepeatTaskData 的 cateId 默认为 0，转账任务没有分类。
+    data[key] = key === "cateid" && numericText(data[key]) === "0"
+      ? "0" : referenceIdText(data[key], `周期任务 ${numericText(raw.id)} ${key}=${numericText(data[key])}`);
+  }
+  return { ...raw, id: positiveIdText(raw.id, "周期任务"), data };
 }
 
 /** 校验并转换允许父分类哨兵值的引用 ID。 */

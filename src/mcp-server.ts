@@ -783,6 +783,62 @@ export function createMoneyTrackMcp(
   );
 
   server.registerTool(
+    "list_repeat_tasks",
+    {
+      description: "实时查询全部钱迹周期记账任务，包含暂停及结束任务，一次读取完整任务目录，不从历史账单推测任务设置",
+      inputSchema: z.strictObject({}).meta({ required: [] }),
+      outputSchema: z.object({ results: z.array(z.record(z.string(), z.unknown()).describe("周期任务设置，含 id、type、status、money、fee、两端资产及 repeat"))
+        .describe("当前账号全部周期记账任务，status 1 为启用，0 为暂停") }),
+      annotations: readAnnotations,
+    },
+    async (_input, ctx) => toolResult(async () => ({
+      results: await service.listRepeatTasks(await userId(principal, store)),
+    }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "create_repeat_transfer",
+    {
+      description: "创建固定金额、每周指定星期或法定工作日的同币种转账周期记账，不执行实际资金交易，从未来日期开始，不回补历史，变额投资应按真实扣款逐笔核算，不能用固定任务预测",
+      inputSchema: z.strictObject({
+        bookId: defaultBookIdText,
+        fromAssetId: positiveIdText.describe("周期转账的转出资产 ID"),
+        targetAssetId: positiveIdText.describe("周期转账的转入资产 ID"),
+        money: z.number().positive().max(MAX_MONEY).describe(`每次转出主金额，包含手续费，${sourceAssetMoneyDescription}`),
+        fee: z.number().nonnegative().max(MAX_MONEY).optional().describe(`每次固定手续费，包含在主金额中，转入金额为 money - fee，${sourceAssetMoneyDescription}`),
+        remark: z.string().max(500).describe("周期账单备注"),
+        tagIds: z.array(z.string().min(1)).max(8).optional().describe("每次周期账单的标签 ID 列表"),
+        startDate: z.iso.date().describe("上海时区起始日期 YYYY-MM-DD，必须晚于今天，不生成历史账单"),
+        timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("上海时区记账时刻 HH:mm"),
+        repeatType: z.union([z.literal("week").describe("每周指定星期"), z.literal("workday").describe("沿用钱迹法定工作日规则")])
+          .optional().describe("周期类型，省略为每周指定星期"),
+        weekdays: z.array(z.number().int().min(1).max(7)).max(7).optional().describe("week 类型必填的星期列表，1 为周一、7 为周日，workday 类型省略或传空数组"),
+      }),
+      outputSchema: z.object({ task: z.record(z.string(), z.unknown()).describe("创建后从钱迹回读确认的周期设置") }),
+      annotations: writeAnnotations,
+    },
+    async (input, ctx) => toolResult(async () => ({
+      task: await service.createRepeatTransfer(await userId(principal, store), input),
+    }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
+    "set_repeat_task_enabled",
+    {
+      description: "按明确目标暂停或恢复周期记账任务，保留任务内容与历史账单，先读取状态再决定是否切换，结果不明必须重新查询，不能盲目重放",
+      inputSchema: z.strictObject({
+        taskId: positiveIdText.describe("周期任务 ID"),
+        enabled: z.boolean().describe("true 恢复任务，false 暂停任务"),
+      }),
+      outputSchema: z.object({ task: z.record(z.string(), z.unknown()).describe("状态切换后从钱迹回读确认的周期设置") }),
+      annotations: { ...writeAnnotations, idempotentHint: true },
+    },
+    async ({ taskId, enabled }, ctx) => toolResult(async () => ({
+      task: await service.setRepeatTaskEnabled(await userId(principal, store), taskId, enabled),
+    }), ctx, principal, bindingTickets),
+  );
+
+  server.registerTool(
     "list_categories",
     {
       description: "列出指定账本的支出或收入分类",
