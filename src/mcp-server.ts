@@ -185,7 +185,11 @@ const adjustmentMoneyDescription = "对应钱迹 APP 主金额输入框：普通
 const billAdjustmentMoneyDescription = `${adjustmentMoneyDescription}，${billInputMoneyDescription}`;
 const sourceAssetMoneyDescription = `使用转出资产币种，${moneyUnitDescription}`;
 const transferMoneyDescription = `${adjustmentMoneyDescription}，${sourceAssetMoneyDescription}`;
+const transferEndpointDescription = "转出与转入资产必须不同，信用卡还款的转入资产必须是信用账户，债务或借贷资产不能作为转出或转入资产";
 const sourceBillMoneyDescription = `使用源账单币种，${moneyUnitDescription}`;
+const conversionTargetAmountDescription = "目标资产币种金额，目标币种等于本位币时与 baseAmount 同时传入则必须相等";
+const conversionBaseAmountDescription = "本位币金额，目标币种等于本位币时与 targetAmount 同时传入则必须相等";
+const patchConversionDescription = "新的跨币种换算信息，省略时资产不变则保持已保存换算并随金额按比例缩放，变更资产时按当前币种目录重算";
 const billAssetIdDescription = "主关联资产 ID，用于收支、退款、报销入账和借贷资金账户，没有主关联资产时为 null";
 const billFromIdDescription = "来源关联资产 ID，用于转账、信用卡还款和部分借贷流水，上游未返回时省略";
 const billTargetIdDescription = "目标关联资产 ID，用于转账、信用卡还款和部分借贷流水，上游未返回时省略";
@@ -348,12 +352,12 @@ const userInfoFields = {
 
 const billCurrencyInputSchema = z.strictObject({
   sourceCurrency: currencySymbolSchema.describe("普通账单的来源币种标识"),
-  targetAmount: nonnegativeMoneySchema.optional().describe("目标资产币种金额"),
-  baseAmount: nonnegativeMoneySchema.optional().describe("本位币金额"),
+  targetAmount: nonnegativeMoneySchema.optional().describe(conversionTargetAmountDescription),
+  baseAmount: nonnegativeMoneySchema.optional().describe(conversionBaseAmountDescription),
 });
 const derivedCurrencyInputSchema = z.strictObject({
-  targetAmount: nonnegativeMoneySchema.optional().describe("目标资产币种金额"),
-  baseAmount: nonnegativeMoneySchema.optional().describe("本位币金额"),
+  targetAmount: nonnegativeMoneySchema.optional().describe(conversionTargetAmountDescription),
+  baseAmount: nonnegativeMoneySchema.optional().describe(conversionBaseAmountDescription),
 }).refine((value) => value.targetAmount !== undefined || value.baseAmount !== undefined, "currencyConversion 至少包含 targetAmount 或 baseAmount")
   .meta({ required: [] });
 const userInfoSchema = z.discriminatedUnion("isVip", [
@@ -407,7 +411,7 @@ const patchSchema = z
     reimbursable: z.boolean().optional()
       .describe("新的待报销状态"),
     currencyConversion: billCurrencyInputSchema.optional()
-      .describe("新的跨币种换算信息"),
+      .describe(patchConversionDescription),
   })
   .refine((patch) => Object.keys(patch).length > 0, "patch 不能为空")
   .refine(({ money, discount }) => money === undefined || discount === undefined || discount <= money, "discount 不能大于 money")
@@ -451,7 +455,7 @@ const transferPatchSchema = z.strictObject({
   tagIds: writeTagIdsSchema.optional().describe("完整替换后的转账或还款标签 ID 字符串列表，空数组表示清除"),
   ...billFlagPatchSchemas,
   currencyConversion: derivedCurrencyInputSchema.optional()
-    .describe("新的跨币种换算信息"),
+    .describe(patchConversionDescription),
 })
   .refine((patch) => Object.keys(patch).length > 0, "patch 不能为空")
   .refine(({ fee = 0, discount = 0 }) => fee === 0 || discount === 0, "fee 与 discount 不能同时大于 0")
@@ -688,7 +692,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "disconnect_qianji",
     {
-      description: "解绑当前 PAT 的钱迹账号，并在账号不再被其他 PAT 使用时删除其本地数据",
+      description: "解绑当前 PAT 的钱迹账号，并在账号不再被其他 PAT 使用时删除其本地数据，不影响钱迹云端数据",
       inputSchema: z.strictObject({}).meta({ required: [] }),
       outputSchema: z.object({
         disconnected: z.literal(true).describe("当前 PAT 已解绑"),
@@ -748,7 +752,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "list_assets",
     {
-      description: "查询当前钱迹账号的资产",
+      description: "查询当前钱迹账号的资产，结果可能包含借入或借出记录对应的基础资产条目，借入或借出详情以 list_debt_accounts 为准",
       inputSchema: z.strictObject({
         includeHidden: z.boolean().optional().default(false)
           .describe("是否包含已隐藏资产"),
@@ -920,7 +924,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "list_bills",
     {
-      description: "分页查询当前钱迹账号的账单摘要",
+      description: "分页查询当前钱迹账号的账单摘要，type 与 types、categoryId 与 categoryIds、tagId 与 tagIds、assetId 与 assetIds 每对筛选互斥，使用 cursor 时不能传其他筛选或分页参数",
       inputSchema: z
         .strictObject({
           bookId: defaultBookIdText,
@@ -977,8 +981,8 @@ export function createMoneyTrackMcp(
             .describe("共享账本记账人用户 ID 列表，匹配任一成员"),
           currency: currencySymbolSchema.optional()
             .describe("按用户原始记账币种筛选，无跨币种信息的账单按当前本位币解释"),
-          noAsset: z.boolean().optional().describe("是否只返回未关联任何资产的账单"),
-          noTags: z.boolean().optional().describe("是否只返回没有标签的账单"),
+          noAsset: z.boolean().optional().describe("是否只返回未关联任何资产的账单，不能与资产 ID 筛选同时使用"),
+          noTags: z.boolean().optional().describe("是否只返回没有标签的账单，不能与标签 ID 筛选同时使用"),
           excludeFromIncomeExpense: z.boolean().optional().describe("按是否标记为不计收支筛选"),
           excludeFromBudget: z.boolean().optional().describe("按是否标记为不计预算筛选"),
           sort: billSortSchema.optional().meta({ description: "账单排序方式", default: "timeDesc" }),
@@ -1040,7 +1044,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "get_bills",
     {
-      description: "批量读取完整账单及附件地址，可先同步账单并返回缓存状态",
+      description: "批量读取完整账单及附件地址，可先同步账单并返回缓存状态，重复 ID 去重，缺失或不属于当前账号的 ID 仍返回一项且 bill 为 null",
       inputSchema: z.strictObject({
         billIds: z.array(positiveIdText).min(1).max(100).describe("账单 ID 列表，重复 ID 保留首次出现顺序"),
         refresh: z.boolean().optional().default(false).describe("先增量同步当前账号账单，不强制刷新全部目录"),
@@ -1155,12 +1159,12 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "update_bills",
     {
-      description: "批量修改普通支出、收入或待报销支出账单",
+      description: "批量修改普通支出、收入或待报销支出账单，不支持收入与支出类型互改",
       inputSchema: z.strictObject({
         updates: z.array(z.strictObject({
           billId: positiveIdText.describe("要修改的账单 ID"),
           patch: patchSchema.describe("账单字段补丁"),
-        })).min(1).max(100).describe("待修改账单列表"),
+        })).min(1).max(100).describe("待修改账单列表，billId 不能重复"),
       }),
       outputSchema: z.object({ bills: z.array(billSchema).describe("修改后同步确认的完整账单列表，顺序与输入一致") }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -1177,8 +1181,8 @@ export function createMoneyTrackMcp(
         deletions: z.array(z.strictObject({
           billId: positiveIdText.describe("要永久删除的账单 ID"),
           cascadeRelatedBills: z.boolean().optional().default(false)
-            .describe("是否同时删除该源账单的全部退款和报销关联账单"),
-        })).min(1).max(100).describe("待删除账单列表"),
+            .describe("是否同时删除该源账单的全部退款和报销关联账单，默认拒绝关联删除，仅在用户确认完整删除范围后设为 true"),
+        })).min(1).max(100).describe("待删除账单列表，billId 不能重复"),
       }),
       outputSchema: z.object({
         deleted: z.array(z.object({
@@ -1310,7 +1314,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "create_transfer",
     {
-      description: "创建同币种或跨币种的资产转账或信用卡还款账单",
+      description: `创建同币种或跨币种的资产转账或信用卡还款账单，${transferEndpointDescription}`,
       inputSchema: createTransferInput,
       outputSchema: z.object({ bill: billSchema.describe("创建后同步确认的转账或信用卡还款账单") }),
       annotations: writeAnnotations,
@@ -1323,7 +1327,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "update_transfer",
     {
-      description: "修改资产转账或信用卡还款账单",
+      description: `修改资产转账或信用卡还款账单，${transferEndpointDescription}`,
       inputSchema: z.strictObject({
         billId: positiveIdText.describe("要修改的转账或信用卡还款账单 ID"),
         patch: transferPatchSchema.describe("转账或信用卡还款字段补丁"),
@@ -1339,7 +1343,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "create_refund",
     {
-      description: "为普通支出或待报销支出创建退款账单",
+      description: "为普通支出或待报销支出创建退款账单，同一源账单最多关联 25 条退款",
       inputSchema: z.strictObject({
         sourceBillId: positiveIdText.describe("退款源账单 ID"),
         ...refundFields,
@@ -1391,7 +1395,7 @@ export function createMoneyTrackMcp(
       description: "按总金额报销所选待报销支出并返回钱迹生成的关联账单",
       inputSchema: z.strictObject({
         sourceBillIds: z.array(positiveIdText).min(1).max(100)
-          .describe("待报销源账单 ID 列表，内部按 APK 规则分摊总金额"),
+          .describe("待报销源账单 ID 列表，不能重复，内部按 APK 规则依源账单时间、账单 ID 升序分摊总金额，非末位以剩余可报销金额封顶，末位承接余额"),
         money: positiveMoneySchema.describe(`本次报销总金额，${sourceBillMoneyDescription}`),
         assetId: optionalAssetIdInputText.optional()
           .describe("报销入账资产 ID，省略或传 null 表示不指定资产"),
@@ -1438,7 +1442,7 @@ export function createMoneyTrackMcp(
       description: "批量取消源账单的报销关系并删除关联账单",
       inputSchema: z.strictObject({
         sourceBillIds: z.array(positiveIdText).min(1).max(100)
-          .describe("待取消报销的源账单 ID 列表"),
+          .describe("待取消报销的源账单 ID 列表，不能重复，不接受报销到账子账单 ID"),
       }),
       outputSchema: z.object({
         cancelled: z.literal(true).describe("全部指定报销关系已取消"),
@@ -1827,7 +1831,7 @@ function registerAdminTools(
   server.registerTool(
     "create_pat",
     {
-      description: "创建可选关联已有钱迹账号的普通用户 PAT",
+      description: "创建可选关联已有钱迹账号的普通用户 PAT，完整 PAT 仅在创建响应中返回一次，此后不可再查",
       inputSchema: z.strictObject({
         remark: z.string().min(1).max(100).describe("用于识别 PAT 用途或持有人的备注"),
         accountId: z.number().int().positive().nullable().optional()
@@ -1860,7 +1864,7 @@ function registerAdminTools(
   server.registerTool(
     "delete_pat",
     {
-      description: "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据",
+      description: "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据，超级管理员 PAT 不可通过本工具删除",
       inputSchema: z.strictObject({ id: z.number().int().positive().describe("要永久删除的普通用户 PAT 内部标识") }),
       outputSchema: z.object({
         deleted: z.literal(true).describe("PAT 已删除"),
