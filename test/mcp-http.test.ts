@@ -464,7 +464,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(tools.find(({ name }) => name === "list_bills")?.inputSchema, "remarkKeyword").description), /匹配账单备注.*不区分大小写.*字面子串/);
   const listBillsTool = tools.find(({ name }) => name === "list_bills")!;
   const getBillTool = tools.find(({ name }) => name === "get_bill")!;
-  assert.equal(listBillsTool.description, "分页查询当前钱迹账号的账单摘要");
+  assert.equal(listBillsTool.description, "分页查询当前钱迹账号的账单摘要，type 与 types、categoryId 与 categoryIds、tagId 与 tagIds、assetId 与 assetIds 每对筛选互斥，使用 cursor 时不能传其他筛选或分页参数");
   assert.equal(getBillTool.description, "按账单 ID 返回完整账单详情");
   for (const [toolName, path] of [
     ["create_bills", ["bills", "items", "tagIds"]],
@@ -505,7 +505,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   const updateBillsTool = tools.find(({ name }) => name === "update_bills")!;
   const updateBillPatch = schemaNode(updateBillsTool.inputSchema, "updates", "items", "patch");
   assert.equal("type" in (updateBillPatch.properties as Record<string, unknown>), false);
-  assert.equal(updateBillsTool.description, "批量修改普通支出、收入或待报销支出账单");
+  assert.equal(updateBillsTool.description, "批量修改普通支出、收入或待报销支出账单，不支持收入与支出类型互改");
   const tagStatus = schemaNode(tools.find(({ name }) => name === "list_tags")?.inputSchema, "status");
   assert.equal(tagStatus.default, 1);
   assert.equal(String(tagStatus.description), "标签状态范围");
@@ -583,7 +583,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.match(String(schemaNode(billSummary, "fromId").description), /来源关联资产 ID.*上游未返回.*省略/);
   assert.match(String(schemaNode(billSummary, "targetId").description), /目标关联资产 ID.*上游未返回.*省略/);
   assert.equal(tools.find(({ name }) => name === "create_bills")?.description, "批量创建普通支出、收入或待报销支出账单");
-  assert.equal(tools.find(({ name }) => name === "update_bills")?.description, "批量修改普通支出、收入或待报销支出账单");
+  assert.equal(tools.find(({ name }) => name === "update_bills")?.description, "批量修改普通支出、收入或待报销支出账单，不支持收入与支出类型互改");
   assert.equal(tools.find(({ name }) => name === "delete_bills")?.description, "批量永久删除普通收支、待报销支出、转账或信用卡还款账单");
   assert.equal(tools.find(({ name }) => name === "list_debt_accounts")?.description, "独立查询当前钱迹账号的借入或借出详情");
   const debtItem = schemaNode(tools.find(({ name }) => name === "list_debt_accounts")?.outputSchema, "results", "items");
@@ -759,7 +759,7 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
     "是否将本次操作记为信用卡还款",
   );
   const updateTransferTool = tools.find(({ name }) => name === "update_transfer")!;
-  assert.equal(updateTransferTool.description, "修改资产转账或信用卡还款账单");
+  assert.equal(updateTransferTool.description, "修改资产转账或信用卡还款账单，转出与转入资产必须不同，信用卡还款的转入资产必须是信用账户，债务或借贷资产不能作为转出或转入资产");
   assert.equal(String(schemaNode(updateTransferTool.inputSchema, "patch", "targetAssetId").description), "新的转入资产 ID");
   assert.equal(String(schemaNode(updateTransferTool.inputSchema, "patch", "creditRepayment").description), "新的信用卡还款标记");
   for (const [toolName, path] of [
@@ -1575,11 +1575,11 @@ test("超级管理员 PAT 取得全部业务工具和 3 个 PAT 管理工具", a
     assert.deepEqual((field.anyOf as Array<{ type: string }>).map(({ type }) => type).sort(), ["integer", "null"]);
     assert.equal("nullable" in field, false);
   }
-  assert.equal(createPatTool.description, "创建可选关联已有钱迹账号的普通用户 PAT");
+  assert.equal(createPatTool.description, "创建可选关联已有钱迹账号的普通用户 PAT，完整 PAT 仅在创建响应中返回一次，此后不可再查");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "pat", "token").description), "新创建且仅本次返回的完整明文 PAT");
   assert.equal(String(schemaNode(createPatTool.outputSchema, "message").description), "新 PAT 的用户交付模板");
   assert.equal(deletePatTool.annotations?.destructiveHint, true);
-  assert.equal(deletePatTool.description, "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据");
+  assert.equal(deletePatTool.description, "永久删除普通用户 PAT，并在关联账号不再被其他 PAT 使用时删除其本地数据，超级管理员 PAT 不可通过本工具删除");
   const booksResult = await client.callTool({ name: "list_books", arguments: {} });
   assert.deepEqual(booksResult.structuredContent, { results: [] });
   const createdResult = await client.callTool({
