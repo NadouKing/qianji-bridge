@@ -4,7 +4,7 @@
 
 ## 现在能做什么
 
-以下功能以当前检出的代码为准；未合并分支或本地改动不会自动出现在已部署服务中。当前普通用户有 **49 个工具**，超级管理员额外有 **3 个 PAT 管理工具**。
+以下功能以当前检出的代码为准；未合并分支或本地改动不会自动出现在已部署服务中。当前普通用户有 **52 个工具**，超级管理员额外有 **3 个 PAT 管理工具**。
 
 | 使用场景 | 工具 |
 |---|---|
@@ -17,6 +17,7 @@
 | 普通收支或待报销支出批量创建与修改 | `create_bills`、`update_bills` |
 | 删除普通收支、待报销支出、转账或还款 | `delete_bills` |
 | 转账与信用卡还款 | `create_transfer`、`update_transfer` |
+| 查询周期设置、创建固定转账周期任务及暂停或恢复任务 | `list_repeat_tasks`、`create_repeat_transfer`、`set_repeat_task_enabled` |
 | 显式启用的本机恢复 | `recover_asset_bills`、`rebuild_reimbursement`、`recover_debt_wallet`、`restore_bill_category`、`restore_asset_balance`、`discard_unused_wallet` |
 | 退款 | `create_refund`、`update_refund`、`delete_refund` |
 | 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` |

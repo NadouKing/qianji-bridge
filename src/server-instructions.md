@@ -95,3 +95,5 @@
 `rebuild_reimbursement` 仅在明确允许新编号后逐条执行，保护原支出、到账日期、备注、分类和图片，执行前保存私人回执。借贷起始记录必须使用 `recover_debt_wallet`，即使账单已经指向新钱包，也要恢复并核验借贷资产的资金账户、原编号、结清状态和图片，通用关联工具会拒绝此类记录。`restore_bill_category` 恢复有依据的原分类并检查预期当前分类，兼容的普通支出请求方式须单独获准，最终回读可能保留原利息类型。
 
 `restore_asset_balance` 仅用于有依据且明确授权的余额恢复，带 expectedBalance 防止覆盖后续变动，不生成抵扣账单，不用它掩盖未解释差额。`discard_unused_wallet` 只清理本次恢复产生、明确授权且无账单关联的临时钱包，须核实预期余额。写后刷新核对原字段和全部受影响余额，部分失败先查私人回执与实际状态，禁止重放整批。`refresh_cache.fullBillSync` 仅重建本地账单缓存，不修改云端账单。
+
+- 周期任务用 `list_repeat_tasks` 查询实际设置，固定金额转账可用 `create_repeat_transfer` 从未来日期创建，暂停或恢复用 `set_repeat_task_enabled`；不操作真实投资，变额投入不凭固定周期金额认定已成交，写入结果不明先查任务，禁止盲目重放

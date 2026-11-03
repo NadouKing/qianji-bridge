@@ -90,6 +90,7 @@ import {
 } from "./qianji-mappers.ts";
 import { QianjiClient, type BudgetPeriod, type PullPage, type SyncBillResult } from "./qianji-client.ts";
 import { calculateBillStatistics, calculateBudgetBillAmounts, type StatisticsUnit } from "./bill-statistics.ts";
+import { publicRepeatTask, type CreateRepeatTransferInput } from "./repeat-tasks.ts";
 
 interface CursorPayload {
   v: 2;
@@ -320,6 +321,92 @@ export class MoneyTrackService {
         (includeHidden || Number(book.visible ?? 1) === 1) &&
         (keyword === undefined || String(book.name ?? "").toLowerCase().includes(keyword))
       ).map(publicBook);
+    });
+  }
+
+  /** 直接查询完整周期任务设置，不从历史账单猜测当前是否启用。 */
+  async listRepeatTasks(accountId: number): Promise<Record<string, unknown>[]> {
+    return this.withAccount(accountId, async (account) =>
+      (await this.loadRepeatTasks(account)).map(publicRepeatTask));
+  }
+
+  private async loadRepeatTasks(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    // APK 刷新只请求 page=0，没有加载更多入口。真实服务忽略 page，返回完整任务目录。
+    return this.client.listRepeatTasks(account);
+  }
+
+  /** 只创建固定金额的同币种转账周期设置，不立即创建账单。 */
+  async createRepeatTransfer(accountId: number, input: CreateRepeatTransferInput): Promise<Record<string, unknown>> {
+    const bookId = normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
+    const fromId = normalizeRequiredAssetId(input.fromAssetId);
+    const targetId = normalizeRequiredAssetId(input.targetAssetId);
+    const fee = billAdjustment(input.money, input.fee ?? 0, 0);
+    const today = shanghaiDate(this.now());
+    if (input.startDate <= today || Number.isNaN(Date.parse(`${input.startDate}T00:00:00+08:00`))) {
+      throw new AppError("INVALID_REPEAT_START", "新周期任务必须从上海时区的未来日期开始，不回补历史账单");
+    }
+    const weekdays = input.weekdays ?? [];
+    const repeatType = input.repeatType ?? "week";
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.timeOfDay)
+      || (repeatType === "week" ? weekdays.length === 0 : weekdays.length !== 0)
+      || new Set(weekdays).size !== weekdays.length
+      || weekdays.some((day) => !Number.isInteger(day) || day < 1 || day > 7)) {
+      throw new AppError("INVALID_REPEAT_SCHEDULE", "周期时间应为 HH:mm，星期应为 1 至 7 的非空无重复列表");
+    }
+    return this.withBillAccount(accountId, async (account) => {
+      const tagIds = input.tagIds ?? [];
+      const { from, target } = await this.validateTransferReferences(account, bookId, fromId, targetId, tagIds, false);
+      if (await this.resolvedAssetCurrency(account, from) !== await this.resolvedAssetCurrency(account, target)) {
+        throw new AppError("REPEAT_CURRENCY_UNSUPPORTED", "周期转账仅支持同币种资产");
+      }
+      const data = {
+        start: input.startDate, time: input.timeOfDay, repeat: { type: repeatType, value: [...weekdays].sort() },
+        bookid: bookId, cateid: 0, fromid: fromId, targetid: targetId,
+        money: storedBillMoney(input.money, fee), fee, remark: input.remark,
+        billflag: 0, tags: tagIds, images: [],
+      };
+      const existing = await this.loadRepeatTasks(account);
+      if (existing.some((task) => task.type === 2 && task.status === 1
+        && JSON.stringify(publicRepeatTask(task)) === JSON.stringify(publicRepeatTask({ id: task.id, type: 2, status: 1, count: task.count, data })))) {
+        throw new AppError("REPEAT_TASK_EXISTS", "相同周期转账任务已存在，请查询现有任务，不要重复创建");
+      }
+      return this.withBusinessWrite(account, tagIds, async (markRemoteSuccess) => {
+        const task = await this.client.submitRepeatTask(account, {
+          type: 2, count: 0, status: 0, createtime: 0, updatetime: 0, packid: 0, data,
+        });
+        markRemoteSuccess();
+        const confirmed = (await this.loadRepeatTasks(account)).find((item) => item.id === task.id);
+        if (!confirmed) throw writeConfirmationFailed(`周期任务 ${String(task.id)} 创建后未查到；请查询任务，不得重试创建`);
+        const actual = publicRepeatTask(confirmed);
+        const expected = publicRepeatTask({ id: task.id, type: 2, status: confirmed.status, count: confirmed.count, data });
+        if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+          throw writeConfirmationFailed(`周期任务 ${String(task.id)} 回读字段与提交不一致；请查询任务，不得重试创建`);
+        }
+        return actual;
+      });
+    });
+  }
+
+  /** 保持原任务数据和历史账单，只按目标状态暂停或恢复。 */
+  async setRepeatTaskEnabled(accountId: number, taskId: string, enabled: boolean): Promise<Record<string, unknown>> {
+    const id = normalizeBillId(taskId);
+    return this.withBillAccount(accountId, async (account) => {
+      const before = (await this.loadRepeatTasks(account)).find((task) => task.id === id);
+      if (!before) throw new AppError("REPEAT_TASK_NOT_FOUND", `周期任务不存在：${id}`, 404);
+      const status = Number(before.status);
+      if (status !== 0 && status !== 1) throw new AppError("REPEAT_TASK_NOT_TOGGLEABLE", `周期任务 ${id} 当前状态 ${status} 不支持暂停或恢复`);
+      await this.requireWritableBook(account, String((before.data as Record<string, unknown>).bookid));
+      if ((status === 1) === enabled) return publicRepeatTask(before);
+      return this.withBusinessWrite(account, [], async (markRemoteSuccess) => {
+        await this.client.toggleRepeatTask(account, id);
+        markRemoteSuccess();
+        const after = (await this.loadRepeatTasks(account)).find((task) => task.id === id);
+        if (!after || Number(after.status) !== (enabled ? 1 : 0)
+          || JSON.stringify(after.data) !== JSON.stringify(before.data)) {
+          throw writeConfirmationFailed(`周期任务 ${id} 状态切换未确认；请重新查询，不得盲目再次切换`);
+        }
+        return publicRepeatTask(after);
+      });
     });
   }
 
