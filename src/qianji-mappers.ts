@@ -1,3 +1,4 @@
+import { localTime, localSecond } from "./time.ts";
 import {
   billExtra,
   inputBillMoney,
@@ -390,22 +391,13 @@ function nextCreditRepaymentDate(
   daysAfterStatement: boolean,
 ): number | undefined {
   if (daysAfterStatement && (!Number.isInteger(statementDay) || statementDay <= 0)) return undefined;
-  const offsetMs = 8 * 60 * 60 * 1000;
-  const localNow = new Date(nowMs + offsetMs);
-  const today = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), localNow.getUTCDate());
-  let candidate: number;
-  if (!daysAfterStatement) {
-    candidate = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth(), repaymentDay);
-    if (candidate < today) candidate = Date.UTC(localNow.getUTCFullYear(), localNow.getUTCMonth() + 1, repaymentDay);
-  } else {
-    let cycleMonth = localNow.getUTCMonth() - 1;
-    candidate = Date.UTC(localNow.getUTCFullYear(), cycleMonth, statementDay + repaymentDay);
-    while (candidate < today) {
-      cycleMonth += 1;
-      candidate = Date.UTC(localNow.getUTCFullYear(), cycleMonth, statementDay + repaymentDay);
-    }
-  }
-  return Math.floor((candidate - offsetMs) / 1000);
+  const local = localTime(nowMs / 1000);
+  const today = localSecond(local.year, local.month, local.day);
+  let month = local.month - (daysAfterStatement ? 1 : 0);
+  const day = daysAfterStatement ? statementDay + repaymentDay : repaymentDay;
+  let candidate = localSecond(local.year, month, day);
+  while (candidate < today) candidate = localSecond(local.year, ++month, day);
+  return candidate;
 }
 
 /** 将官方原始金额还原为 APP 主金额输入框语义。 */

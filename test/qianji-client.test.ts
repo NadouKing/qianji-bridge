@@ -16,6 +16,29 @@ import test from "./context.ts";
 import type { QianjiAccount } from "../src/data-store.ts";
 import { AppError } from "../src/errors.ts";
 
+test("new native routes preserve 64-bit IDs and account timezone headers without alternate write transports",async()=>{
+  const id="1770000000000123456",assetId="1770000000000123457",categoryId="1770000000000123458";
+  const account={id:1,uid:"123",utoken:"fixture",devid:"fixture",timeZone:"America/New_York"};
+  const calls:Array<{path:string;body:URLSearchParams}>=[];
+  let more=false;
+  const client=new QianjiClient({now:()=>Date.UTC(2026,6,1),fetch:async(url,init)=>{
+    const path=new URL(String(url)).pathname,body=new URLSearchParams(String(init?.body));calls.push({path,body});
+    assert.equal(new Headers(init?.headers).get("timezoneoffset"),"-14400");
+    assert.equal(new Headers(init?.headers).get("utoken"),"fixture");assert.equal(body.get("uid"),"123");
+    if(path==="/installment/list") return new Response(`{"ec":200,"data":{"hasmore":${more?1:0},"list":[{"id":${id},"assetid":${assetId},"data":{"cateid":${categoryId}}}]}}`);
+    return Response.json({ec:200,data:{}});
+  }});
+  const rows=await client.listInstallments(account);
+  assert.equal(rows[0]!.id,id);assert.equal(rows[0]!.assetid,assetId);assert.equal((rows[0]!.data as Record<string,unknown>).cateid,categoryId);
+  await client.submitInstallment(account,{id,assetid:assetId,data:{cateid:categoryId,remark:id}});
+  const payload=calls.at(-1)!.body.get("v")!;
+  assert.ok(payload.includes(`"id":${id}`));assert.ok(payload.includes(`"cateid":${categoryId}`));assert.ok(payload.includes(`"remark":"${id}"`));
+  await client.configureInstallment(account,id,{incount:1,feeincount:0});
+  await client.deleteInstallment(account,id);await client.deleteRepeatTask(account,id);await client.finishDebt(account,id,"2026-07-01");
+  assert.deepEqual(calls.slice(2).map(row=>[row.path,row.body.get("did")]),[["/installment/config",id],["/installment/delete",id],["/repeat_task/delete",id],["/asset/finish",id]]);
+  more=true;await assert.rejects(client.listInstallments(account),/未完整返回/);
+});
+
 test("Android 4.5.1b3 tok 确定性向量保持不变", () => {
   assert.equal(
     createTok("76ac66badd5fbfd7a7f8257469436710", "category", "listv2"),

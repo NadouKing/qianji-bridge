@@ -574,7 +574,7 @@ test("账单统计的 month 始终使用 UTC+08:00 自然月", async (t) => {
   assert.deepEqual(statistics.range, {
     startTime: Math.floor(Date.UTC(2026, 1, 1, -8) / 1000),
     endTime: Math.floor(Date.UTC(2026, 2, 1, -8) / 1000) - 1,
-    timezoneOffsetSeconds: 28_800,
+    timezoneOffsetSeconds: 28_800, timeZone: "Asia/Shanghai",
   });
   assert.equal(statistics.average.unit, "day");
   assert.equal(statistics.average.periodCount, 28);
@@ -638,7 +638,7 @@ test("预算查询按自定义月和 APK 金额规则聚合总预算、分类预
     month: 7,
     startTime: Math.floor(Date.UTC(2026, 6, 15, -8) / 1000),
     endTime: Math.floor(Date.UTC(2026, 7, 15, -8) / 1000) - 1,
-    timezoneOffsetSeconds: 28_800,
+    timezoneOffsetSeconds: 28_800, timeZone: "Asia/Shanghai",
   });
   assert.deepEqual(allExpenses.summary, {
     spendingScope: "allExpenses",
@@ -696,7 +696,7 @@ test("预算查询按自定义月和 APK 金额规则聚合总预算、分类预
       year: 2026,
       startTime: Math.floor(Date.UTC(2026, 0, 1, -8) / 1000),
       endTime: Math.floor(Date.UTC(2027, 0, 1, -8) / 1000) - 1,
-      timezoneOffsetSeconds: 28_800,
+      timezoneOffsetSeconds: 28_800, timeZone: "Asia/Shanghai",
     },
     currency: "CNY",
     configured: false,
@@ -730,7 +730,7 @@ test("预算查询省略 bookId 时仍使用默认账本的自定义月配置", 
     month: 7,
     startTime: Math.floor(Date.UTC(2026, 6, 15, -8) / 1000),
     endTime: Math.floor(Date.UTC(2026, 7, 15, -8) / 1000) - 1,
-    timezoneOffsetSeconds: 28_800,
+    timezoneOffsetSeconds: 28_800, timeZone: "Asia/Shanghai",
   });
   assert.equal(form?.get("bookid"), "-1");
   assert.equal(form?.get("flts"), '{"month":"2026,7"}');

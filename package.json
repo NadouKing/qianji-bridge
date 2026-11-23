@@ -14,8 +14,10 @@
     "reconcile": "bun src/reconcile-cli.ts"
   },
   "dependencies": {
+    "@js-temporal/polyfill": "0.5.1",
     "@modelcontextprotocol/node": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "sharp": "0.35.5",
     "zod": "4.4.3"
   },
   "devDependencies": {

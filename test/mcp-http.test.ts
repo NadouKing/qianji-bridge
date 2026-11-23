@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { runInNewContext } from "node:vm";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Client, StreamableHTTPClientTransport, UrlElicitationRequiredError } from "@modelcontextprotocol/client";
 
@@ -16,6 +19,25 @@ import test from "./context.ts";
 
 const ADMIN_PAT = `mt_pat_${"a".repeat(43)}`;
 const BUSINESS_TOOLS = [
+  "export_bills",
+  "get_debt_details",
+  "manage_debt",
+  "list_installments",
+  "manage_installment",
+  "delete_unused_repeat_task",
+  "create_repeat_task",
+  "update_repeat_task",
+  "get_catalog_object",
+  "manage_catalog_object",
+  "upload_bill_image",
+  "set_bill_images",
+  "get_operation_status",
+  "verify_future_repeat_creation",
+  "verify_debt_creation",
+  "verify_debt_deletion",
+  "verify_rejected_bill_operation",
+  "get_time_zone",
+  "set_time_zone",
   "archive_tags",
   "list_repeat_tasks",
   "create_repeat_transfer",
@@ -70,11 +92,36 @@ const BUSINESS_TOOLS = [
   "update_transfer",
 ].sort();
 
+test("MCP writes use durable receipts across connections, require IDs when enabled and query original status", async t => {
+  const root = mkdtempSync(join(tmpdir(), "qianji-mcp-operations-"));
+  const { store, app, service, token } = setupApp({ operationsRoot: root });
+  t.after(async () => { await app.close(); store.close(); rmSync(root, { recursive: true }); });
+  let writes = 0;
+  service.setBudget = async (_account, input) => { writes++; return input; };
+  const input = { bookId: "1", period: { kind: "month", year: 2026, month: 1 }, target: { kind: "total" }, amount: 10 };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const client = new Client({ name: "receipt-test", version: "1" });
+    try {
+      await client.connect(transport(app, token));
+      const noId = await client.callTool({ name: "set_budget", arguments: input });
+      assert.equal(noId.isError, true);
+      const result = await client.callTool({ name: "set_budget", arguments: { ...input, requestId: "budget-once" } });
+      assert.equal(result.isError, undefined);
+      const status = await client.callTool({ name: "get_operation_status", arguments: { requestId: "budget-once" } });
+      assert.equal((status.structuredContent as {operation: {state: string}}).operation.state, "confirmed");
+      const conflict = await client.callTool({ name: "set_budget", arguments: { ...input, amount: 11, requestId: "budget-once" } });
+      assert.equal(conflict.isError, true);
+    } finally { await client.close(); }
+  }
+  assert.equal(writes, 1);
+});
+
 function setupApp(options: {
   role?: PatRole;
   bound?: boolean;
   fetch?: QianjiFetch;
   bindingNow?: () => number;
+  operationsRoot?: string;
 } = {}) {
   const role = options.role ?? "user";
   const store = new Store(":memory:");
@@ -89,6 +136,7 @@ function setupApp(options: {
   const service = new MoneyTrackService(
     store,
     new QianjiClient({ fetch: options.fetch ?? (async () => { throw new Error("unexpected upstream call"); }) }),
+    Date.now, { operationsRoot: options.operationsRoot },
   );
   const config: AppConfig = {
     host: "127.0.0.1",
@@ -868,7 +916,7 @@ test("get_budget 通过 MCP 返回已校验的只读预算结构", async (t) => 
         year: 2026,
         startTime: Math.floor(Date.UTC(2026, 0, 1, -8) / 1000),
         endTime: Math.floor(Date.UTC(2027, 0, 1, -8) / 1000) - 1,
-        timezoneOffsetSeconds: 28_800,
+        timezoneOffsetSeconds: 28_800, timeZone: "Asia/Shanghai",
       },
       currency: "CNY",
       configured: true,

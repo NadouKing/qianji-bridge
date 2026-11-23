@@ -37,6 +37,8 @@ import {
 } from "./bill-rules.ts";
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
+import { installOperationTools } from "./operation-tools.ts";
+import { MAX_IMAGE_BYTES } from "./attachments.ts";
 
 const bindingExpiryFormatter = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
@@ -100,6 +102,29 @@ const writeTagIdsSchema = z.array(opaqueIdText).max(8)
 // 最多两位小数继续由 bill-rules.ts 的唯一金额校验入口保证
 const positiveMoneySchema = z.number().finite().positive().max(MAX_MONEY);
 const nonnegativeMoneySchema = z.number().finite().nonnegative().max(MAX_MONEY);
+const expectedVersionSchema = z.string().regex(/^[a-f0-9]{64}$/).describe("最新对象查询返回的版本指纹，变化时拒绝写入");
+const repeatScheduleSchema = z.strictObject({
+  type: z.union([z.literal("day").describe("每天"), z.literal("week").describe("每周指定星期"), z.literal("month").describe("每月指定日期"), z.literal("year").describe("每年指定月日"), z.literal("workday").describe("钱迹法定工作日"), z.literal("bystep").describe("每隔指定天数")]).describe("周期类型"),
+  values: z.array(z.union([z.number().int().describe("周、月或间隔天数"), z.string().describe("每年周期的 MM-DD")])).max(366).optional().describe("周为 1 至 7，月为 1 至 31，年为 MM-DD，间隔为单个 1 至 3650，day 和 workday 省略"),
+}).describe("钱迹原生周期规则，不等同于基金交易日");
+const catalogPatchIdentity = { id: z.string().min(1).max(100).describe("目录对象 ID，使用对应查询原值"), expectedVersion: expectedVersionSchema };
+const catalogCommandSchema = z.discriminatedUnion("action", [
+  z.strictObject({action: z.literal("createBook").describe("创建账本"), name: z.string().trim().min(1).max(15).describe("新账本名称，最多 15 个字符")}),
+  z.strictObject({action: z.literal("updateBook").describe("修改账本"), ...catalogPatchIdentity, name: z.string().trim().min(1).max(15).optional().describe("新账本名称"), visible: z.boolean().optional().describe("显示或隐藏，与名称分开修改")}),
+  z.strictObject({action: z.literal("createAsset").describe("创建 CNY 现金或信用账户"),
+    name: z.string().trim().min(1).max(40).describe("资产名称"), kind: z.union([z.literal("cash").describe("现金账户"), z.literal("credit").describe("信用账户")]).describe("资产类型"),
+    balance: z.number().finite().min(-MAX_MONEY).max(MAX_MONEY).describe("明确的初始余额，CNY 元，信用负债使用负数"),
+    includeInTotal: z.boolean().describe("是否计入总资产"),
+    statementDay: z.number().int().min(1).max(31).optional().describe("信用账户必填的每月账单日，1 至 31 日"),
+    paymentDay: z.number().int().min(1).max(31).optional().describe("信用账户必填的每月固定还款日，1 至 31 日"),
+  }),
+  z.strictObject({action: z.literal("updateAsset").describe("修改资产基础资料"), ...catalogPatchIdentity,
+    name: z.string().trim().min(1).max(40).optional().describe("新资产名称"), remark: z.string().max(500).optional().describe("新备注"),
+    includeInTotal: z.boolean().optional().describe("是否计入总资产"), visible: z.boolean().optional().describe("显示或隐藏，须与其他字段分开修改"),
+  }),
+  z.strictObject({action: z.literal("renameTagGroup").describe("标签组改名"), ...catalogPatchIdentity, name: z.string().trim().min(1).max(10).describe("新标签组名称，保留组内标签")}),
+  z.strictObject({action: z.literal("deleteEmpty").describe("删除无账单、周期及分期引用的自有空对象"), ...catalogPatchIdentity, kind: z.union([z.literal("book").describe("自有空账本"), z.literal("asset").describe("零余额无引用资产")]).describe("删除对象类型")}),
+]).describe("明确的目录管理操作，修改须提供最新版本指纹");
 const currencySymbolSchema = z.string().min(1)
   .refine(isCurrencySymbol, "币种标识不能为空")
   .describe("币种标识");
@@ -222,7 +247,7 @@ const assetSchema = z.object({
       type: repaymentRuleTypeSchema,
       value: z.number().int().positive().describe("固定还款日或账单日后的天数"),
     }).optional().describe("信用账户还款规则"),
-    nextRepaymentDate: z.number().int().nonnegative().optional().describe("按钱迹规则计算的下一还款日，UTC+08:00 当日零点 Unix 秒"),
+    nextRepaymentDate: z.number().int().nonnegative().optional().describe("按钱迹规则计算的下一还款日，当前账号时区 当日零点 Unix 秒"),
     limit: z.number().nonnegative().optional().describe(`信用额度，仅当 list_assets.includeBalances=true 时返回，${moneyUnitDescription}`),
   }).optional().describe("仅信用账户返回的账单日、还款规则和下一还款日，额度仅在 includeBalances=true 时返回"),
 });
@@ -536,7 +561,8 @@ const statisticsOutputSchema = z.object({
   range: z.object({
     startTime: z.number().int().describe("实际统计起点，Unix 秒，包含边界"),
     endTime: z.number().int().describe("实际统计终点，Unix 秒，包含边界"),
-    timezoneOffsetSeconds: z.literal(28_800).describe("日期分桶固定使用 UTC+08:00"),
+    timezoneOffsetSeconds: z.number().describe("期间起点的 UTC 偏移秒数，期间内夏令时可能变化"),
+    timeZone: z.string().describe("日期分桶的 IANA 时区"),
   }).describe("实际使用的统计时间范围"),
   currency: currencySymbolSchema.describe("响应中全部金额使用的币种标识，未指定时为当前本位币"),
   availableCurrencies: z.array(currencySymbolSchema).describe("应用其他筛选后可选的来源币种标识集合，并包含当前本位币"),
@@ -549,7 +575,7 @@ const statisticsOutputSchema = z.object({
   }).describe("匹配账单及实际收入、支出、报销条目计数"),
   average: z.object({
     unit: statisticsUnitSchema.describe("APK 按范围选择的平均和时间序列期间单位"),
-    periodCount: z.number().int().nonnegative().describe("平均值分母，其中 unit=day 时，自然月只计已经完整结束的日历日，跨度不超过 365 天的自定义范围以 startTime 为起点，以 endTime 后一秒与当前 UTC+08:00 自然日零点中的较早者为终点，每满 86400 秒计 1 个期间，范围内无账单的期间也计入，因此进行中的当天不计入，仅查询当天时即使有账单也可能为 0，而 unit=month/year 时只计有账单期间，跨度超过 365 天的自定义范围使用 year"),
+    periodCount: z.number().int().nonnegative().describe("平均值分母，其中 unit=day 时，自然月只计已经完整结束的日历日，跨度不超过 365 天的自定义范围以 startTime 为起点，以 endTime 后一秒与当前 当前账号时区 自然日零点中的较早者为终点，按自然日差计数，夏令时不按固定 86400 秒折算，范围内无账单的期间也计入，因此进行中的当天不计入，仅查询当天时即使有账单也可能为 0，而 unit=month/year 时只计有账单期间，跨度超过 365 天的自定义范围使用 year"),
     income: z.number().describe("totalIncome / periodCount，分母为 0 时为 0"),
     spend: z.number().describe("totalSpend / periodCount，分母为 0 时为 0"),
     balance: z.number().describe("平均收入减平均支出"),
@@ -572,7 +598,7 @@ const statisticsOutputSchema = z.object({
       income: z.number().describe("该期间总收入"),
       spend: z.number().describe("该期间总支出"),
       balance: z.number().describe("该期间收入减支出"),
-    })).describe("按 UTC+08:00 分桶且不补空期间的时间序列"),
+    })).describe("按 当前账号时区 分桶且不补空期间的时间序列"),
   }).describe("按 APK 选择的日期粒度汇总趋势"),
 });
 
@@ -590,7 +616,8 @@ const budgetPeriodInputSchema = z.discriminatedUnion("kind", [
 const budgetRangeFields = {
   startTime: z.number().int().describe("实际预算期间起点，Unix 秒，包含边界"),
   endTime: z.number().int().describe("实际预算期间终点，Unix 秒，包含边界"),
-  timezoneOffsetSeconds: z.literal(28_800).describe("预算日期固定使用 UTC+08:00"),
+  timezoneOffsetSeconds: z.number().describe("期间起点的 UTC 偏移秒数"),
+  timeZone: z.string().describe("预算自然日的 IANA 时区"),
 };
 const budgetTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("total").describe("总预算") }),
@@ -645,7 +672,7 @@ const budgetOutputSchema = z.object({
   summary: budgetSummarySchema.nullable().describe("预算总览，没有配置预算时为 null"),
   categories: z.array(budgetCategorySchema).describe("按一级分类与直属二级分类组织的预算明细，未设置预算的分类不返回"),
   dailyStatistics: z.array(z.object({
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("UTC+08:00 日历日期，格式为 YYYY-MM-DD"),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("当前账号时区 日历日期，格式为 YYYY-MM-DD"),
     spend: z.number().nonnegative().describe("当日预算支出，按 spendingScope 统计并排除不计预算金额"),
     cumulativeSpend: z.number().nonnegative().describe("从预算期间起点到当日的累计预算支出"),
     remaining: z.number().describe("当日结束后的预算剩余额度，固定为 summary.limit - cumulativeSpend，负数表示超支"),
@@ -663,6 +690,122 @@ export function createMoneyTrackMcp(
     { name: "qianji-bridge", version: "0.1.0" },
     { instructions: serverInstructions.trim() },
   );
+  installOperationTools(server, service, () => userId(principal, store));
+
+  const financeName = z.string().min(1).max(40).describe("自定义名称");
+  const financeRemark = z.string().max(500).describe("用途备注");
+  const financeDate = z.iso.date().describe("自然日 YYYY-MM-DD");
+  const financeTime = z.number().int().nonnegative().describe("Unix 秒");
+  const debtPrincipalSchema = nonnegativeMoneySchema.describe(`本金，纯利息还款可为零，${moneyUnitDescription}`);
+  const debtCommand = z.discriminatedUnion("action", [
+    z.strictObject({action:z.literal("create").describe("新建借贷及原生本金账单"), name:financeName,
+      direction:z.union([z.literal("borrowed").describe("借入"),z.literal("lent").describe("借出")]).describe("借贷方向"),money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),bookId:bookIdText,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),startDate:financeDate,endDate:financeDate.optional(),remark:financeRemark}),
+    z.strictObject({action:z.literal("addPrincipal").describe("追加本金"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),time:financeTime,remark:financeRemark}),
+    z.strictObject({action:z.literal("repay").describe("归还或收回本金并单独记录利息"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:debtPrincipalSchema,interest:nonnegativeMoneySchema.describe("独立利息主单位"),time:financeTime,remark:financeRemark}),
+    z.strictObject({action:z.literal("finish").describe("结清零本金借贷"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,endDate:financeDate}),
+    z.strictObject({action:z.literal("deleteSettled").describe("永久删除已结清本金循环及全部本金账单，服务端退回还款金额并返回资金余额影响，仅支持无利息、无附件、每个资金账户净流动为零的记录"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,billIds:z.array(positiveIdText).min(1).max(100).describe("全部关联本金账单 ID，必须同时提供对应 expectedBills 指纹")}),
+  ]).describe("原生借贷操作，需持久回执，暂限明确 CNY 资金账户");
+  server.registerTool("get_debt_details", {
+    description:"读取借贷详情及版本指纹", inputSchema:z.strictObject({debtId:positiveIdText.describe("借贷 ID")}),
+    outputSchema:z.record(z.string(),z.unknown()).describe("借贷公开字段及版本"),annotations:readAnnotations,
+  },async ({debtId},ctx)=>toolResult(async()=>service.getDebtDetails(await userId(principal,store),debtId),ctx,principal,bindingTickets));
+  server.registerTool("manage_debt", {
+    description:"创建借贷、追加本金、归还本金与利息、结清或按明确账单清单删除已结清本金循环，核验原生关系、历史账单和余额",
+    inputSchema:z.strictObject({command:debtCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验借贷详情、版本和账单编号或删除结果"),annotations:{...writeAnnotations,destructiveHint:true},
+  },async ({command},ctx)=>toolResult(async()=>service.manageDebt(await userId(principal,store),command),ctx,principal,bindingTickets));
+  server.registerTool("list_installments", {
+    description:"直接读取分期目录和版本，不从历史账单猜测当前设置",inputSchema:z.strictObject({}).meta({required:[]}),
+    outputSchema:z.object({results:z.array(z.record(z.string(),z.unknown())).describe("分期设置、剩余本金费用及版本")}),annotations:readAnnotations,
+  },async (_,ctx)=>toolResult(async()=>({results:await service.listInstallments(await userId(principal,store))}),ctx,principal,bindingTickets));
+  const feeMethod = z.union([z.literal("average").describe("平均分配"),z.literal("first").describe("首期收取"),z.literal("last").describe("末期收取")]).describe("手续费分配方式");
+  const remainder = z.union([z.literal("first").describe("首期补余数"),z.literal("last").describe("末期补余数")]).describe("本金和平均手续费的分币余数位置");
+  const installmentCommand=z.discriminatedUnion("action",[
+    z.strictObject({action:z.literal("create").describe("从未来自然日创建原生分期"),name:financeName,assetId:positiveIdText.describe("独立 CNY 信用账户 ID"),bookId:bookIdText,categoryId:positiveIdText.describe("该账本的支出分类 ID"),money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),fee:nonnegativeMoneySchema.describe(`全部期数总手续费，${moneyUnitDescription}`),periods:z.number().int().min(2).max(120).describe("期数 2 至 120"),time:financeTime,feeMethod,remainder,remark:financeRemark}),
+    z.strictObject({action:z.literal("configure").describe("修改分期统计开关"),id:positiveIdText,expectedVersion:expectedVersionSchema,includeInStatistics:z.boolean().describe("本金计入统计"),feeInStatistics:z.boolean().describe("手续费计入统计")}),
+    z.strictObject({action:z.literal("deleteUnused").describe("删除未生成账单的分期设置"),id:positiveIdText,expectedVersion:expectedVersionSchema}),
+  ]).describe("分期操作，需持久回执，保留历史记录");
+  server.registerTool("manage_installment", {
+    description:"创建未来分期、修改统计开关或删除未执行设置，核验本金费用与余额，未来自动生成需届时复核",
+    inputSchema:z.strictObject({command:installmentCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验分期设置及版本或删除结果"),annotations:{...writeAnnotations,destructiveHint:true},
+  },async ({command},ctx)=>toolResult(async()=>service.manageInstallment(await userId(principal,store),command),ctx,principal,bindingTickets));
+  server.registerTool("delete_unused_repeat_task", {
+    description:"按版本删除尚未生成账单的自有周期设置，保留已有账单和余额",
+    inputSchema:z.strictObject({taskId:positiveIdText,expectedVersion:expectedVersionSchema}),outputSchema:z.object({deleted:z.boolean().describe("删除已确认"),id:positiveIdText}),annotations:destructiveAnnotations,
+  },async ({taskId,expectedVersion},ctx)=>toolResult(async()=>service.deleteUnusedRepeatTask(await userId(principal,store),taskId,expectedVersion),ctx,principal,bindingTickets));
+
+  server.registerTool("export_bills", {
+    description: "分页导出账单摘要为 CSV 或 JSON 内容，明确返回完整性和续页游标，不写入服务器任意文件路径",
+    inputSchema: z.strictObject({format: z.union([z.literal("csv").describe("适合表格读取，保护公式及长整数 ID"), z.literal("json").describe("保留结构化摘要")]).describe("导出格式"),
+      maxRows: z.number().int().min(1).max(10000).optional().default(1000).describe("本次最大行数，可能在完整分页边界提前结束，最多 10000 行"),
+      bookId: bookIdText.optional(), allBooks: z.boolean().optional().describe("是否导出全部账本，与 bookId 互斥"),
+      startTime: z.number().int().nonnegative().optional().describe("起始时间，Unix 秒，包含边界"), endTime: z.number().int().nonnegative().optional().describe("结束时间，Unix 秒，包含边界"),
+      cursor: z.string().max(MAX_BILL_CURSOR_LENGTH).optional().describe("上次截断返回的续页游标，续页不再传账本或时间筛选"),
+    }).refine(value => !(value.allBooks && value.bookId !== undefined), "allBooks 与 bookId 互斥")
+      .refine(value => !value.cursor || [value.bookId, value.allBooks, value.startTime, value.endTime].every(v => v === undefined), "游标与筛选互斥")
+      .refine(value => value.startTime === undefined || value.endTime === undefined || value.startTime <= value.endTime, "时间范围无效"),
+    outputSchema: z.object({format: z.string().describe("输出格式"), rowCount: z.number().int().nonnegative().describe("本次实际行数"), complete: z.boolean().describe("是否已读到筛选范围末尾"), nextCursor: z.string().nullable().describe("未读完时的续页游标"), content: z.string().describe("导出内容，含私人账单信息，仅保存到私人目录")}),
+    annotations: readAnnotations,
+  }, async (input, ctx) => toolResult(async () => service.exportBills(await userId(principal, store), input), ctx, principal, bindingTickets));
+
+  server.registerTool("create_repeat_task", {
+    description: "从未来日期创建 CNY 收支、转账、还款或待报销周期任务，支持六种周期，核验可能提前生成的账单及余额",
+    inputSchema: z.strictObject({
+      type: z.union([z.literal(0).describe("支出"), z.literal(1).describe("收入"), z.literal(2).describe("转账"), z.literal(3).describe("信用卡还款"), z.literal(5).describe("待报销支出")]).describe("周期账单类型"),
+      bookId: bookIdText, fromAssetId: positiveIdText.describe("收支资金账户或转出资产 ID"), targetAssetId: positiveIdText.optional().describe("转账或还款的转入资产 ID"),
+      categoryId: positiveIdText.optional().describe("普通收支或待报销的分类 ID"),
+      money: positiveMoneySchema.describe(`每次主金额，转账包含手续费，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`每次固定手续费，仅转账或还款支持，${moneyUnitDescription}`),
+      remark: z.string().max(500).describe("周期备注"), startDate: z.iso.date().describe("当前账号时区未来起始日期 YYYY-MM-DD"),
+      timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("当前账号时区记账时刻 HH:mm"), schedule: repeatScheduleSchema,
+    }),
+    outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
+  }, async (input, ctx) => toolResult(async () => ({task: await service.createRepeatTask(await userId(principal, store), input)}), ctx, principal, bindingTickets));
+  server.registerTool("update_repeat_task", {
+    description: "按最新版本修改周期金额、费用、备注、时间或频率，保留账户、历史账单和任务关联，核验余额变化",
+    inputSchema: z.strictObject({taskId: positiveIdText.describe("周期任务 ID"), expectedVersion: expectedVersionSchema,
+      patch: z.strictObject({money: positiveMoneySchema.optional().describe(`新的每次主金额，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`新的固定手续费，${moneyUnitDescription}`),
+        remark: z.string().max(500).optional().describe("新周期备注"), timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional().describe("新的当前账号时区 HH:mm"), schedule: repeatScheduleSchema.optional(),
+      }).refine(value => Object.keys(value).length > 0, "patch 不能为空").meta({required: []}).describe("只修改明确提供的字段"),
+    }), outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
+  }, async ({taskId, expectedVersion, patch}, ctx) => toolResult(async () => ({task: await service.updateRepeatTask(await userId(principal, store), taskId, expectedVersion, patch)}), ctx, principal, bindingTickets));
+
+  server.registerTool("get_catalog_object", {
+    description: "直接读取账本、资产或标签组及版本指纹，包含空标签组，用于修改前核对",
+    inputSchema: z.strictObject({ kind: z.union([z.literal("book").describe("账本"), z.literal("asset").describe("资产"), z.literal("tagGroup").describe("标签组")]).describe("对象类型"),
+      id: z.string().min(1).max(100).describe("对象原始 ID"), includeBalances: z.boolean().optional().default(false).describe("是否返回资产余额，只有明确需要时启用"),
+    }),
+    outputSchema: z.object({object: z.record(z.string(), z.unknown()).describe("公开对象字段"), version: expectedVersionSchema}),
+    annotations: readAnnotations,
+  }, async ({kind, id, includeBalances}, ctx) => toolResult(async () => service.getCatalogObject(await userId(principal, store), kind, id, includeBalances), ctx, principal, bindingTickets));
+  server.registerTool("manage_catalog_object", {
+    description: "创建账本或 CNY 现金及信用账户，修改基础资料和显示状态，标签组改名，删除自有空账本或零余额无引用资产，保留余额和已有关系",
+    inputSchema: z.strictObject({ command: catalogCommandSchema }),
+    outputSchema: z.record(z.string(), z.unknown()).describe("写后核验的公开对象及版本，或已删除对象 ID"),
+    annotations: {...writeAnnotations, destructiveHint: true},
+  }, async ({command}, ctx) => toolResult(async () => service.manageCatalog(await userId(principal, store), command), ctx, principal, bindingTickets));
+
+  server.registerTool("upload_bill_image", {
+    description: "上传并核验单帧 PNG 或 JPEG，需启用持久回执，返回存储证明及独立的内容核验结果",
+    inputSchema: z.strictObject({ imageBase64: z.string().min(1).max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4).describe("图片标准 Base64 内容，原文件最多 8 MiB，不接受路径、URL 或 data URL") }),
+    outputSchema: z.object({ image: z.object({
+      imageKey: z.string().describe("本账号上传的图片对象键"),
+      sha256: z.string().describe("上传文件 SHA256"),
+      storageVerified: z.boolean().describe("存储回执哈希是否符合上传内容"),
+      fileVerified: z.boolean().describe("CDN 回读字节是否完全一致"),
+      pixelsVerified: z.boolean().describe("按图片方向解码后的尺寸及像素是否完全一致"),
+    }).describe("上传和回读结果，内容核验失败不代表存储上传失败") }),
+    annotations: writeAnnotations,
+  }, async ({ imageBase64 }, ctx) => toolResult(async () => ({ image: await service.uploadBillImage(await userId(principal, store), imageBase64) }), ctx, principal, bindingTickets));
+
+  server.registerTool("set_bill_images", {
+    description: "按已核验的上传请求关联账单附件，append 保留旧图，replace 显式替换，仅修改附件并回读原账单字段",
+    inputSchema: z.strictObject({
+      billId: positiveIdText.describe("目标账单 ID"),
+      mode: z.union([z.literal("append").describe("保留旧图并按顺序追加"), z.literal("replace").describe("完整替换附件，空列表清除全部图片")]).describe("附件修改方式"),
+      uploadRequestIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,100}$/)).max(6).describe("本账号已完成内容核验的上传请求号列表，最多 6 张图片"),
+    }),
+    outputSchema: z.object({ bill: billSchema.describe("附件和其他字段已核验的账单") }),
+    annotations: { ...writeAnnotations, destructiveHint: true },
+  }, async (input, ctx) => toolResult(async () => ({ bill: await service.setBillImages(await userId(principal, store), input) }), ctx, principal, bindingTickets));
 
   server.registerTool(
     "connect_qianji",
@@ -809,8 +952,8 @@ export function createMoneyTrackMcp(
         fee: z.number().nonnegative().max(MAX_MONEY).optional().describe(`每次固定手续费，包含在主金额中，转入金额为 money - fee，${sourceAssetMoneyDescription}`),
         remark: z.string().max(500).describe("周期账单备注"),
         tagIds: z.array(z.string().min(1)).max(8).optional().describe("每次周期账单的标签 ID 列表"),
-        startDate: z.iso.date().describe("上海时区起始日期 YYYY-MM-DD，必须晚于今天，不生成历史账单"),
-        timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("上海时区记账时刻 HH:mm"),
+        startDate: z.iso.date().describe("当前账号时区起始日期 YYYY-MM-DD，必须晚于今天，不生成历史账单"),
+        timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("当前账号时区记账时刻 HH:mm"),
         repeatType: z.union([z.literal("week").describe("每周指定星期"), z.literal("workday").describe("沿用钱迹法定工作日规则")])
           .optional().describe("周期类型，省略为每周指定星期"),
         weekdays: z.array(z.number().int().min(1).max(7)).max(7).optional().describe("week 类型必填的星期列表，1 为周一、7 为周日，workday 类型省略或传空数组"),
@@ -881,6 +1024,16 @@ export function createMoneyTrackMcp(
         results: await service.listTags(await userId(principal, store), status),
       }), ctx, principal, bindingTickets),
   );
+
+  server.registerTool("get_time_zone", {
+    description: "查询当前账号用于报表、预算和日期边界的 IANA 时区",
+    inputSchema: z.strictObject({}).meta({required: []}), outputSchema: z.object({timeZone: z.string().describe("IANA 时区")}), annotations: readAnnotations,
+  }, async (_, ctx) => toolResult(async () => service.getTimeZone(await userId(principal, store)), ctx, principal, bindingTickets));
+  server.registerTool("set_time_zone", {
+    description: "设置本服务账号时区，不会移动历史 Unix 秒、修改 APP 设置或重排已有周期任务",
+    inputSchema: z.strictObject({timeZone: z.string().min(1).max(100).describe("IANA 时区，如 Asia/Shanghai")}),
+    outputSchema: z.object({timeZone: z.string().describe("保存的 IANA 时区")}), annotations: {...writeAnnotations, idempotentHint: true},
+  }, async ({timeZone}, ctx) => toolResult(async () => service.setTimeZone(await userId(principal, store), timeZone), ctx, principal, bindingTickets));
 
   server.registerTool(
     "get_user_info",
@@ -1050,6 +1203,7 @@ export function createMoneyTrackMcp(
         results: z.array(z.object({
           billId: positiveIdText.describe("请求的账单 ID"),
           bill: billSchema.nullable().describe("完整详情，不存在或不属于当前账号时为 null"),
+          fingerprint: z.string().nullable().describe("详情版本 SHA256，用于写前 expectedBills 检查，账单缺失时为 null"),
         })).describe("按 ID 首次出现顺序返回的结果"),
         cache: z.object({
           readAt: z.number().int().describe("读取缓存的时间，Unix 秒，不表示已经同步"),
@@ -1073,7 +1227,7 @@ export function createMoneyTrackMcp(
           description: "是否统计全部账本，启用时忽略 bookId",
           default: false,
         }),
-        range: statisticsRangeSchema.describe("统计范围，按 UTC+08:00 解释月份和年份"),
+        range: statisticsRangeSchema.describe("统计范围，按 当前账号时区 解释月份和年份"),
         memberIds: z.array(opaqueIdText).min(1).max(100).optional()
           .describe("共享账本记账人用户 ID 列表，匹配任一成员"),
         currency: currencySymbolSchema.optional().describe("来源币种标识筛选和统计结果币种，传入时只统计以该币种记账的账单并按该币种汇总，省略时不筛选来源币种并按当前本位币汇总"),

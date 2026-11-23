@@ -23,6 +23,7 @@ export interface QianjiAccount {
   uid: string;
   utoken: string;
   devid: string;
+  timeZone?: string;
 }
 
 /** PAT 当前绑定及仅供登录流程使用的账号标识。 */
@@ -143,6 +144,7 @@ export interface DataStore {
   unbindPat(patId: number, expectedAccountId: number): MaybePromise<UnbindResult>;
   /** 读取一个已绑定的钱迹账号。 */
   requireAccount(accountId: number): MaybePromise<QianjiAccount>;
+  setTimeZone(accountId: number, timeZone: string): MaybePromise<void>;
   /** 读取用户资料缓存。 */
   getUserCache(accountId: number): MaybePromise<UserCache | undefined>;
   /** 写入用户资料缓存。 */
@@ -356,7 +358,7 @@ export class Store implements DataStore {
   /** 读取已认证用户的账号绑定，不允许跨账号访问。 */
   requireAccount(accountId: number): QianjiAccount {
     const row = this.db
-      .prepare("SELECT id, uid, utoken, devid FROM accounts WHERE id = ?")
+      .prepare("SELECT id, uid, utoken, devid, time_zone FROM accounts WHERE id = ?")
       .get(accountId) as SqlRow | undefined;
     if (!row) throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "尚未绑定钱迹账号");
     return {
@@ -364,7 +366,12 @@ export class Store implements DataStore {
       uid: String(row.uid),
       utoken: String(row.utoken),
       devid: String(row.devid),
+      timeZone: String(row.time_zone),
     };
+  }
+
+  setTimeZone(accountId: number, timeZone: string): void {
+    this.db.prepare("UPDATE accounts SET time_zone = ? WHERE id = ?").run(timeZone, accountId);
   }
 
   /** 读取钱迹用户缓存，不公开账号凭据。 */
@@ -632,6 +639,7 @@ export class Store implements DataStore {
       ["user_json", "TEXT"],
       ["user_refreshed_at_ms", "INTEGER"],
       ["write_quota_date", "TEXT"],
+      ["time_zone", "TEXT NOT NULL DEFAULT 'Asia/Shanghai'"],
       ["write_quota_used", "INTEGER NOT NULL DEFAULT 0 CHECK (write_quota_used >= 0)"],
       ["login_identifier", "TEXT"],
     ].filter(([name]) => !columns.has(name!));

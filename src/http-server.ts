@@ -31,6 +31,7 @@ export interface AppConfig {
   superadminPat: string;
   debugLogPath?: string;
   recoveryRoot?: string;
+  operationsRoot?: string;
 }
 
 export interface HttpApplication {
@@ -75,6 +76,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (env.QIANJI_MCP_RECOVERY_ROOT && !isAbsolute(env.QIANJI_MCP_RECOVERY_ROOT)) {
     throw new Error("QIANJI_MCP_RECOVERY_ROOT must be an absolute private directory");
   }
+  if (env.QIANJI_MCP_OPERATIONS_ROOT && !isAbsolute(env.QIANJI_MCP_OPERATIONS_ROOT)) {
+    throw new Error("QIANJI_MCP_OPERATIONS_ROOT must be an absolute private directory");
+  }
   return {
     host,
     port,
@@ -85,6 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     superadminPat,
     debugLogPath: env.QIANJI_MCP_DEBUG_LOG_PATH,
     recoveryRoot: env.QIANJI_MCP_RECOVERY_ROOT,
+    operationsRoot: env.QIANJI_MCP_OPERATIONS_ROOT,
   };
 }
 
@@ -146,7 +151,7 @@ export async function startServer(config = loadConfig()): Promise<{
     const service = new MoneyTrackService(store, new QianjiClient({
       baseUrl: config.apiServer,
       debugLogPath: config.debugLogPath,
-    }), Date.now, { recoveryRoot: config.recoveryRoot });
+    }), Date.now, { recoveryRoot: config.recoveryRoot, operationsRoot: config.operationsRoot });
     const app = createHttpApplication(config, store, service);
     const nodeHandler = toNodeHandler(app, { onerror: (error: unknown) => console.error("HTTP adapter error:", error) });
     const server = createServer((request, response) => {

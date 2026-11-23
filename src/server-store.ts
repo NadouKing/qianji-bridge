@@ -62,15 +62,18 @@ export class ServerStore implements DataStore {
       if (version === 1) {
         await this.migrateToVersion2();
         await this.migrateToVersion3();
+        await this.ensureTimeZoneColumn();
         return;
       }
       if (version === 2) {
         await this.migrateToVersion3();
+        await this.ensureTimeZoneColumn();
         return;
       }
       if (version !== 3 || !(await this.hasLoginIdentifierColumn())) {
         throw new Error("Unsupported or incomplete qianji-mcp database schema");
       }
+      await this.ensureTimeZoneColumn();
       return;
     }
     if (existingTables.length > 0) throw new Error("QIANJI_MCP_DATABASE_URL must reference an empty or initialized qianji-mcp database");
@@ -79,6 +82,7 @@ export class ServerStore implements DataStore {
       applied_at BIGINT NOT NULL
     )${this.dialect === "mysql" ? " ENGINE=InnoDB" : ""}`);
     for (const statement of schemaStatements(this.dialect)) await this.sql.unsafe(statement);
+    await this.ensureTimeZoneColumn();
     await this.query(this.sql, "INSERT INTO qianji_schema_versions(version, applied_at) VALUES (?, ?)", [3, unixNow()]);
   }
 
@@ -210,9 +214,13 @@ export class ServerStore implements DataStore {
 
   /** 按本地主键读取已绑定账号。 */
   async requireAccount(accountId: number): Promise<QianjiAccount> {
-    const row = (await this.query(this.sql, "SELECT id, uid, utoken, devid FROM accounts WHERE id = ?", [accountId]))[0];
+    const row = (await this.query(this.sql, "SELECT id, uid, utoken, devid, time_zone FROM accounts WHERE id = ?", [accountId]))[0];
     if (!row) throw new AppError("QIANJI_ACCOUNT_NOT_BOUND", "尚未绑定钱迹账号");
-    return { id: Number(row.id), uid: String(row.uid), utoken: String(row.utoken), devid: String(row.devid) };
+    return { id: Number(row.id), uid: String(row.uid), utoken: String(row.utoken), devid: String(row.devid), timeZone: String(row.time_zone) };
+  }
+
+  async setTimeZone(accountId: number, timeZone: string): Promise<void> {
+    await this.query(this.sql, "UPDATE accounts SET time_zone = ? WHERE id = ?", [timeZone, accountId]);
   }
 
   /** 读取用户缓存，不公开账号凭据。 */
@@ -403,6 +411,14 @@ export class ServerStore implements DataStore {
       await this.query(tx, "DELETE FROM qianji_schema_versions WHERE version = 2");
       await this.query(tx, "INSERT INTO qianji_schema_versions(version, applied_at) VALUES (?, ?)", [3, unixNow()]);
     });
+  }
+
+  /** Additive and restart-safe; schema v3 readers tolerate this column on rollback. */
+  private async ensureTimeZoneColumn(): Promise<void> {
+    const rows = await this.query(this.sql, this.dialect === "postgres"
+      ? "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'accounts' AND column_name = 'time_zone'"
+      : "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'accounts' AND column_name = 'time_zone'");
+    if (!rows.length) await this.sql.unsafe("ALTER TABLE accounts ADD COLUMN time_zone VARCHAR(100) NOT NULL DEFAULT 'Asia/Shanghai'");
   }
 
   private async hasLoginIdentifierColumn(): Promise<boolean> {

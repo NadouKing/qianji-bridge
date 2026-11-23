@@ -1,8 +1,11 @@
+import { offsetSeconds } from "./time.ts";
 import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { AppError } from "./errors.ts";
+import { uploadImage } from "./attachments.ts";
+import { noteRemoteWrite } from "./write-context.ts";
 import {
   isCurrencySymbol,
   isOptionalPositiveLongId,
@@ -288,6 +291,39 @@ export class QianjiClient {
     return asObjectArray(data.list).map(normalizeBook);
   }
 
+  async submitBook(account: QianjiAccount, value: Record<string, unknown>): Promise<void> {
+    const v = JSON.stringify(value, (key, item) => key === "bookid" && typeof item === "string" && isPositiveLongId(item)
+      ? (JSON as JsonWithRaw).rawJSON(item) : item);
+    await this.authPost(account, "/book/submit", { v });
+  }
+
+  async toggleBookVisibility(account: QianjiAccount, bookId: string): Promise<void> {
+    await this.authPost(account, "/book/visible", { bookid: bookId });
+  }
+
+  async deleteEmptyBook(account: QianjiAccount, bookId: string): Promise<void> {
+    await this.authPost(account, "/book/delete", { bookid: bookId });
+  }
+
+  async listTagGroups(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/tag/list", { status: -1, lasttime: 0 }, true));
+    return asObjectArray(data.list).map(group => ({...group, id: opaqueIdText(group.id, "标签组")}));
+  }
+
+  async renameTagGroup(account: QianjiAccount, groupId: string, name: string): Promise<void> {
+    await this.authPost(account, "/tag/submitgroup", { did: groupId, v: name });
+  }
+
+  async toggleAssetVisibility(account: QianjiAccount, assetId: string): Promise<void> {
+    await this.authPost(account, "/asset/visible", { did: assetId });
+  }
+
+  async uploadBillImage(account: QianjiAccount, bytes: Buffer) {
+    const data = asObject(await this.authPost(account, "/common/uploadtoken", { dt: 1 }));
+    if (typeof data.v !== "string" || data.v.length < 10 || data.v.length > 10_000) throw new AppError("UPLOAD_TOKEN_INVALID", "上传令牌响应无效");
+    return uploadImage(this.fetchImpl, account.uid, bytes, data.v);
+  }
+
   /** APK page=0 请求返回完整目录，服务端不按 page 分页。 */
   async listRepeatTasks(account: QianjiAccount): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/repeat_task/list", { page: 0 }));
@@ -308,6 +344,38 @@ export class QianjiClient {
     await this.authPost(account, "/repeat_task/toggle", { did: taskId });
   }
 
+  async deleteRepeatTask(account: QianjiAccount, taskId: string): Promise<void> {
+    await this.authPost(account, "/repeat_task/delete", { did: taskId });
+  }
+
+  async finishDebt(account: QianjiAccount, id: string, endDate: string): Promise<void> {
+    await this.authPost(account, "/asset/finish", {did: id, v: endDate});
+  }
+
+  async listInstallments(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/installment/list", {flts: "{}"}));
+    if (data.hasmore === 1 || data.hasmore === true) throw new AppError("INSTALLMENT_PAGINATION_UNSUPPORTED", "分期目录未完整返回，停止依赖该目录的写入", 502);
+    return asObjectArray(data.list).map(row => {
+      const details=asObject(typeof row.data === "string" ? parseQianjiJson(row.data) : row.data);
+      return {...row, id:positiveIdText(row.id,"分期"),assetid:positiveIdText(row.assetid,"分期资产"),
+        data:{...details,cateid:optionalPositiveIdText(details.cateid,"分期分类")}};
+    });
+  }
+
+  async submitInstallment(account: QianjiAccount, task: Record<string, unknown>): Promise<void> {
+    const v = JSON.stringify(task, (key, value) => ["id", "assetid", "cateid"].includes(key)
+      && typeof value === "string" && isPositiveLongId(value) ? (JSON as JsonWithRaw).rawJSON(value) : value);
+    await this.authPost(account, "/installment/submit", {v});
+  }
+
+  async configureInstallment(account: QianjiAccount, id: string, value: Record<string, number>): Promise<void> {
+    await this.authPost(account, "/installment/config", {did: id, v: JSON.stringify(value)});
+  }
+
+  async deleteInstallment(account: QianjiAccount, id: string): Promise<void> {
+    await this.authPost(account, "/installment/delete", {did: id});
+  }
+
   /** APK AssetAccount submit protocol: change balance without diffparams or an adjustment bill. */
   async submitAssetBalance(account: QianjiAccount, asset: Record<string, unknown>, money: number, extra?: Record<string, unknown>): Promise<void> {
     const raw: Record<string, unknown> = { ...asset, money };
@@ -321,6 +389,14 @@ export class QianjiClient {
   }
 
   /** Delete only an unused wallet after the service has checked ownership and all bill references. */
+  async checkAssetDeletion(account: QianjiAccount, assetId: string): Promise<void> {
+    const data = asObject(await this.authPost(account, "/asset/deletecheck", {did: assetId}));
+    for (const key of ["installcount", "repeatcount"]) {
+      if (typeof data[key] !== "number" || !Number.isInteger(data[key]) || Number(data[key]) < 0) throw new AppError("QIANJI_RESPONSE_INVALID", "资产删除检查未返回明确的关联数量", 502);
+      if (Number(data[key]) > 0) throw new AppError("CATALOG_OBJECT_IN_USE", "资产仍有关联分期或周期，拒绝上游级联终止");
+    }
+  }
+
   async deleteUnusedWallet(account: QianjiAccount, assetId: string): Promise<void> {
     await this.authPost(account, "/asset/delete", { did: assetId });
   }
@@ -744,10 +820,11 @@ export class QianjiClient {
     body: Record<string, string | number>,
     htoken = false,
   ): Promise<unknown> {
+    if (!new Set(["/client/init", "/book/list", "/book/members", "/asset/list", "/asset/info", "/asset/listloan", "/asset/typelist", "/asset/deletecheck", "/tag/list", "/budget/list", "/category/listv2", "/category/iconlist", "/category/deletecheckv2", "/currency/listv2", "/repeat_task/list", "/installment/list", "/syncv2/pull", "/common/uploadtoken"]).has(path)) noteRemoteWrite();
     return this.post(
       path,
       { uid: account.uid, ...body, fr: account.uid },
-      { devid: account.devid, utoken: account.utoken, htoken },
+      { devid: account.devid, utoken: account.utoken, htoken, timeZone: account.timeZone },
     );
   }
 
@@ -755,7 +832,7 @@ export class QianjiClient {
   private async post(
     path: string,
     body: Record<string, string | number>,
-    auth: { devid: string; utoken?: string; htoken?: boolean },
+    auth: { devid: string; utoken?: string; htoken?: boolean; timeZone?: string },
   ): Promise<unknown> {
     const { ctrl, act } = extractCtrlAct(path);
     const route = `${ctrl}/${act}`;
@@ -766,6 +843,7 @@ export class QianjiClient {
     const reqidv2 = createReqidv2(ctrl, act, requestMs);
     const headers = new Headers({
       ...CLIENT_PROFILE,
+      timezoneoffset: String(offsetSeconds(now / 1000, auth.timeZone)),
       ctrl,
       act,
       reqidv2,
@@ -846,6 +924,7 @@ export class QianjiClient {
 
   /** 以脱敏 JSONL 追加可选诊断记录，日志失败不影响业务请求。 */
   private writeDebugLog(url: URL, requestBody: string, status: number | null, responseBody: string | null): void {
+    if (url.pathname === "/common/uploadtoken") return;
     if (!this.debugLogPath) return;
     try {
       // ponytail: 可选诊断采用同步追加已足够，吞吐成为实际问题时再接入部署日志管道。
@@ -947,6 +1026,7 @@ function normalizeRepeatTask(raw: Record<string, unknown>): Record<string, unkno
   for (const key of ["bookid", "cateid", "fromid", "targetid"]) {
     // 上游省略未选择的引用，尤其转账任务不返回 cateid。
     if (!(key in data)) continue;
+    if (data[key] === null) { delete data[key]; continue; }
     // RepeatTaskData 的 cateId 默认为 0，转账任务没有分类。
     data[key] = key === "cateid" && numericText(data[key]) === "0"
       ? "0" : referenceIdText(data[key], `周期任务 ${numericText(raw.id)} ${key}=${numericText(data[key])}`);

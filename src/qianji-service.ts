@@ -1,4 +1,12 @@
+import { manageDebt, debtDetails, manageInstallment, publicInstallment, verifyCreatedDebt, verifyDeletedDebt, type DebtCommand, type InstallmentCommand } from "./linked-finance.ts";
+import { inTimeZone, validateTimeZone, timeZone, localTime, localDate, localSecond, startOfDay, nextDay, calendarDays, offsetSeconds } from "./time.ts";
 import { randomUUID } from "node:crypto";
+import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
+import { OperationJournal, type ExpectedBill } from "./operation-journal.ts";
+import { billFingerprint } from "./reconciliation.ts";
+import { decodeImageBase64, imageIdentity } from "./attachments.ts";
+import { getCatalogObject, manageCatalog, type CatalogObjectKind, type CatalogCommand } from "./catalog-management.ts";
+import { exportBillPages } from "./bill-export.ts";
 import { readRecoveryBackup, remapBillAsset, recoveryFingerprint, saveRecoveryRecord } from "./bill-recovery.ts";
 
 import {
@@ -90,7 +98,7 @@ import {
 } from "./qianji-mappers.ts";
 import { QianjiClient, type BudgetPeriod, type PullPage, type SyncBillResult } from "./qianji-client.ts";
 import { calculateBillStatistics, calculateBudgetBillAmounts, type StatisticsUnit } from "./bill-statistics.ts";
-import { publicRepeatTask, type CreateRepeatTransferInput } from "./repeat-tasks.ts";
+import { publicRepeatTask, repeatSchedule, validDate, type CreateRepeatTransferInput, type RepeatTaskInput, type RepeatTaskPatch } from "./repeat-tasks.ts";
 
 interface CursorPayload {
   v: 2;
@@ -231,6 +239,7 @@ export class MoneyTrackService {
   private readonly client: QianjiClient;
   private readonly now: () => number;
   private readonly recoveryRoot?: string;
+  private readonly operations?: OperationJournal;
   private readonly locks = new Map<string, Promise<void>>();
   // 仅记录本进程确认的同步；重启后保持未知，不把读取缓存的时间当作同步时间。
   private readonly billSyncTimes = new Map<number, number>();
@@ -239,11 +248,206 @@ export class MoneyTrackService {
   private readonly initialSyncFailures = new Map<number, AppError>();
 
   /** 创建业务服务，时间函数可注入，以便确定性验证缓存和配额边界。 */
-  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now, options: { recoveryRoot?: string } = {}) {
+  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now, options: { recoveryRoot?: string; operationsRoot?: string } = {}) {
     this.store = store;
     this.client = client;
     this.now = now;
     this.recoveryRoot = options.recoveryRoot;
+    this.operations = options.operationsRoot ? new OperationJournal(options.operationsRoot) : undefined;
+  }
+
+  async operationStatus(accountId: number, requestId: string) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "尚未配置私人操作回执目录");
+    const account = await this.store.requireAccount(accountId);
+    return this.operations.status(account.uid, requestId);
+  }
+
+  async exportBills(accountId: number, input: {format: "csv" | "json"; maxRows: number; bookId?: string; allBooks?: boolean; startTime?: number; endTime?: number; cursor?: string}) {
+    return this.withBillAccount(accountId, account => exportBillPages(input.format, input.maxRows,
+      (cursor, limit) => this.listBillsUnlocked(account, cursor ? {cursor} : {
+        bookId: input.bookId, allBooks: input.allBooks, startTime: input.startTime, endTime: input.endTime, limit,
+      }), input.cursor));
+  }
+
+  private financeContext(account: QianjiAccount) {
+    return {client:this.client,store:this.store,account,sync:()=>this.syncUnlocked(account),baseCurrency:async()=>requireBaseCurrency(await this.loadUserWithCurrencyConfig(account)),now:this.now()};
+  }
+  async getDebtDetails(accountId: number, id: string) {
+    return this.withAccount(accountId, account => debtDetails(this.financeContext(account),id));
+  }
+  async manageDebt(accountId: number, command: DebtCommand) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "借贷写入需要持久操作回执");
+    return this.withBillAccount(accountId,account=>manageDebt(this.financeContext(account),command));
+  }
+  async verifyDebtCreation(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],debtId:string,expectedCashBalanceAfter:number) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedCreation(account.uid,requestId,"manage_debt",{args,expected});
+      const command=args.command as Extract<DebtCommand,{action:"create"}>;
+      if(!command || command.action!=="create") throw new AppError("DEBT_REVIEW_UNSUPPORTED","仅复核借贷创建，不处理追加、还款、结清或删除");
+      const verified=await verifyCreatedDebt(this.financeContext(account),command,debtId,expectedCashBalanceAfter,original.updatedAt);
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified,"createdDebtMatched");
+      return {operation:await this.operations!.status(account.uid,requestId),...verified};
+    });
+  }
+  async verifyDebtDeletion(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],cashBalances:Array<{assetId:string;balance:number}>) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedCreation(account.uid,requestId,"manage_debt",{args,expected});
+      const command=args.command as Extract<DebtCommand,{action:"deleteSettled"}>;
+      if(!command || command.action!=="deleteSettled") throw new AppError("DEBT_REVIEW_UNSUPPORTED","仅复核已结束的本金循环删除，不处理其他操作");
+      const verified=await verifyDeletedDebt(this.financeContext(account),command,cashBalances);
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified,"deletedDebtMatched");
+      return {operation:await this.operations!.status(account.uid,requestId),...verified};
+    });
+  }
+  async listInstallments(accountId: number) {
+    return this.withAccount(accountId,async account=>(await this.client.listInstallments(account)).map(publicInstallment));
+  }
+  async manageInstallment(accountId: number, command: InstallmentCommand) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "分期写入需要持久操作回执");
+    return this.withBillAccount(accountId,account=>manageInstallment(this.financeContext(account),command));
+  }
+  async deleteUnusedRepeatTask(accountId: number, id: string, expectedVersion: string) {
+    return this.withBillAccount(accountId, async account => {
+      const task=(await this.loadRepeatTasks(account)).find(row=>String(row.id)===id);
+      if (!task || publicUserId(task.userid)!==account.uid || billFingerprint(task)!==expectedVersion) throw new AppError("REPEAT_VERSION_CONFLICT","周期任务不存在、不属于当前账号或版本已变化");
+      const before=await this.scheduleSnapshot(account);
+      if (Number(task.count)!==0 || before.bills.some(row=>[cachedBillObject(row).packid,cachedBillObject(row).importpackid].some(value=>Number(task.packid)>0 && String(value)===String(task.packid)))) throw new AppError("REPEAT_TASK_IN_USE","只删除尚未生成账单的周期设置");
+      await this.client.deleteRepeatTask(account,id);
+      if ((await this.loadRepeatTasks(account)).some(row=>String(row.id)===id)) throw writeConfirmationFailed("周期任务删除未确认");
+      await this.syncUnlocked(account);
+      const after=await this.scheduleSnapshot(account);
+      const history=(rows:BillRow[])=>rows.map(row=>[row.id,billFingerprint(publicBill(cachedBillObject(row)))]).sort();
+      const balances=(rows:Record<string,unknown>[])=>rows.map(row=>[String(row.id),row.money]).sort();
+      if (billFingerprint(history(before.bills))!==billFingerprint(history(after.bills)) || billFingerprint(balances(before.assets))!==billFingerprint(balances(after.assets))) throw writeConfirmationFailed("删除周期设置期间账单或余额发生变化");
+      return {deleted:true,id};
+    });
+  }
+
+  async getCatalogObject(accountId: number, kind: CatalogObjectKind, id: string, includeBalances = false) {
+    return this.withAccount(accountId, account => getCatalogObject(this.client, account, kind, id, includeBalances, async () => requireBaseCurrency(await this.loadUserWithCurrencyConfig(account))));
+  }
+
+  async manageCatalog(accountId: number, command: CatalogCommand) {
+    return this.withBillAccount(accountId, account => manageCatalog(this.client, this.store, account, command, () => this.syncUnlocked(account), async () => requireBaseCurrency(await this.loadUserWithCurrencyConfig(account))));
+  }
+
+  async uploadBillImage(accountId: number, imageBase64: string) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "附件上传必须启用持久操作回执");
+    const bytes = decodeImageBase64(imageBase64);
+    await imageIdentity(bytes);
+    return this.withAccount(accountId, account => this.client.uploadBillImage(account, bytes));
+  }
+
+  async setBillImages(accountId: number, input: { billId: string; mode: "append" | "replace"; uploadRequestIds: string[] }) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "附件关联必须启用持久操作回执");
+    return this.withBillAccount(accountId, async account => {
+      const keys: string[] = [];
+      for (const requestId of input.uploadRequestIds) {
+        const status = await this.operations!.status(account.uid, requestId);
+        const image = status.result?.structuredContent?.image;
+        if (status.state !== "confirmed" || status.tool !== "upload_bill_image" || !image || typeof image !== "object"
+          || typeof image.imageKey !== "string" || image.storageVerified !== true || image.pixelsVerified !== true) {
+          throw new AppError("IMAGE_REFERENCE_UNVERIFIED", "只能关联本账号已完成内容核验的上传回执");
+        }
+        keys.push(image.imageKey);
+      }
+      await this.syncUnlocked(account);
+      const row = await this.store.getBill(account.id, normalizeBillId(input.billId));
+      if (!row) throw new AppError("BILL_NOT_FOUND", "账单不存在", 404);
+      const raw = cachedBillObject(row);
+      requireOwnedBill(raw, account.uid);
+      await this.requireWritableBook(account, String(raw.bookid));
+      if (![0, 1, 2, 3, 5].includes(Number(raw.type))) throw new AppError("BILL_SCENARIO_MISMATCH", "当前附件编辑仅支持普通收支、待报销、转账和还款");
+      if (raw.images != null && (!Array.isArray(raw.images) || raw.images.some(item => typeof item !== "string"))) throw new AppError("IMAGE_REFERENCE_UNVERIFIED", "原账单图片结构无法安全保留");
+      const images = [...new Set([...(input.mode === "append" ? (raw.images as string[] | null ?? []) : []), ...keys])];
+      if (images.length > 6) throw new AppError("IMAGE_LIMIT_EXCEEDED", "当前附件编辑最多保留 6 张图片，不会自动删图");
+      if (JSON.stringify(images) === JSON.stringify(raw.images ?? [])) return publicBill(raw);
+      const next: Record<string,unknown> = { ...raw, images, status: 2, updatetime: Math.floor(this.now()/1000) };
+      for (const field of DISPLAY_FIELDS) delete next[field];
+      return this.withBusinessWrite(account, tagIdsFrom(raw), async mark => {
+        await this.acceptSyncBillResult(account, await this.client.syncBills(account, { bills: { changelist: [next] } }), [row.id], mark);
+        await this.confirmWrite(() => this.syncUnlocked(account));
+        const confirmed = await this.store.getBill(account.id, row.id);
+        if (!confirmed) throw writeConfirmationFailed("附件关联后账单未查到");
+        const after = cachedBillObject(confirmed);
+        const stable = (bill: Record<string, unknown>) => {
+          const { imageUrls: _images, updateTime: _time, ...fields } = publicBill(bill);
+          return billFingerprint(fields);
+        };
+        if (JSON.stringify(after.images ?? []) !== JSON.stringify(images) || stable(raw) !== stable(after)) throw writeConfirmationFailed("附件或原账单字段未核验通过，请查询原请求及账单");
+        return publicBill(after);
+      });
+    });
+  }
+
+  async runOperation(accountId: number, requestId: string | undefined, tool: string, args: Record<string, unknown>,
+    expected: ExpectedBill[] | undefined, action: () => Promise<CallToolResult | InputRequiredResult>) {
+    if (!this.operations) {
+      if (requestId || expected) throw new AppError("OPERATIONS_NOT_CONFIGURED", "请求防重需先配置 QIANJI_MCP_OPERATIONS_ROOT");
+      return action();
+    }
+    if (!requestId) throw new AppError("REQUEST_ID_REQUIRED", "已启用持久防重，请为本次业务提供稳定 requestId");
+    const account = await this.store.requireAccount(accountId);
+    return this.operations.execute(account.uid, requestId, tool, { args, expected: expected ?? [] }, async () => {
+      const required = new Set<string>();
+      const visit = (value: unknown) => {
+        if (Array.isArray(value)) { value.forEach(visit); return; }
+        if (!value || typeof value !== "object") return;
+        for (const [key, child] of Object.entries(value)) {
+          if (["billId", "sourceBillId", "refundBillId", "reimbursementBillId"].includes(key) && typeof child === "string") required.add(child);
+          else if (["billIds", "sourceBillIds"].includes(key) && Array.isArray(child)) child.forEach(id => required.add(String(id)));
+          else visit(child);
+        }
+      };
+      visit(args);
+      const hashes = new Map((expected ?? []).map(row => [row.billId, row.hash]));
+      if (hashes.size !== (expected ?? []).length || [...required].some(id => !hashes.has(id))) {
+        throw new AppError("EXPECTED_BILLS_REQUIRED", "修改及关联源账单必须提供 get_bills 返回的完整版本指纹");
+      }
+      if (hashes.size) {
+        const snapshot = await this.getBills(accountId, [...hashes.keys()], true);
+        if (snapshot.results.some(row => row.bill === null || row.fingerprint !== hashes.get(row.billId))) {
+          throw new AppError("BILL_VERSION_CONFLICT", "账单已变化或无法读取，请重新核对后制定新请求");
+        }
+      }
+    }, action);
+  }
+
+  /** Only a completed explicit rejection can be closed, never timeout, partial success or pending. */
+  async verifyRejectedBillOperation(accountId: number, requestId: string, tool: string, args: Record<string,unknown>, expected: ExpectedBill[]) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "尚未配置持久回执");
+    const account=await this.store.requireAccount(accountId);
+    const payload={args,expected};
+    await this.operations.assertExplicitRejection(account.uid,requestId,tool,payload);
+    if (!expected.length || new Set(expected.map(row=>row.billId)).size!==expected.length) throw new AppError("EXPECTED_BILLS_REQUIRED","需要原请求全部账单版本指纹");
+    const current=await this.getBills(accountId,expected.map(row=>row.billId),true);
+    if (current.results.some(row=>row.bill===null || row.fingerprint!==expected.find(item=>item.billId===row.billId)?.hash)) throw new AppError("BILL_VERSION_CONFLICT","原账单已变化，不能确认未执行");
+    await this.operations.confirmExplicitRejection(account.uid,requestId,tool,payload);
+    return {operation:await this.operations.status(account.uid,requestId),verifiedUnchangedBillIds:expected.map(row=>row.billId)};
+  }
+
+  async verifyFutureRepeatCreation(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],taskId:string) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedRepeatCreation(account.uid,requestId,{args,expected});
+      const input=args as unknown as RepeatTaskInput;
+      if(input.startDate<=localDate(this.now()/1000)) throw new AppError("REPEAT_REVIEW_UNSUPPORTED","只复核尚未到起始自然日的周期创建");
+      const data:Record<string,unknown>={start:input.startDate,end:null,time:input.timeOfDay,repeat:repeatSchedule(input.schedule),bookid:input.bookId,fromid:input.fromAssetId,
+        ...(input.targetAssetId?{targetid:input.targetAssetId}:{}),...(input.categoryId?{cateid:input.categoryId}:{}),money:storedBillMoney(input.money,billAdjustment(input.money,input.fee??0,0)),fee:input.fee??0,remark:input.remark,tags:[],images:[]};
+      const comparable=(task:Record<string,unknown>)=>{const {id:_id,count:_count,...rest}=publicRepeatTask(task);return billFingerprint(rest);};
+      const wanted=comparable({id:taskId,type:input.type,status:1,count:0,data});
+      const matches=(await this.loadRepeatTasks(account)).filter(task=>publicUserId(task.userid)===account.uid && Number(task.count)===0 && Number(task.createtime)>=original.updatedAt-60 && Number(task.createtime)<=original.updatedAt+5 && comparable(task)===wanted);
+      if(matches.length!==1 || String(matches[0]!.id)!==taskId) throw new AppError("REPEAT_REVIEW_MISMATCH","未唯一匹配原请求时间窗内的未执行周期设置");
+      const task=matches[0]!;
+      await this.syncUnlocked(account);
+      const rows=await this.store.listBills(account.id,{limit:BILL_SCAN_LIMIT});
+      if(Number(task.packid)<=0 || rows.some(row=>[cachedBillObject(row).packid,cachedBillObject(row).importpackid].some(value=>String(value)===String(task.packid)))) throw new AppError("REPEAT_REVIEW_UNSUPPORTED","任务关联不明确或已经生成账单，不能仅凭设置解除门禁");
+      const verified={...publicRepeatTask(task),version:billFingerprint(task),generatedBillIds:[]};
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified);
+      return {operation:await this.operations!.status(account.uid,requestId),task:verified};
+    });
   }
 
   /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储。 */
@@ -304,7 +508,18 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额。 */
+  /** 返回当前账号时区；设置只影响本服务的自然日口径。 */
+  async getTimeZone(accountId: number) {
+    return this.withAccount(accountId, async () => ({ timeZone: timeZone() }));
+  }
+  async setTimeZone(accountId: number, zone: string) {
+    return this.withAccount(accountId, async () => {
+      const validated = validateTimeZone(zone);
+      await this.store.setTimeZone(accountId, validated);
+      return { timeZone: validated };
+    });
+  }
+
   async getUserInfo(accountId: number): Promise<Record<string, unknown>> {
     return this.withAccount(accountId, async (account) =>
       publicUser(await this.loadUserWithCurrencyConfig(account), this.store, account.id, this.now()),
@@ -326,7 +541,100 @@ export class MoneyTrackService {
   /** 直接查询完整周期任务设置，不从历史账单猜测当前是否启用。 */
   async listRepeatTasks(accountId: number): Promise<Record<string, unknown>[]> {
     return this.withAccount(accountId, async (account) =>
-      (await this.loadRepeatTasks(account)).map(publicRepeatTask));
+      (await this.loadRepeatTasks(account)).map(task => ({...publicRepeatTask(task), version: billFingerprint(task)})));
+  }
+
+  async createRepeatTask(accountId: number, input: RepeatTaskInput) {
+    const adjustment = billAdjustment(input.money, input.fee ?? 0, 0);
+    return this.withBillAccount(accountId, async account => {
+      if (!validDate(input.startDate) || input.startDate <= localDate(this.now() / 1000)) throw new AppError("INVALID_REPEAT_START", "新任务必须从当前账号时区的未来日期开始");
+      const data: Record<string, unknown> = {start: input.startDate, end: {date: null, count: null}, time: input.timeOfDay,
+        repeat: repeatSchedule(input.schedule), bookid: normalizeBookId(input.bookId), fromid: normalizeRequiredAssetId(input.fromAssetId),
+        ...(input.targetAssetId ? {targetid: normalizeRequiredAssetId(input.targetAssetId)} : {}),
+        ...(input.categoryId ? {cateid: normalizeCategoryId(input.categoryId)} : {}),
+        money: storedBillMoney(input.money, adjustment), fee: adjustment, remark: input.remark, billflag: 0, tags: [], images: [],
+      };
+      await this.validateRepeatData(account, input.type, data);
+      const before = await this.scheduleSnapshot(account);
+      const task = await this.client.submitRepeatTask(account, {type: input.type, count: 0, status: 0, createtime: 0, updatetime: 0, packid: 0, data});
+      return this.confirmRepeatChange(account, task.id as string, input.type, data, before);
+    });
+  }
+
+  async updateRepeatTask(accountId: number, taskId: string, expectedVersion: string, patch: RepeatTaskPatch) {
+    return this.withBillAccount(accountId, async account => {
+      const old = (await this.loadRepeatTasks(account)).find(task => task.id === normalizeBillId(taskId));
+      if (!old) throw new AppError("REPEAT_TASK_NOT_FOUND", "周期任务不存在", 404);
+      if (billFingerprint(old) !== expectedVersion) throw new AppError("REPEAT_VERSION_CONFLICT", "周期任务已变化，请重新查询");
+      if (![0, 1].includes(Number(old.status)) || ![0, 1, 2, 3, 5].includes(Number(old.type))) throw new AppError("REPEAT_TYPE_UNSUPPORTED", "当前任务状态或类型不支持修改");
+      if (!Object.keys(patch).length) throw new AppError("INVALID_REPEAT_PATCH", "修改内容不能为空");
+      const data = {...old.data as Record<string, unknown>};
+      data.time = publicRepeatTask(old).timeOfDay;
+      const money = patch.money ?? Number(publicRepeatTask(old).money);
+      const fee = patch.fee ?? Number(data.fee ?? 0);
+      data.money = storedBillMoney(money, billAdjustment(money, fee, 0)); data.fee = fee;
+      if (patch.remark !== undefined) data.remark = patch.remark;
+      if (patch.timeOfDay !== undefined) data.time = patch.timeOfDay;
+      if (patch.schedule !== undefined) data.repeat = repeatSchedule(patch.schedule);
+      await this.validateRepeatData(account, Number(old.type), data);
+      const before = await this.scheduleSnapshot(account);
+      await this.client.submitRepeatTask(account, {...old, data, updatetime: Math.floor(this.now()/1000)});
+      return this.confirmRepeatChange(account, taskId, Number(old.type), data, before, old);
+    });
+  }
+
+  private async validateRepeatData(account: QianjiAccount, type: number, data: Record<string, unknown>) {
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(data.time))) throw new AppError("INVALID_REPEAT_TIME", "周期时间必须为 HH:mm");
+    requirePositiveMoney(inputBillMoney(data.money, Number(data.fee ?? 0)), "周期金额");
+    const book = String(data.bookid), from = String(data.fromid), tags = Array.isArray(data.tags) ? data.tags.map(String) : [];
+    if ([2, 3].includes(type)) {
+      const refs = await this.validateTransferReferences(account, book, from, String(data.targetid), tags, type === 3);
+      if (await this.resolvedAssetCurrency(account, refs.from) !== "CNY" || await this.resolvedAssetCurrency(account, refs.target) !== "CNY") throw new AppError("REPEAT_CURRENCY_UNSUPPORTED", "新周期编辑当前仅支持 CNY");
+    } else {
+      if (Number(data.fee ?? 0) !== 0) throw new AppError("REPEAT_FEE_UNSUPPORTED", "普通收支周期暂不支持手续费或优惠");
+      await this.validateWriteReferences(account, book, type === 1 ? 1 : 0, String(data.cateid), from, tags);
+      if (await this.assetCurrency(account, from) !== "CNY") throw new AppError("REPEAT_CURRENCY_UNSUPPORTED", "新周期编辑当前仅支持 CNY");
+    }
+  }
+
+  private async scheduleSnapshot(account: QianjiAccount) {
+    await this.syncUnlocked(account);
+    return {bills: await this.store.listBills(account.id, {limit: BILL_SCAN_LIMIT}), assets: await this.client.listAssets(account, true)};
+  }
+
+  private async confirmRepeatChange(account: QianjiAccount, id: string, type: number, data: Record<string, unknown>, before: Awaited<ReturnType<MoneyTrackService["scheduleSnapshot"]>>, old?: Record<string, unknown>): Promise<Record<string, unknown> & {version: string; generatedBillIds: string[]}> {
+    const task = (await this.loadRepeatTasks(account)).find(task => task.id === id);
+    if (!task) throw writeConfirmationFailed("周期写入后未查到任务");
+    const comparable = (task: Record<string, unknown>) => {const {count: _count, ...rest} = publicRepeatTask(task); return billFingerprint(rest);};
+    if (comparable(task) !== comparable({id, type, status: old?.status ?? task.status, data}) || (old && String(old.packid) !== String(task.packid))) throw writeConfirmationFailed("周期字段或历史关联编号不一致");
+    await this.syncUnlocked(account);
+    const afterBills = await this.store.listBills(account.id, {limit: BILL_SCAN_LIMIT});
+    const map = new Map(afterBills.map(row => [row.id, row]));
+    for (const row of before.bills) {
+      if (!map.has(row.id) || billFingerprint(publicBill(cachedBillObject(row))) !== billFingerprint(publicBill(cachedBillObject(map.get(row.id)!)))) throw writeConfirmationFailed("周期操作期间历史账单发生变化，请核对");
+    }
+    const beforeIds = new Set(before.bills.map(row => row.id));
+    const created = afterBills.filter(row => !beforeIds.has(row.id)).map(cachedBillObject);
+    const relevant = new Set([String(data.fromid), String(data.targetid ?? "-1")]);
+    const delta = new Map<string, number>();
+    for (const bill of created) {
+      if (![bill.assetid, bill.fromid, bill.targetid].some(value => relevant.has(String(value)))) continue;
+      if (!task.packid || Number(task.packid) <= 0 || ![bill.packid, bill.importpackid].some(value => String(value) === String(task.packid)) || Number(bill.type) !== type || Number(bill.money) !== Number(data.money)) throw writeConfirmationFailed("出现无法归属或金额不符的新周期账单");
+      const add = (asset: unknown, amount: number) => delta.set(String(asset), decimalAdd(delta.get(String(asset)) ?? 0, amount));
+      if ([2,3].includes(type)) {
+        const fee = Number(billExtra(bill).transfee ?? 0);
+        if (fee !== Number(data.fee ?? 0)) throw writeConfirmationFailed("新周期账单费用不符");
+        add(bill.fromid, -decimalAdd(Number(bill.money), Math.max(0, fee))); add(bill.targetid, decimalSubtract(Number(bill.money), Math.min(0, fee)));
+      } else add(bill.assetid, type === 1 ? Number(bill.money) : -Number(bill.money));
+    }
+    const afterAssets = await this.client.listAssets(account, true);
+    for (const assetId of relevant) {
+      if (assetId === "-1") continue;
+      const from = before.assets.find(row => String(row.id) === assetId), to = afterAssets.find(row => String(row.id) === assetId);
+      if (!from || !to || Number(to.money) !== decimalAdd(Number(from.money), delta.get(assetId) ?? 0)) throw writeConfirmationFailed("周期操作后账户余额未核验通过");
+    }
+    await this.store.invalidateCatalogCache(account.id, "assets", "");
+    return {...publicRepeatTask(task), version: billFingerprint(task), generatedBillIds: created.filter(bill => Number(task.packid) > 0 && [bill.packid, bill.importpackid].some(value => String(value) === String(task.packid))).map(bill => String(bill.id))};
   }
 
   private async loadRepeatTasks(account: QianjiAccount): Promise<Record<string, unknown>[]> {
@@ -340,10 +648,6 @@ export class MoneyTrackService {
     const fromId = normalizeRequiredAssetId(input.fromAssetId);
     const targetId = normalizeRequiredAssetId(input.targetAssetId);
     const fee = billAdjustment(input.money, input.fee ?? 0, 0);
-    const today = shanghaiDate(this.now());
-    if (input.startDate <= today || Number.isNaN(Date.parse(`${input.startDate}T00:00:00+08:00`))) {
-      throw new AppError("INVALID_REPEAT_START", "新周期任务必须从上海时区的未来日期开始，不回补历史账单");
-    }
     const weekdays = input.weekdays ?? [];
     const repeatType = input.repeatType ?? "week";
     if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.timeOfDay)
@@ -353,6 +657,9 @@ export class MoneyTrackService {
       throw new AppError("INVALID_REPEAT_SCHEDULE", "周期时间应为 HH:mm，星期应为 1 至 7 的非空无重复列表");
     }
     return this.withBillAccount(accountId, async (account) => {
+      if (!validDate(input.startDate) || input.startDate <= localDate(this.now() / 1000)) {
+        throw new AppError("INVALID_REPEAT_START", "新周期任务必须从当前账号时区的未来日期开始，不回补历史账单");
+      }
       const tagIds = input.tagIds ?? [];
       const { from, target } = await this.validateTransferReferences(account, bookId, fromId, targetId, tagIds, false);
       if (await this.resolvedAssetCurrency(account, from) !== await this.resolvedAssetCurrency(account, target)) {
@@ -897,93 +1204,95 @@ export class MoneyTrackService {
 
   /** 增量同步账单后执行筛选，并使用键集游标返回账单摘要。 */
   async listBills(accountId: number, input: ListBillsInput): Promise<ListBillsResult> {
-    return this.withBillAccount(accountId, async (account) => {
-      if (input.cursor && hasExplicitBillFilters(input)) {
-        throw new AppError("INVALID_CURSOR_ARGUMENTS", "使用 cursor 时不能同时传入其他筛选或分页参数");
-      }
-      const advancedCursor = input.cursor?.startsWith("c3_")
-        ? decodeAdvancedCursor(input.cursor, account.id)
-        : undefined;
-      if (advancedCursor) {
-        return this.listBillsAdvanced(account, advancedCursor.filters, advancedCursor.offset, advancedCursor.limit);
-      }
-      if (usesAdvancedBillFilters(input)) {
-        const { cursor: _cursor, limit = 20, ...filters } = input;
-        return this.listBillsAdvanced(account, filters, 0, limit);
-      }
-      const decoded = input.cursor ? decodeCursor(input.cursor, account.id) : undefined;
-      const bookId = decoded
-        ? decoded.bookId
-        : input.allBooks
-          ? undefined
-          : normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
-      if (bookId !== undefined) await this.requireBook(account, bookId);
-      if (await this.store.getSyncState(account.id) === undefined) await this.syncUnlocked(account);
-      const limit = decoded?.limit ?? input.limit ?? 20;
-      const startTime = decoded?.startTime ?? input.startTime;
-      const endTime = decoded?.endTime ?? input.endTime;
-      const createStartTime = decoded?.createStartTime ?? input.createStartTime;
-      const createEndTime = decoded?.createEndTime ?? input.createEndTime;
-      const type = decoded?.type ?? input.type;
-      const categoryId = decoded?.categoryId ?? (
-        input.categoryId === undefined ? undefined : normalizeCategoryId(input.categoryId)
-      );
-      const tagId = decoded?.tagId ?? input.tagId;
-      const remarkKeyword = (decoded?.remarkKeyword ?? input.remarkKeyword)?.trim();
-      const assetId = decoded?.assetId ?? (
-        input.assetId === undefined ? undefined : normalizeAssetId(input.assetId)
-      );
-      const fromAssetId = decoded?.fromAssetId ?? (
-        input.fromAssetId === undefined ? undefined : normalizeAssetId(input.fromAssetId)
-      );
-      const targetAssetId = decoded?.targetAssetId ?? (
-        input.targetAssetId === undefined ? undefined : normalizeAssetId(input.targetAssetId)
-      );
-      const filters: BillFilters = {
-        bookId,
-        startTime,
-        endTime,
-        createStartTime,
-        createEndTime,
-        type,
-        categoryId,
-        tagId,
-        remarkKeyword,
-        assetId,
-        fromAssetId,
-        targetAssetId,
-        limit,
-        cursor: decoded ? { time: decoded.time, id: decoded.id } : undefined,
-      };
-      const rows = await this.store.listBills(account.id, filters);
-      const page = rows.slice(0, limit);
-      const last = page.at(-1);
-      return {
-        bills: page.map(billSummary),
-        nextCursor:
-          rows.length > limit && last
-            ? encodeCursor({
-                v: 2,
-                accountId: account.id,
-                time: last.time,
-                id: last.id,
-                bookId,
-                startTime,
-                endTime,
-                createStartTime,
-                createEndTime,
-                type,
-                categoryId,
-                tagId,
-                remarkKeyword,
-                assetId,
-                fromAssetId,
-                targetAssetId,
-                limit,
-              })
-            : null,
-      };
-    });
+    return this.withBillAccount(accountId, account => this.listBillsUnlocked(account, input));
+  }
+
+  private async listBillsUnlocked(account: QianjiAccount, input: ListBillsInput): Promise<ListBillsResult> {
+    if (input.cursor && hasExplicitBillFilters(input)) {
+      throw new AppError("INVALID_CURSOR_ARGUMENTS", "使用 cursor 时不能同时传入其他筛选或分页参数");
+    }
+    const advancedCursor = input.cursor?.startsWith("c3_")
+      ? decodeAdvancedCursor(input.cursor, account.id)
+      : undefined;
+    if (advancedCursor) {
+      return this.listBillsAdvanced(account, advancedCursor.filters, advancedCursor.offset, advancedCursor.limit);
+    }
+    if (usesAdvancedBillFilters(input)) {
+      const { cursor: _cursor, limit = 20, ...filters } = input;
+      return this.listBillsAdvanced(account, filters, 0, limit);
+    }
+    const decoded = input.cursor ? decodeCursor(input.cursor, account.id) : undefined;
+    const bookId = decoded
+      ? decoded.bookId
+      : input.allBooks
+        ? undefined
+        : normalizeBookId(input.bookId ?? GLOBAL_SYNC_BOOK_ID);
+    if (bookId !== undefined) await this.requireBook(account, bookId);
+    if (await this.store.getSyncState(account.id) === undefined) await this.syncUnlocked(account);
+    const limit = decoded?.limit ?? input.limit ?? 20;
+    const startTime = decoded?.startTime ?? input.startTime;
+    const endTime = decoded?.endTime ?? input.endTime;
+    const createStartTime = decoded?.createStartTime ?? input.createStartTime;
+    const createEndTime = decoded?.createEndTime ?? input.createEndTime;
+    const type = decoded?.type ?? input.type;
+    const categoryId = decoded?.categoryId ?? (
+      input.categoryId === undefined ? undefined : normalizeCategoryId(input.categoryId)
+    );
+    const tagId = decoded?.tagId ?? input.tagId;
+    const remarkKeyword = (decoded?.remarkKeyword ?? input.remarkKeyword)?.trim();
+    const assetId = decoded?.assetId ?? (
+      input.assetId === undefined ? undefined : normalizeAssetId(input.assetId)
+    );
+    const fromAssetId = decoded?.fromAssetId ?? (
+      input.fromAssetId === undefined ? undefined : normalizeAssetId(input.fromAssetId)
+    );
+    const targetAssetId = decoded?.targetAssetId ?? (
+      input.targetAssetId === undefined ? undefined : normalizeAssetId(input.targetAssetId)
+    );
+    const filters: BillFilters = {
+      bookId,
+      startTime,
+      endTime,
+      createStartTime,
+      createEndTime,
+      type,
+      categoryId,
+      tagId,
+      remarkKeyword,
+      assetId,
+      fromAssetId,
+      targetAssetId,
+      limit,
+      cursor: decoded ? { time: decoded.time, id: decoded.id } : undefined,
+    };
+    const rows = await this.store.listBills(account.id, filters);
+    const page = rows.slice(0, limit);
+    const last = page.at(-1);
+    return {
+      bills: page.map(billSummary),
+      nextCursor:
+        rows.length > limit && last
+          ? encodeCursor({
+              v: 2,
+              accountId: account.id,
+              time: last.time,
+              id: last.id,
+              bookId,
+              startTime,
+              endTime,
+              createStartTime,
+              createEndTime,
+              type,
+              categoryId,
+              tagId,
+              remarkKeyword,
+              assetId,
+              fromAssetId,
+              targetAssetId,
+              limit,
+            })
+          : null,
+    };
   }
 
   /** 对 APK 完整本地搜索条件执行一次统一筛选，默认简单查询仍走存储层键集分页。 */
@@ -1072,7 +1381,8 @@ export class MoneyTrackService {
       const results = [];
       for (const billId of ids) {
         const row = await this.store.getBill(account.id, billId);
-        results.push({ billId, bill: row ? publicBill(cachedBillObject(row)) : null });
+        const bill = row ? publicBill(cachedBillObject(row)) : null;
+        results.push({ billId, bill, fingerprint: bill === null ? null : billFingerprint(bill) });
       }
       return {
         results,
@@ -2624,7 +2934,7 @@ export class MoneyTrackService {
     return operation(() => {});
   }
 
-  /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果。 */
+  /** 在唯一入口处刷新部分成功后的本地状态并返回逐项结果。 */
   private async acceptSyncBillResult(
     account: QianjiAccount,
     result: SyncBillResult,
@@ -2727,7 +3037,10 @@ export class MoneyTrackService {
     operation: (account: QianjiAccount) => Promise<T>,
   ): Promise<T> {
     // ponytail: 进程内账号锁符合单实例约束，支持多副本前改用数据库级锁。
-    return this.withLock(`account:${accountId}`, async () => operation(await this.store.requireAccount(accountId)));
+    return this.withLock(`account:${accountId}`, async () => {
+      const account = await this.store.requireAccount(accountId);
+      return inTimeZone(account.timeZone, () => operation(account));
+    });
   }
 
   /** 使用 Promise 尾链串行执行同一键的任务，并在队列耗尽后释放锁记录。 */
@@ -3388,9 +3701,6 @@ function statisticsRange(
   rows: Array<{ bookid: string; time: number }>,
   nowMs: number,
 ): { startTime: number; endTime: number; unit: StatisticsUnit } {
-  const offset = 8 * 60 * 60;
-  const localSecond = (year: number, month: number, day: number): number =>
-    Math.floor(Date.UTC(year, month - 1, day) / 1000) - offset;
   if (input.range.kind === "custom") {
     if (input.range.startTime > input.range.endTime) throw new AppError("INVALID_TIME_RANGE", "startTime 不能晚于 endTime");
     const days = (input.range.endTime + 1 - input.range.startTime) / 86_400;
@@ -3459,10 +3769,10 @@ function resolveBudgetPeriod(
   const startDay = budgetStartDay(range);
   let filter = input;
   if (!filter) {
-    const local = new Date(nowMs + 28_800_000);
-    let year = local.getUTCFullYear();
-    let month = local.getUTCMonth() + 1;
-    if (Math.floor(nowMs / 1000) < shanghaiSecond(year, month, startDay)) {
+    const local = localTime(nowMs / 1000);
+    let year = local.year;
+    let month = local.month;
+    if (Math.floor(nowMs / 1000) < localSecond(year, month, startDay)) {
       const previous = new Date(Date.UTC(year, month - 2, 1));
       year = previous.getUTCFullYear();
       month = previous.getUTCMonth() + 1;
@@ -3476,18 +3786,18 @@ function resolveBudgetPeriod(
     if (!Number.isInteger(filter.month) || filter.month < 1 || filter.month > 12) {
       throw new AppError("INVALID_BUDGET_PERIOD", "预算月份必须是 1 到 12 之间的整数");
     }
-    const startTime = shanghaiSecond(filter.year, filter.month, startDay);
+    const startTime = localSecond(filter.year, filter.month, startDay);
     return {
       filter,
       startTime,
-      endTime: shanghaiSecond(filter.year, filter.month + 1, startDay) - 1,
+      endTime: localSecond(filter.year, filter.month + 1, startDay) - 1,
     };
   }
   if (filter.kind !== "year") throw new AppError("INVALID_BUDGET_PERIOD", "预算期间只支持月份或年份");
   return {
     filter,
-    startTime: shanghaiSecond(filter.year, 1, 1),
-    endTime: shanghaiSecond(filter.year + 1, 1, 1) - 1,
+    startTime: localSecond(filter.year, 1, 1),
+    endTime: localSecond(filter.year + 1, 1, 1) - 1,
   };
 }
 
@@ -3500,11 +3810,6 @@ function budgetStartDay(range: string | undefined): number {
   return day;
 }
 
-function shanghaiSecond(year: number, month: number, day: number): number {
-  const time = Date.UTC(year, month - 1, day) / 1000 - 28_800;
-  if (!Number.isFinite(time)) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹账本月份范围无效", 502);
-  return Math.floor(time);
-}
 
 function calculateBudget(options: {
   budgets: Record<string, unknown>[];
@@ -3567,7 +3872,8 @@ function calculateBudget(options: {
     ...options.period.filter,
     startTime: options.period.startTime,
     endTime: options.period.endTime,
-    timezoneOffsetSeconds: 28_800,
+    timeZone: timeZone(),
+    timezoneOffsetSeconds: offsetSeconds(options.period.startTime),
   };
   if (!configured) {
     return {
@@ -3606,7 +3912,7 @@ function calculateBudget(options: {
     }
     const included = spendingScope === "allExpenses" || (categoryRoot !== undefined && selectedRoots.has(categoryRoot));
     if (included && amounts.spend > 0) {
-      const day = Math.floor((row.time + 28_800) / 86_400) * 86_400 - 28_800;
+      const day = startOfDay(row.time);
       dailySpend.set(day, decimalAdd(dailySpend.get(day) ?? 0, amounts.spend));
     }
   }
@@ -3623,10 +3929,10 @@ function calculateBudget(options: {
   const limit = Math.max(fullLimit, totalCategoryLimit);
   const used = spendingScope === "allExpenses" ? allSpend : categorySpend;
   const remaining = decimalSubtract(limit, used);
-  const totalDays = (options.period.endTime + 1 - options.period.startTime) / 86_400;
+  const totalDays = calendarDays(options.period.startTime, options.period.endTime + 1);
   const now = Math.floor(options.nowMs / 1000);
   const remainingDays = options.period.filter.kind === "month" && now >= options.period.startTime && now <= options.period.endTime
-    ? Math.floor((options.period.endTime - now) / 86_400) + 1
+    ? calendarDays(startOfDay(now), options.period.endTime + 1)
     : 0;
   const summary: Record<string, unknown> = {
     spendingScope,
@@ -3707,12 +4013,11 @@ function publicBudgetDays(
 ): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
   let cumulativeSpend = 0;
-  for (let time = period.startTime; time <= period.endTime; time += 86_400) {
+  for (let time = period.startTime; time <= period.endTime; time = nextDay(time)) {
     const spend = spending.get(time) ?? 0;
     cumulativeSpend = decimalAdd(cumulativeSpend, spend);
-    const date = new Date((time + 28_800) * 1000);
     result.push({
-      date: `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`,
+      date: localDate(time),
       spend,
       cumulativeSpend,
       remaining: decimalSubtract(limit, cumulativeSpend),
@@ -3753,22 +4058,6 @@ function isVip(user: Record<string, unknown>, nowMs: number): boolean {
   const start = Number(user.vipstart ?? 0);
   const end = Number(user.vipend ?? 0);
   return type >= 1 && now >= start && now < end;
-}
-
-/** 将时间戳转换为上海时区的自然日字符串。 */
-function shanghaiDate(epochMs: number): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(epochMs);
-}
-
-/** 计算指定上海自然日下一次午夜的 Unix 秒。 */
-function nextShanghaiMidnight(date: string): number {
-  const [year, month, day] = date.split("-").map(Number);
-  return Math.floor((Date.UTC(year!, month! - 1, day! + 1) - 8 * 60 * 60 * 1000) / 1000);
 }
 
 /** 构造远端已写入但本地无法确认时的可恢复错误。 */

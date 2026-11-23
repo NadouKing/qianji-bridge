@@ -8,11 +8,15 @@
 
 #### 查询
 
+- 导出账单摘要使用 `export_bills`，检查 complete 和 nextCursor，截断不能称为完整导出，返回内容只保存到仓库外私人目录
+
 - 用户信息、账户本位币、VIP 状态：使用 `get_user_info`
 - 账本：使用 `list_books`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围
+- 单个账本、资产或标签组的最新字段和版本：使用 `get_catalog_object`，可查询空标签组，修改时使用其 version
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，默认不返回余额和信用额度，只有用户明确要求查看余额或额度时才设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，`list_assets` 可能包含 type 5 债务记录基础资产条目，但不能替代详细信息，不要自行聚合两类响应
 - 周期记账设置：使用 `list_repeat_tasks` 查询实际任务，任务模板不代表实际扣款或投资已经发生
+- 新周期类型使用 `create_repeat_task`，任务修改使用 `update_repeat_task` 并传最新 version，当前只支持 CNY，核验本次可能提前生成的账单不代表未来调度已验证
 - 分类：使用 `list_categories`
 - 分类图标：使用 `list_category_icons`
 - 删除分类的影响评估：使用 `check_category_deletion` 取得受影响账单数量
@@ -32,6 +36,11 @@
   - 服务仅返回地址，不下载图片或执行 OCR，客户端没有图像读取能力时应说明限制
 
 #### 创建或修改
+
+- 账本、资产基础资料和标签组名称：使用 `manage_catalog_object` 的明确 command，修改前读取最新对象版本，资产修改保留余额及信用设置，显示状态与其他字段分开修改，当前创建资产支持 CNY 现金和信用账户
+
+- 附件：先用 `upload_bill_image` 上传并取得内容核验通过的回执，再用 `set_bill_images` 按上传请求号关联，append 保留旧图，replace 完整替换，必须明确用户希望替换时才使用 replace
+- 上传返回存储证明不等于 CDN 内容已核验，只有 pixelsVerified=true 的本账号上传回执可关联，失败时查询原请求，不重传图片或猜测对象键
 
 需要账本、资产、分类或标签 ID 且当前缺少可信 ID 时，只调用对应的 `list_books`、`list_assets`、`list_categories` 或 `list_tags` 获取，不得猜测或构造 ID。
 
@@ -73,6 +82,12 @@
 
 ### 异常恢复
 
+启用私人操作回执目录后，业务写入必须带稳定 `requestId`；修改和关联源账单须提供 `get_bills` 返回的 `fingerprint` 作为 `expectedBills`。同一业务始终使用原请求号，相同请求返回原回执，异内容复用被拒绝。旧客户端未启用此配置时保持原行为，不具有持久请求防重。
+
+- `get_operation_status` 只读查询原请求回执，不重发写入，`confirmed` 表示原调用已核验，`pending` 或 `uncertain` 表示正在执行或结果待核实
+- `notFound` 不证明原调用已经停止，也不是换号重发的依据；结果未知时保留整个私人回执目录，先核查实际账目，不删除记录解锁
+- 操作记录只协调共用私人目录的单机服务进程，不能阻止官方 App 或其他设备同时修改，不是服务器事务
+
 入参未通过工具 Schema 校验时，返回包含 `Input validation error` 的错误。工具执行失败返回 `isError=true`，正文为 JSON `{error: {code, message}}`。按实际错误码及消息定位原因，写入结果未知时先核对实际状态，不因错误提示直接重试写入。
 
 - PAT 未绑定钱迹账号或钱迹登录状态失效时：
@@ -89,7 +104,7 @@
 - 账单、账本、分类和资产 ID 使用 Java `long` 正数范围内的十进制字符串，`"-1"` 和 `"0"` 只能在具体字段明确允许时使用
 - 标签和成员 ID 使用对应查询返回的原始字符串，不得按数值 ID 猜测或改写
 - 金额使用币种主单位，不使用分、美分等最小货币单位
-- 时间戳字段使用 Unix 秒，不使用毫秒或 ISO 日期字符串，统计和预算的日期口径固定为 UTC+08:00，周期任务的 `timeOfDay` 单独使用 `HH:mm`
+- 时间戳字段使用 Unix 秒，不使用毫秒或 ISO 日期字符串，统计和预算按 `get_time_zone` 查询的账号时区解释，默认 Asia/Shanghai，`set_time_zone` 只修改本服务的日期口径，不移动历史时间戳或重排已有周期任务，周期任务的 `timeOfDay` 单独使用 `HH:mm`
 - `money`、`fee` 和 `discount` 的业务含义以工具字段说明为准，输入结构约束以 Schema 为准
 - 服务端自动换算时，汇率按 HALF_UP 保留 10 位，换算金额按 HALF_EVEN 保留 2 位
 - 跨币种账单使用 `get_user_info.baseCurrency` 解释本位币，读取历史账单时使用 `currencyConversion` 的保存值，不用当前汇率重算
@@ -101,3 +116,18 @@
 `rebuild_reimbursement` 仅在明确允许新编号后逐条执行，保护原支出、到账日期、备注、分类和图片，执行前保存私人回执。借贷起始记录必须使用 `recover_debt_wallet`，即使账单已经指向新钱包，也要恢复并核验借贷资产的资金账户、原编号、结清状态和图片，通用关联工具会拒绝此类记录。`restore_bill_category` 恢复有依据的原分类并检查预期当前分类，兼容的普通支出请求方式须单独获准，最终回读可能保留原利息类型。
 
 `restore_asset_balance` 仅用于有依据且明确授权的余额恢复，带 expectedBalance 防止覆盖后续变动，不生成抵扣账单，不用它掩盖未解释差额。`discard_unused_wallet` 只清理本次恢复产生、明确授权且无账单关联的临时钱包，须核实预期余额。写后刷新核对原字段和全部受影响余额，部分失败先查私人回执与实际状态，禁止重放整批。`refresh_cache.fullBillSync` 仅重建本地账单缓存，不修改云端账单。
+
+### 原生借贷与分期
+
+- `get_debt_details` 查询原生借贷详情和版本，`manage_debt` 处理明确 CNY 资金账户的借入、借出、追加本金、归还本金、独立利息和零本金结清，必须启用持久回执并核实双方余额
+- `list_installments` 读取分期设置，`manage_installment` 创建未来自然日起始的独立 CNY 信用分期、修改统计开关或删除未执行设置，本金和总手续费须分别明确，余数和费用分配不可猜测，未来自动执行需届时复核
+- `delete_unused_repeat_task` 仅删除尚未生成账单的自有周期设置，已有历史账单的任务使用停用工具，不自动清理历史
+
+- `verify_rejected_bill_operation` 仅复核已经返回 WRITE_FAILED 的附件、普通账单或转账修改，需原参数和原账单指纹，刷新确认未变才记录未执行并保留原失败回执，原号永不重发，不适用于超时、部分成功或仍执行中的请求
+
+- `verify_future_repeat_creation` 仅回读核验创建接口已返回的未来周期，必须提供原参数和实际任务 ID，唯一匹配且未生成账单才记录 reviewed，保留原失败回执并禁止重发原创建，不适用于超时、模糊匹配、已开始任务或周期编辑失败
+
+- `verify_debt_creation` 仅复核接口已返回但回读未确认的新借贷，匹配原参数、创建时间窗及唯一的起始本金账单，资金余额必须由写前余额及请求本金独立核对，不能直接照抄当前余额，记录 reviewed 并保留原失败回执，不适用于超时、追加、还款、结清或删除失败
+- `manage_debt` 的 deleteSettled 永久删除已结清本金循环及明确列出的全部本金账单，需逐笔 expectedBills 指纹，仅限无利息、无附件、各资金账户本金净流动为零的记录，服务端删除会退回还款金额但不退回借入/借出本金，返回 cashBalanceEffects 必须核对，不自动改余额，不能用于任意借贷清理
+
+- `verify_debt_deletion` 只读复核已结束的本金循环删除，必须提供原参数、原指纹及独立核对的全部资金余额，核实借贷和本金账单均消失后记录 reviewed，保留原失败回执，不改余额、不重发删除，不处理超时
