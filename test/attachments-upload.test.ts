@@ -5,6 +5,7 @@ import { join } from "node:path";
 import sharp from "sharp";
 import { decodeImageBase64, imageIdentity, imageEtag, imageUploadHost, uploadImage } from "../src/attachments.ts";
 import { OperationJournal } from "../src/operation-journal.ts";
+import { noteRemoteWrite } from "../src/write-context.ts";
 import { Store } from "../src/data-store.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
 import { QianjiClient, parseQianjiJson } from "../src/qianji-client.ts";
@@ -64,13 +65,14 @@ test("attachment append preserves old images and all bill fields, replacement cl
   const now = Date.now();
   store.setUserCache(account.id, {id: account.uid, viptype: -1, __baseCurrency: "CNY"}, now);
   store.setCatalogCache(account.id, "books", "", [{bookid: "1", name: "fixture", visible: 1, userid: "uid"}], now);
-  let row: Record<string, unknown> = { id: "170000000000000001", bookid: "1", userid: "uid", type: 0, money: 3, time: 1700000000, createtime: 1700000000, updatetime: 1700000000, cateid: "2", assetid: "3", remark: "preserve", images: ["old-image"], extra: {flag: 3} };
+  let row: Record<string, unknown> = { id: "170000000000000001", bookid: "1", userid: "uid", type: 0, status:0, category:{name:"display"}, fromact:"display", money: 3, time: 1700000000, createtime: 1700000000, updatetime: 1700000000, cateid: "2", assetid: "3", remark: "preserve", images: ["old-image"], extra: {flag: 3} };
   let writes = 0;
   const client = new QianjiClient({fetch: async (url, init) => {
     if (new URL(String(url)).pathname === "/bill/syncall") {
       writes++;
       const payload = parseQianjiJson(new URLSearchParams(String(init!.body)).get("v")!) as {bills: {changelist: Record<string, unknown>[]}};
       row = payload.bills.changelist[0]!;
+      assert.equal(row.status,2);assert.equal(row.category,undefined);assert.equal(row.fromact,undefined);
       return Response.json({ec: 200, data: {sync_result: {bill: {new_ids: [], update_ids: ["170000000000000001"], del_ids: [], conf_ids: [], has_failed: false}}}});
     }
     assert.equal(new URL(String(url)).pathname, "/syncv2/pull");
@@ -86,4 +88,16 @@ test("attachment append preserves old images and all bill fields, replacement cl
   await assert.rejects(service.setBillImages(account.id, {billId: "170000000000000001", mode: "append", uploadRequestIds: ["foreign"]}), /本账号/);
   const cleared = await service.setBillImages(account.id, {billId: "170000000000000001", mode: "replace", uploadRequestIds: []});
   assert.deepEqual(cleared.imageUrls, []); assert.equal(writes, 2);
+  const originalArguments={billId:"170000000000000001",mode:"replace",uploadRequestIds:[]};
+  const snapshot=await service.getBills(account.id,[originalArguments.billId],true);
+  const expected=[{billId:originalArguments.billId,hash:snapshot.results[0]!.fingerprint!}];
+  const journal=new OperationJournal(root),payload={args:originalArguments,expected};
+  const rejected={isError:true,content:[{type:"text" as const,text:JSON.stringify({error:{code:"WRITE_FAILED",message:"synthetic terminal rejection"}})}]};
+  await journal.execute(account.uid,"rejected","set_bill_images",payload,async()=>{},async()=>{noteRemoteWrite();return rejected;});
+  const originalRemark=row.remark;row.remark="concurrent change";
+  await assert.rejects(service.verifyRejectedBillOperation(account.id,"rejected","set_bill_images",originalArguments,expected),/已变化/);
+  assert.equal((await journal.status(account.uid,"rejected")).state,"uncertain");row.remark=originalRemark;
+  await service.verifyRejectedBillOperation(account.id,"rejected","set_bill_images",originalArguments,expected);
+  assert.equal((await journal.status(account.uid,"rejected")).state,"notExecuted");
+  assert.deepEqual(await journal.execute(account.uid,"rejected","set_bill_images",payload,async()=>{},async()=>{throw new Error("must not redispatch");}),rejected);
 });

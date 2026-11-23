@@ -1,4 +1,4 @@
-import { manageDebt, debtDetails, manageInstallment, publicInstallment, type DebtCommand, type InstallmentCommand } from "./linked-finance.ts";
+import { manageDebt, debtDetails, manageInstallment, publicInstallment, verifyCreatedDebt, verifyDeletedDebt, type DebtCommand, type InstallmentCommand } from "./linked-finance.ts";
 import { inTimeZone, validateTimeZone, timeZone, localTime, localDate, localSecond, startOfDay, nextDay, calendarDays, offsetSeconds } from "./time.ts";
 import { randomUUID } from "node:crypto";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
@@ -270,7 +270,7 @@ export class MoneyTrackService {
   }
 
   private financeContext(account: QianjiAccount) {
-    return {client:this.client,store:this.store,account,sync:()=>this.syncUnlocked(account),now:this.now()};
+    return {client:this.client,store:this.store,account,sync:()=>this.syncUnlocked(account),baseCurrency:async()=>requireBaseCurrency(await this.loadUserWithCurrencyConfig(account)),now:this.now()};
   }
   async getDebtDetails(accountId: number, id: string) {
     return this.withAccount(accountId, account => debtDetails(this.financeContext(account),id));
@@ -278,6 +278,28 @@ export class MoneyTrackService {
   async manageDebt(accountId: number, command: DebtCommand) {
     if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "借贷写入需要持久操作回执");
     return this.withBillAccount(accountId,account=>manageDebt(this.financeContext(account),command));
+  }
+  async verifyDebtCreation(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],debtId:string,expectedCashBalanceAfter:number) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedCreation(account.uid,requestId,"manage_debt",{args,expected});
+      const command=args.command as Extract<DebtCommand,{action:"create"}>;
+      if(!command || command.action!=="create") throw new AppError("DEBT_REVIEW_UNSUPPORTED","仅复核借贷创建，不处理追加、还款、结清或删除");
+      const verified=await verifyCreatedDebt(this.financeContext(account),command,debtId,expectedCashBalanceAfter,original.updatedAt);
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified,"createdDebtMatched");
+      return {operation:await this.operations!.status(account.uid,requestId),...verified};
+    });
+  }
+  async verifyDebtDeletion(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],cashBalances:Array<{assetId:string;balance:number}>) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedCreation(account.uid,requestId,"manage_debt",{args,expected});
+      const command=args.command as Extract<DebtCommand,{action:"deleteSettled"}>;
+      if(!command || command.action!=="deleteSettled") throw new AppError("DEBT_REVIEW_UNSUPPORTED","仅复核已结束的本金循环删除，不处理其他操作");
+      const verified=await verifyDeletedDebt(this.financeContext(account),command,cashBalances);
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified,"deletedDebtMatched");
+      return {operation:await this.operations!.status(account.uid,requestId),...verified};
+    });
   }
   async listInstallments(accountId: number) {
     return this.withAccount(accountId,async account=>(await this.client.listInstallments(account)).map(publicInstallment));
@@ -304,11 +326,11 @@ export class MoneyTrackService {
   }
 
   async getCatalogObject(accountId: number, kind: CatalogObjectKind, id: string, includeBalances = false) {
-    return this.withAccount(accountId, account => getCatalogObject(this.client, account, kind, id, includeBalances));
+    return this.withAccount(accountId, account => getCatalogObject(this.client, account, kind, id, includeBalances, async () => requireBaseCurrency(await this.loadUserWithCurrencyConfig(account))));
   }
 
   async manageCatalog(accountId: number, command: CatalogCommand) {
-    return this.withBillAccount(accountId, account => manageCatalog(this.client, this.store, account, command, () => this.syncUnlocked(account)));
+    return this.withBillAccount(accountId, account => manageCatalog(this.client, this.store, account, command, () => this.syncUnlocked(account), async () => requireBaseCurrency(await this.loadUserWithCurrencyConfig(account))));
   }
 
   async uploadBillImage(accountId: number, imageBase64: string) {
@@ -342,7 +364,8 @@ export class MoneyTrackService {
       const images = [...new Set([...(input.mode === "append" ? (raw.images as string[] | null ?? []) : []), ...keys])];
       if (images.length > 6) throw new AppError("IMAGE_LIMIT_EXCEEDED", "当前附件编辑最多保留 6 张图片，不会自动删图");
       if (JSON.stringify(images) === JSON.stringify(raw.images ?? [])) return publicBill(raw);
-      const next = { ...raw, images, updatetime: Math.floor(this.now()/1000) };
+      const next: Record<string,unknown> = { ...raw, images, status: 2, updatetime: Math.floor(this.now()/1000) };
+      for (const field of DISPLAY_FIELDS) delete next[field];
       return this.withBusinessWrite(account, tagIdsFrom(raw), async mark => {
         await this.acceptSyncBillResult(account, await this.client.syncBills(account, { bills: { changelist: [next] } }), [row.id], mark);
         await this.confirmWrite(() => this.syncUnlocked(account));
@@ -390,6 +413,41 @@ export class MoneyTrackService {
         }
       }
     }, action);
+  }
+
+  /** Only a completed explicit rejection can be closed, never timeout, partial success or pending. */
+  async verifyRejectedBillOperation(accountId: number, requestId: string, tool: string, args: Record<string,unknown>, expected: ExpectedBill[]) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "尚未配置持久回执");
+    const account=await this.store.requireAccount(accountId);
+    const payload={args,expected};
+    await this.operations.assertExplicitRejection(account.uid,requestId,tool,payload);
+    if (!expected.length || new Set(expected.map(row=>row.billId)).size!==expected.length) throw new AppError("EXPECTED_BILLS_REQUIRED","需要原请求全部账单版本指纹");
+    const current=await this.getBills(accountId,expected.map(row=>row.billId),true);
+    if (current.results.some(row=>row.bill===null || row.fingerprint!==expected.find(item=>item.billId===row.billId)?.hash)) throw new AppError("BILL_VERSION_CONFLICT","原账单已变化，不能确认未执行");
+    await this.operations.confirmExplicitRejection(account.uid,requestId,tool,payload);
+    return {operation:await this.operations.status(account.uid,requestId),verifiedUnchangedBillIds:expected.map(row=>row.billId)};
+  }
+
+  async verifyFutureRepeatCreation(accountId:number,requestId:string,args:Record<string,unknown>,expected:ExpectedBill[],taskId:string) {
+    if(!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED","尚未配置持久回执");
+    return this.withBillAccount(accountId,async account=>{
+      const original=await this.operations!.completedRepeatCreation(account.uid,requestId,{args,expected});
+      const input=args as unknown as RepeatTaskInput;
+      if(input.startDate<=localDate(this.now()/1000)) throw new AppError("REPEAT_REVIEW_UNSUPPORTED","只复核尚未到起始自然日的周期创建");
+      const data:Record<string,unknown>={start:input.startDate,end:null,time:input.timeOfDay,repeat:repeatSchedule(input.schedule),bookid:input.bookId,fromid:input.fromAssetId,
+        ...(input.targetAssetId?{targetid:input.targetAssetId}:{}),...(input.categoryId?{cateid:input.categoryId}:{}),money:storedBillMoney(input.money,billAdjustment(input.money,input.fee??0,0)),fee:input.fee??0,remark:input.remark,tags:[],images:[]};
+      const comparable=(task:Record<string,unknown>)=>{const {id:_id,count:_count,...rest}=publicRepeatTask(task);return billFingerprint(rest);};
+      const wanted=comparable({id:taskId,type:input.type,status:1,count:0,data});
+      const matches=(await this.loadRepeatTasks(account)).filter(task=>publicUserId(task.userid)===account.uid && Number(task.count)===0 && Number(task.createtime)>=original.updatedAt-60 && Number(task.createtime)<=original.updatedAt+5 && comparable(task)===wanted);
+      if(matches.length!==1 || String(matches[0]!.id)!==taskId) throw new AppError("REPEAT_REVIEW_MISMATCH","未唯一匹配原请求时间窗内的未执行周期设置");
+      const task=matches[0]!;
+      await this.syncUnlocked(account);
+      const rows=await this.store.listBills(account.id,{limit:BILL_SCAN_LIMIT});
+      if(Number(task.packid)<=0 || rows.some(row=>[cachedBillObject(row).packid,cachedBillObject(row).importpackid].some(value=>String(value)===String(task.packid)))) throw new AppError("REPEAT_REVIEW_UNSUPPORTED","任务关联不明确或已经生成账单，不能仅凭设置解除门禁");
+      const verified={...publicRepeatTask(task),version:billFingerprint(task),generatedBillIds:[]};
+      await this.operations!.recordRepeatCreationReview(account.uid,requestId,original,verified);
+      return {operation:await this.operations!.status(account.uid,requestId),task:verified};
+    });
   }
 
   /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储。 */
@@ -450,7 +508,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额。 */
+  /** 返回当前账号时区；设置只影响本服务的自然日口径。 */
   async getTimeZone(accountId: number) {
     return this.withAccount(accountId, async () => ({ timeZone: timeZone() }));
   }
@@ -2876,7 +2934,7 @@ export class MoneyTrackService {
     return operation(() => {});
   }
 
-  /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果。 */
+  /** 在唯一入口处刷新部分成功后的本地状态并返回逐项结果。 */
   private async acceptSyncBillResult(
     account: QianjiAccount,
     result: SyncBillResult,

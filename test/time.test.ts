@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "./context.ts";
-import { inTimeZone, localSecond, localDate, nextDay, calendarDays, offsetSeconds, validateTimeZone } from "../src/time.ts";
+import { completeLocalDays, inTimeZone, localSecond, localDate, nextDay, calendarDays, offsetSeconds, validateTimeZone } from "../src/time.ts";
 import { Store } from "../src/data-store.ts";
 import { QianjiClient } from "../src/qianji-client.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
@@ -11,6 +11,7 @@ test("calendar boundaries support DST, midnight gaps and skipped dates without 8
     assert.equal(nextDay(spring) - spring, 23 * 3600);
     assert.equal(nextDay(fall) - fall, 25 * 3600);
     assert.equal(calendarDays(spring, nextDay(spring)), 1);
+    assert.equal(completeLocalDays(spring + 12 * 3600, nextDay(spring)),0);
     assert.equal(offsetSeconds(spring), -18000);
     assert.equal(offsetSeconds(nextDay(spring)), -14400);
     assert.equal(localDate(localSecond(2026, 13, 1)), "2027-01-01");

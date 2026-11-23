@@ -1,4 +1,4 @@
-import { timeZone, offsetSeconds, localDate, startOfDay, calendarDays } from "./time.ts";
+import { timeZone, offsetSeconds, localDate, startOfDay, completeLocalDays } from "./time.ts";
 import { billExtra, publicUserId, refundRelationshipMap, reimbursementRelationshipMap, tagIdsFrom } from "./bill-rules.ts";
 import type { BillRow } from "./data-store.ts";
 import { decimalAdd, decimalDivide, decimalMultiply, decimalRound, decimalSubtract } from "./decimal.ts";
@@ -404,7 +404,7 @@ function averagePeriodCount(options: StatisticsOptions, periods: Map<string, unk
   if (options.unit !== "day") return periods.size;
   const todayStart = startOfDay(options.nowMs / 1000);
   const effectiveEnd = Math.min(options.endTime + 1, todayStart);
-  return Math.max(0, calendarDays(options.startTime, effectiveEnd));
+  return Math.max(0, completeLocalDays(options.startTime, effectiveEnd));
 }
 
 function amount(value: number): number {

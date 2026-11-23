@@ -18,6 +18,7 @@ test("catalog management preserves balances and credit settings, checks versions
   client.listInstallments = async () => [];
   client.listCategories = async () => [];
   client.listDebtAccounts = async () => [];
+  client.checkAssetDeletion = async () => {};
   client.deleteUnusedWallet = async (_account,id) => {writes++; assets=assets.filter(row=>row.id!==id);};
   client.submitBook = async (_account, value) => {
     writes++;
@@ -68,4 +69,18 @@ test("catalog management preserves balances and credit settings, checks versions
   client.listDebtAccounts=async()=>[];
   await run({action:"deleteEmpty",kind:"asset",id:"201",expectedVersion:zero.version});
   assert.equal(assets.some(row=>row.id==="201"),false);
+});
+
+test("asset deletion preflight refuses native cascade counts and missing evidence",async()=>{
+ const account={id:1,uid:"1",utoken:"test",devid:"test"};
+ for(const data of [{installcount:1,repeatcount:0},{installcount:0,repeatcount:2},{},{installcount:0},{installcount:-1,repeatcount:0}]) {
+  const client=new QianjiClient({fetch:async(url,init)=>{
+   assert.equal(new URL(String(url)).pathname,"/asset/deletecheck");
+   assert.equal(new URLSearchParams(String(init?.body)).get("did"),"200");
+   return Response.json({ec:200,data});
+  }});
+  await assert.rejects(client.checkAssetDeletion(account,"200"));
+ }
+ const client=new QianjiClient({fetch:async()=>Response.json({ec:200,data:{installcount:0,repeatcount:0}})});
+ await client.checkAssetDeletion(account,"200");
 });

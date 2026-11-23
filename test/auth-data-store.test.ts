@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -428,4 +429,17 @@ test("旧 accounts 表升级后具备登录标识、用户缓存与 UID 共享�
     write_quota_used: 0n,
     login_identifier: null,
   });
+  assert.equal(migrated.requireAccount(1).timeZone,"Asia/Shanghai");
+  migrated.setTimeZone(1,"America/New_York");
+  migrated.db.prepare("UPDATE accounts SET write_quota_date=?,write_quota_used=? WHERE id=?").run("fixture",3,1);
+  assert.equal(migrated.getWriteQuota(1).used,3);
+  const moduleUrl=new URL("../src/data-store.ts",import.meta.url).href;
+  for(let round=0;round<3;round++) {
+    const script=`import {Store} from ${JSON.stringify(moduleUrl)};
+      const store=new Store(process.argv[1]);
+      if(store.requireAccount(1).timeZone!=='America/New_York'||store.getWriteQuota(1).used!==3) process.exit(1);
+      store.close();`;
+    const child=spawnSync(process.execPath,["-e",script,path],{encoding:"utf8"});
+    assert.equal(child.status,0,child.stderr);
+  }
 });

@@ -76,3 +76,29 @@ test("process termination after remote entry leaves durable pending evidence, ne
   assert.equal((await journal.status("uid", "crash")).state, "pending");
   await assert.rejects(journal.execute("uid", "crash", "create_bills", {}, noop, async () => result), /待核实/);
 });
+
+test("three independent processes racing the same request perform exactly one synthetic dispatch",async t=>{
+  const root=mkdtempSync(join(tmpdir(),"qianji-journal-processes-"));t.after(()=>rmSync(root,{recursive:true}));
+  const moduleUrl=new URL("../src/operation-journal.ts",import.meta.url).href;
+  const script=`import {OperationJournal} from ${JSON.stringify(moduleUrl)};
+    import {appendFileSync} from 'node:fs';
+    try {await new OperationJournal(process.argv[1]).execute('uid','race','create_bills',{},async()=>{},async()=>{
+      appendFileSync(process.argv[1]+'/dispatch.txt','sent\\n');await Bun.sleep(100);
+      return {content:[{type:'text',text:'synthetic'}]};
+    });} catch(e) {if(!['OPERATION_UNCERTAIN','ACCOUNT_OPERATION_PENDING'].includes(e.code)) throw e;}`;
+  const children=Array.from({length:3},()=>Bun.spawn([process.execPath,"-e",script,root],{stdout:"pipe",stderr:"pipe"}));
+  for(const child of children) assert.equal(await child.exited,0,await new Response(child.stderr).text());
+  assert.equal(await Bun.file(join(root,"dispatch.txt")).text(),"sent\n");
+  assert.equal((await new OperationJournal(root).status("uid","race")).state,"confirmed");
+});
+
+test("terminal rejection review cannot release partial success, timeouts, another request or creation",async t=>{
+  const root=mkdtempSync(join(tmpdir(),"qianji-rejection-"));t.after(()=>rmSync(root,{recursive:true}));
+  const journal=new OperationJournal(root);
+  for(const [uid,tool,code] of [["partial","update_bills","WRITE_PARTIAL"],["timeout","set_bill_images","QIANJI_HTTP_ERROR"],["create","create_bills","WRITE_FAILED"]]) {
+    await journal.execute(uid!,"request",tool!,{},noop,async()=>{noteRemoteWrite();return {isError:true,content:[{type:"text",text:JSON.stringify({error:{code}})}]};});
+    await assert.rejects(journal.assertExplicitRejection(uid!,"request",tool!,{}),/不能|仅能/);
+    assert.equal((await journal.status(uid!,"request")).state,"uncertain");
+  }
+  await assert.rejects(journal.assertExplicitRejection("partial","request","update_bills",{changed:true}),/不一致/);
+});

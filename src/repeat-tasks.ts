@@ -21,7 +21,7 @@ export function repeatSchedule(schedule: RepeatSchedule) {
   else if (schedule.type === "bystep") valid &&= values.length === 1 && typeof values[0] === "number" && Number.isInteger(values[0]) && values[0] >= 1 && values[0] <= 3650;
   else valid = false;
   if (!valid) throw new AppError("INVALID_REPEAT_SCHEDULE", "周期参数不匹配，周为 1 至 7，月为 1 至 31，年为 MM-DD，间隔天数为 1 至 3650");
-  return { type: schedule.type, value: values.length ? [...values].sort((a,b) => String(a).localeCompare(String(b), "en", {numeric: true})) : null };
+  return { type: schedule.type, value: [...values].sort((a,b) => String(a).localeCompare(String(b), "en", {numeric: true})) };
 }
 
 /** 固定金额转账周期任务；不是投资申购指令，也不支持预测变额投入。 */
@@ -59,7 +59,8 @@ export function publicRepeatTask(raw: Record<string, unknown>): Record<string, u
     startDate: String(data.start),
     timeOfDay: String(data.time).split(":").map((part) => part.padStart(2, "0")).join(":"),
     repeat: data.repeat,
-    end: data.end ?? null,
+    end: data.end && typeof data.end === "object" && Object.values(data.end).some(value => value !== null && value !== undefined)
+      ? data.end : null,
     tagIds: data.tags ?? [],
     imageCount: Array.isArray(data.images) ? data.images.length : 0,
   };

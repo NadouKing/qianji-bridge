@@ -4,16 +4,17 @@ import { AppError } from "./errors.ts";
 import { billFingerprint } from "./reconciliation.ts";
 import { createBillId, inspectWriteResult, requireNonnegativeMoney, requirePositiveMoney, normalizeBookId, normalizeRequiredAssetId, publicUserId } from "./bill-rules.ts";
 import { decimalAdd, decimalSubtract } from "./decimal.ts";
-import { cachedBillObject, publicBill, publicDebtAccount, categoryChildren } from "./qianji-mappers.ts";
+import { cachedBillObject, publicBill, publicDebtAccount, publicAssetCurrency, categoryChildren } from "./qianji-mappers.ts";
 import { validDate } from "./repeat-tasks.ts";
 import { localDate } from "./time.ts";
 
 type Row = Record<string, unknown>;
-export interface FinanceContext { client: QianjiClient; store: DataStore; account: QianjiAccount; sync(): Promise<void>; now: number }
+export interface FinanceContext { client: QianjiClient; store: DataStore; account: QianjiAccount; sync(): Promise<void>; baseCurrency(): Promise<string>; now: number }
 export type DebtCommand =
   | {action: "create"; name: string; direction: "borrowed" | "lent"; money: number; bookId: string; cashAssetId: string; startDate: string; endDate?: string; remark: string}
   | {action: "addPrincipal" | "repay"; debtId: string; expectedVersion: string; cashAssetId: string; bookId: string; money: number; interest?: number; time: number; remark: string}
-  | {action: "finish"; debtId: string; expectedVersion: string; endDate: string};
+  | {action: "finish"; debtId: string; expectedVersion: string; endDate: string}
+  | {action: "deleteSettled"; debtId: string; expectedVersion: string; billIds: string[]};
 export type InstallmentCommand =
   | {action: "create"; name: string; assetId: string; bookId: string; categoryId: string; money: number; fee: number; periods: number; time: number; feeMethod: "average" | "first" | "last"; remainder: "first" | "last"; remark: string}
   | {action: "configure"; id: string; expectedVersion: string; includeInStatistics: boolean; feeInStatistics: boolean}
@@ -43,7 +44,35 @@ async function allDebts({client,account}: FinanceContext) {
 export async function debtDetails(ctx: FinanceContext, id: string) {
   const row = (await allDebts(ctx)).find(row => String(row.id) === id);
   owned(row,ctx.account);
-  return {debt: publicDebtAccount(row,"CNY"), version: billFingerprint(row)};
+  return {debt: publicDebtAccount(row,await ctx.baseCurrency()), version: billFingerprint(row)};
+}
+/** Read-only reconciliation of a completed create call, not a retry or balance repair. */
+export async function verifyCreatedDebt(ctx:FinanceContext,command:Extract<DebtCommand,{action:"create"}>,debtId:string,expectedCashBalanceAfter:number,completedAt:number) {
+  if(command.action!=="create" || !Number.isFinite(expectedCashBalanceAfter)) throw new AppError("DEBT_REVIEW_UNSUPPORTED","需要原借贷创建参数及已核对的资金余额");
+  const sign=command.direction==="borrowed"?-1:1;
+  const matches=(await allDebts(ctx)).filter(row=>publicUserId(row.userid)===ctx.account.uid && row.name===command.name && Number(row.type)===5 && Number(row.stype)===(sign<0?51:52) && Number(row.status)===0 && Number(row.createtime)>=completedAt-60 && Number(row.createtime)<=completedAt+5);
+  if(matches.length!==1 || String(matches[0]!.id)!==debtId) throw new AppError("DEBT_REVIEW_MISMATCH","未唯一匹配原创建时间窗内的自有借贷");
+  const row=matches[0]!,loan=object(row.loan),baseCurrency=await ctx.baseCurrency();
+  if(publicAssetCurrency(row,baseCurrency)!=="CNY" || Number(row.money)!==sign*command.money || Number(loan.money)!==sign*command.money || Number(loan.totalpay??0)!==0 || loan.startdate!==command.startDate || String(loan.enddate??"")!==(command.endDate??"")) throw new AppError("DEBT_REVIEW_MISMATCH","借贷本金、币种或日期与原请求不一致");
+  await ctx.sync();
+  const related=(await bills(ctx)).map(cachedBillObject).filter(bill=>[bill.assetid,bill.fromid,bill.targetid].some(value=>String(value)===debtId));
+  const bill=related[0];
+  if(related.length!==1 || !bill || publicUserId(bill.userid)!==ctx.account.uid || String(bill.assetid)!==debtId || String(bill.bookid)!==command.bookId || Number(bill.type)!==(sign<0?6:7) || String(bill[sign<0?"targetid":"fromid"])!==command.cashAssetId || Number(bill.money)!==command.money || bill.remark!==command.remark) throw new AppError("DEBT_REVIEW_MISMATCH","起始本金账单关系或内容不唯一匹配");
+  const asset=await cash(ctx,command.cashAssetId,await ctx.client.listAssets(ctx.account,true));
+  if(Number(asset.money)!==expectedCashBalanceAfter) throw new AppError("DEBT_REVIEW_MISMATCH","资金余额与调用方已核对的预期不一致");
+  return {debt:publicDebtAccount(row,baseCurrency),version:billFingerprint(row),billIds:[String(bill.id)],cashBalanceAfter:expectedCashBalanceAfter};
+}
+export async function verifyDeletedDebt(ctx:FinanceContext,command:Extract<DebtCommand,{action:"deleteSettled"}>,cashBalances:Array<{assetId:string;balance:number}>) {
+  if(command.action!=="deleteSettled" || !command.billIds.length || !cashBalances.length || new Set(cashBalances.map(row=>row.assetId)).size!==cashBalances.length) throw new AppError("DEBT_REVIEW_UNSUPPORTED","需要原删除范围及独立核对的资金余额");
+  const assets=await ctx.client.listAssets(ctx.account,true);
+  if([...assets,...await allDebts(ctx)].some(row=>String(row.id)===command.debtId)) throw new AppError("DEBT_REVIEW_MISMATCH","借贷仍存在，不能确认删除");
+  await ctx.sync();
+  if((await bills(ctx)).some(row=>command.billIds.includes(row.id) || ["assetid","fromid","targetid"].some(key=>String(cachedBillObject(row)[key])===command.debtId))) throw new AppError("DEBT_REVIEW_MISMATCH","本金账单或关联仍存在");
+  for(const expected of cashBalances) {
+    const asset=await cash(ctx,expected.assetId,assets);
+    if(!Number.isFinite(expected.balance) || Number(asset.money)!==expected.balance) throw new AppError("DEBT_REVIEW_MISMATCH","资金余额与独立核对的预期不一致");
+  }
+  return {deleted:true,id:command.debtId,deletedBillIds:command.billIds,cashBalances};
 }
 async function book(ctx: FinanceContext, id: string) {
   normalizeBookId(id);
@@ -80,7 +109,35 @@ export async function manageDebt(ctx: FinanceContext, command: DebtCommand) {
   const old="debtId" in command ? debts.find(row=>String(row.id)===command.debtId) : undefined;
   if ("debtId" in command) {
     owned(old,account); version(old,command.expectedVersion);
-    if (Number(old.type)!==5 || ![51,52].includes(Number(old.stype)) || old.currency!=="CNY" || Number(old.status)!==0) throw new AppError("DEBT_TYPE_UNSUPPORTED","需要正常自有 CNY 借贷记录");
+    if (Number(old.type)!==5 || ![51,52].includes(Number(old.stype)) || publicAssetCurrency(old,await ctx.baseCurrency())!=="CNY" || Number(old.status)!==(command.action==="deleteSettled"?1:0)) throw new AppError("DEBT_TYPE_UNSUPPORTED","需要对应状态的自有 CNY 借贷记录");
+  }
+  if (command.action==="deleteSettled") {
+    // Current server reverses repayments, but does not reverse principal receipts on asset/delete.
+    // Restrict scope and report that verified cash effect; never silently rewrite balances.
+    const id=command.debtId, approved=new Set(command.billIds);
+    const related=beforeBills.filter(row=>["assetid","fromid","targetid"].some(key=>String(cachedBillObject(row)[key])===id));
+    if (Number(old!.money)!==0 || !related.length || approved.size!==command.billIds.length || related.length!==approved.size || related.some(row=>!approved.has(row.id))) throw new AppError("DEBT_DELETE_SCOPE_MISMATCH","需要已结清零本金及全部关联账单的精确清单");
+    const delta=new Map<string,number>(),deletionDelta=new Map<string,number>(),borrow=Number(old!.stype)===51;
+    for(const row of related) {
+      const bill=cachedBillObject(row),type=Number(bill.type),n=Number(bill.money),add=type===(borrow?6:7);
+      if(publicUserId(bill.userid)!==account.uid || String(bill.assetid)!==id || ![borrow?6:7,borrow?9:4].includes(type) || !Number.isFinite(n) || n<=0 || (Array.isArray(bill.images)&&bill.images.length)) throw new AppError("DEBT_DELETE_UNSUPPORTED","只删除自有、无附件、无利息的已结清本金循环");
+      const cashId=String(bill[[4,6].includes(type)?"targetid":"fromid"]);
+      await cash(ctx,cashId,assets);
+      delta.set(cashId,decimalAdd(delta.get(cashId)??0,(borrow?1:-1)*(add?n:-n)));
+      if(!add) deletionDelta.set(cashId,decimalAdd(deletionDelta.get(cashId)??0,(borrow?1:-1)*n));
+    }
+    if([...delta.values()].some(n=>n!==0)) throw new AppError("DEBT_DELETE_UNSUPPORTED","仅支持每个资金账户本金净流动为零的已结清循环");
+    const references=(value:unknown):boolean=>value!==null && value!==undefined && (typeof value==="object"?Object.values(value).some(references):String(value)===id);
+    if((await client.listRepeatTasks(account)).some(row=>references(row.data)) || (await client.listInstallments(account)).some(row=>references(row)) || [...assets,...debts].some(row=>String(row.id)!==id && [row.loan,row.credit,row.extra].some(references))) throw new AppError("DEBT_DELETE_UNSUPPORTED","借贷仍被其他对象引用");
+    await client.deleteUnusedWallet(account,id);
+    await ctx.sync();const after=await bills(ctx);
+    confirmed(!(await allDebts(ctx)).some(row=>String(row.id)===id) && !(await client.listAssets(account,true)).some(row=>String(row.id)===id),"借贷删除未确认");
+    confirmed(!after.some(row=>approved.has(row.id)) && after.length===beforeBills.length-related.length,"借贷本金账单删除范围未确认");
+    preserveHistory(beforeBills.filter(row=>!approved.has(row.id)),after);
+    const afterAssets=await client.listAssets(account,true);
+    verifyBalances(assets.filter(row=>String(row.id)!==id),afterAssets,deletionDelta);
+    await store.invalidateCatalogCache(account.id,"assets","");
+    return {deleted:true,id,deletedBillIds:[...approved],debt:publicDebtAccount(old!,"CNY"),version:billFingerprint(old!),billIds:[],cashBalanceEffects:[...deletionDelta].map(([assetId,delta])=>({assetId,delta,balanceBefore:Number(assets.find(row=>String(row.id)===assetId)!.money),balanceAfter:Number(afterAssets.find(row=>String(row.id)===assetId)!.money)}))};
   }
   if (command.action==="finish") {
     if (Number(old!.money)!==0 || !validDate(command.endDate) || command.endDate < String(object(old!.loan).startdate)) throw new AppError("DEBT_NOT_SETTLED","本金未归零或结清日期无效");
@@ -104,6 +161,7 @@ export async function manageDebt(ctx: FinanceContext, command: DebtCommand) {
   const cashDelta=(borrow?1:-1)*(add?command.money:-decimalAdd(command.money,interest));
   let rows: Row[]=[], debtId=old ? String(old.id):"";
   if (command.action==="create") {
+    if(await ctx.baseCurrency()!=="CNY") throw new AppError("DEBT_CURRENCY_UNSUPPORTED","原生借贷使用账号本位币，当前新建仅支持 CNY 本位币账号");
     named(command.name); requirePositiveMoney(command.money,"本金");
     if (!validDate(command.startDate) || (command.endDate && (!validDate(command.endDate) || command.endDate<command.startDate))) throw new AppError("INVALID_DEBT_DATES","借贷起止日期无效");
     if ([...assets,...debts].some(row=>row.name===command.name)) throw new AppError("FINANCE_NAME_EXISTS","同名资产已存在");
@@ -139,7 +197,8 @@ export async function manageDebt(ctx: FinanceContext, command: DebtCommand) {
   const loan=debt && object(debt.loan), beforeLoan=old && object(old.loan);
   confirmed(debt && loan && Number(debt.money)===decimalAdd(Number(old?.money??0),debtDelta),"未还本金未确认");
   confirmed(Number(loan.money)===decimalAdd(Number(beforeLoan?.money??0),add?debtDelta:0) && Number(loan.totalpay??0)===decimalAdd(Number(beforeLoan?.totalpay??0),add?0:command.money),"借贷本金与累计还款未确认");
-  if (command.action==="create") confirmed(String(loan.accountId)===command.cashAssetId && loan.startdate===command.startDate,"借贷资金账户或日期未确认");
+  // Native creation links cash via the opening bill, already verified above. LoanInfo omits accountId.
+  if (command.action==="create") confirmed(loan.startdate===command.startDate && String(loan.enddate??"")===(command.endDate??""),"借贷日期未确认");
   verifyBalances(assets,await client.listAssets(account,true),new Map([[command.cashAssetId,cashDelta],[debtId,debtDelta]]));
   await store.invalidateCatalogCache(account.id,"assets","");
   return {debt:publicDebtAccount(debt,"CNY"),version:billFingerprint(debt),billIds:rows.map(row=>String(row.id))};

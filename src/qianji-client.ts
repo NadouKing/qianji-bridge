@@ -389,6 +389,14 @@ export class QianjiClient {
   }
 
   /** Delete only an unused wallet after the service has checked ownership and all bill references. */
+  async checkAssetDeletion(account: QianjiAccount, assetId: string): Promise<void> {
+    const data = asObject(await this.authPost(account, "/asset/deletecheck", {did: assetId}));
+    for (const key of ["installcount", "repeatcount"]) {
+      if (typeof data[key] !== "number" || !Number.isInteger(data[key]) || Number(data[key]) < 0) throw new AppError("QIANJI_RESPONSE_INVALID", "资产删除检查未返回明确的关联数量", 502);
+      if (Number(data[key]) > 0) throw new AppError("CATALOG_OBJECT_IN_USE", "资产仍有关联分期或周期，拒绝上游级联终止");
+    }
+  }
+
   async deleteUnusedWallet(account: QianjiAccount, assetId: string): Promise<void> {
     await this.authPost(account, "/asset/delete", { did: assetId });
   }
@@ -812,7 +820,7 @@ export class QianjiClient {
     body: Record<string, string | number>,
     htoken = false,
   ): Promise<unknown> {
-    if (!new Set(["/client/init", "/book/list", "/book/members", "/asset/list", "/asset/info", "/asset/listloan", "/asset/typelist", "/tag/list", "/budget/list", "/category/listv2", "/category/iconlist", "/category/deletecheckv2", "/currency/listv2", "/repeat_task/list", "/installment/list", "/syncv2/pull", "/common/uploadtoken"]).has(path)) noteRemoteWrite();
+    if (!new Set(["/client/init", "/book/list", "/book/members", "/asset/list", "/asset/info", "/asset/listloan", "/asset/typelist", "/asset/deletecheck", "/tag/list", "/budget/list", "/category/listv2", "/category/iconlist", "/category/deletecheckv2", "/currency/listv2", "/repeat_task/list", "/installment/list", "/syncv2/pull", "/common/uploadtoken"]).has(path)) noteRemoteWrite();
     return this.post(
       path,
       { uid: account.uid, ...body, fr: account.uid },

@@ -4,6 +4,7 @@ import { AppError } from "./errors.ts";
 import { billFingerprint } from "./reconciliation.ts";
 import { publicBook, publicAssetGroups, publicTagGroup, cachedBillObject, categoryChildren } from "./qianji-mappers.ts";
 import { requireNonnegativeMoney, publicUserId } from "./bill-rules.ts";
+import { parseQianjiJson } from "./qianji-client.ts";
 
 export type CatalogObjectKind = "book" | "asset" | "tagGroup";
 export type CatalogCommand =
@@ -22,9 +23,9 @@ async function read(client: QianjiClient, account: QianjiAccount, kind: CatalogO
   return kind === "book" ? client.listBooks(account, true) : kind === "asset" ? client.listAssets(account, true) : client.listTagGroups(account);
 }
 const idOf = (row: Record<string, unknown>, kind: CatalogObjectKind) => String(row[kind === "book" ? "bookid" : "id"]);
-function publicObject(row: Record<string, unknown>, kind: CatalogObjectKind, includeBalances = false) {
+function publicObject(row: Record<string, unknown>, kind: CatalogObjectKind, includeBalances = false, baseCurrency = "") {
   const object = kind === "book" ? publicBook(row) : kind === "tagGroup" ? publicTagGroup(row) :
-    (publicAssetGroups([row], includeBalances, "CNY", Date.now())[0]!.children as Record<string, unknown>[])[0]!;
+    (publicAssetGroups([row], includeBalances, baseCurrency, Date.now())[0]!.children as Record<string, unknown>[])[0]!;
   return { object, version: billFingerprint(row) };
 }
 function owned(row: Record<string, unknown>, account: QianjiAccount) {
@@ -33,14 +34,14 @@ function owned(row: Record<string, unknown>, account: QianjiAccount) {
 function name(value: string, max: number) {
   if (!value.trim() || value !== value.trim() || value.length > max) throw new AppError("INVALID_CATALOG_NAME", `名称必须为 1 至 ${max} 个字符且不含首尾空白`);
 }
-export async function getCatalogObject(client: QianjiClient, account: QianjiAccount, kind: CatalogObjectKind, id: string, includeBalances = false) {
+export async function getCatalogObject(client: QianjiClient, account: QianjiAccount, kind: CatalogObjectKind, id: string, includeBalances = false, baseCurrency: () => Promise<string> = async () => "") {
   const row = (await read(client, account, kind)).find(row => idOf(row, kind) === id);
   if (!row) throw new AppError("CATALOG_OBJECT_NOT_FOUND", "目录对象不存在", 404);
-  return publicObject(row, kind, includeBalances);
+  return publicObject(row, kind, includeBalances, kind === "asset" && !row.currency ? await baseCurrency() : "");
 }
 
 /** Manage only native catalog APIs. Existing rows are read afresh and version-checked. */
-export async function manageCatalog(client: QianjiClient, store: DataStore, account: QianjiAccount, command: CatalogCommand, sync: () => Promise<void>) {
+export async function manageCatalog(client: QianjiClient, store: DataStore, account: QianjiAccount, command: CatalogCommand, sync: () => Promise<void>, baseCurrency: () => Promise<string> = async () => "") {
   const kind = kindOf(command);
   if ("name" in command && command.name !== undefined) name(command.name, kind === "book" ? 15 : kind === "tagGroup" ? 10 : 40);
   const before = await read(client, account, kind);
@@ -103,7 +104,13 @@ export async function manageCatalog(client: QianjiClient, store: DataStore, acco
       })) throw new AppError("CATALOG_OBJECT_IN_USE", "对象仍被周期任务引用");
       const installments = await client.listInstallments(account);
       const categories = kind === "book" ? (await client.listCategories(account, id!, -1)).flatMap(row => [row, ...categoryChildren(row)]) : [];
-      if (installments.some(task => kind === "asset" ? String(task.assetid) === id : categories.some(category => String(category.id) === String((task.data as Record<string,unknown>).cateid)))) {
+      if (installments.some(task => {
+        if (kind === "asset") return String(task.assetid) === id;
+        const data=task.data as Record<string,unknown>;
+        const category=typeof data.category === "string" ? parseQianjiJson(data.category) : data.category;
+        return [task.bookid,data.bookid,(category as Record<string,unknown> | null)?.bookid].some(value=>String(value)===id)
+          || categories.some(category=>String(category.id)===String(data.cateid));
+      })) {
         throw new AppError("CATALOG_OBJECT_IN_USE", "对象仍被分期引用");
       }
       if (kind === "asset") {
@@ -120,6 +127,7 @@ export async function manageCatalog(client: QianjiClient, store: DataStore, acco
         const debts: Record<string,unknown>[] = [];
         for (const direction of [51,52] as const) for (const status of [0,1] as const) debts.push(...await client.listDebtAccounts(account,direction,status));
         if ([...assets.filter(row=>String(row.id)!==id),...debts].some(row=>[row.credit,row.loan,row.extra].some(references))) throw new AppError("CATALOG_OBJECT_IN_USE", "资产仍被借贷或共享额度关系引用");
+        await client.checkAssetDeletion(account,id!);
         await client.deleteUnusedWallet(account,id!);
       } else await client.deleteEmptyBook(account, id!);
       removed = true;
@@ -134,6 +142,6 @@ export async function manageCatalog(client: QianjiClient, store: DataStore, acco
     if (candidates.length !== 1 || !found || Object.entries(expected).some(([key, value]) => billFingerprint(found[key] ?? null) !== billFingerprint(value ?? null))) {
       throw new AppError("WRITE_CONFIRMATION_FAILED", "目录写入回读不一致，请核实原请求，不重发");
     }
-    return publicObject(found, kind, kind === "asset");
+    return publicObject(found, kind, kind === "asset", kind === "asset" && !found.currency ? await baseCurrency() : "");
   } finally { await store.invalidateCatalogCache(account.id, kind === "book" ? "books" : kind === "asset" ? "assets" : "tags", ""); }
 }

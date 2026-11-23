@@ -703,14 +703,15 @@ export function createMoneyTrackMcp(
     z.strictObject({action:z.literal("addPrincipal").describe("追加本金"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),time:financeTime,remark:financeRemark}),
     z.strictObject({action:z.literal("repay").describe("归还或收回本金并单独记录利息"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:debtPrincipalSchema,interest:nonnegativeMoneySchema.describe("独立利息主单位"),time:financeTime,remark:financeRemark}),
     z.strictObject({action:z.literal("finish").describe("结清零本金借贷"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,endDate:financeDate}),
+    z.strictObject({action:z.literal("deleteSettled").describe("永久删除已结清本金循环及全部本金账单，服务端退回还款金额并返回资金余额影响，仅支持无利息、无附件、每个资金账户净流动为零的记录"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,billIds:z.array(positiveIdText).min(1).max(100).describe("全部关联本金账单 ID，必须同时提供对应 expectedBills 指纹")}),
   ]).describe("原生借贷操作，需持久回执，暂限明确 CNY 资金账户");
   server.registerTool("get_debt_details", {
     description:"读取借贷详情及版本指纹", inputSchema:z.strictObject({debtId:positiveIdText.describe("借贷 ID")}),
     outputSchema:z.record(z.string(),z.unknown()).describe("借贷公开字段及版本"),annotations:readAnnotations,
   },async ({debtId},ctx)=>toolResult(async()=>service.getDebtDetails(await userId(principal,store),debtId),ctx,principal,bindingTickets));
   server.registerTool("manage_debt", {
-    description:"创建借贷、追加本金、归还本金与利息或结清，核验原生关系、历史账单和余额",
-    inputSchema:z.strictObject({command:debtCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验借贷详情、版本和新账单编号"),annotations:writeAnnotations,
+    description:"创建借贷、追加本金、归还本金与利息、结清或按明确账单清单删除已结清本金循环，核验原生关系、历史账单和余额",
+    inputSchema:z.strictObject({command:debtCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验借贷详情、版本和账单编号或删除结果"),annotations:{...writeAnnotations,destructiveHint:true},
   },async ({command},ctx)=>toolResult(async()=>service.manageDebt(await userId(principal,store),command),ctx,principal,bindingTickets));
   server.registerTool("list_installments", {
     description:"直接读取分期目录和版本，不从历史账单猜测当前设置",inputSchema:z.strictObject({}).meta({required:[]}),

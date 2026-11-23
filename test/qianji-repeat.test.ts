@@ -4,15 +4,43 @@ import { QianjiClient, parseQianjiJson } from "../src/qianji-client.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
 import test from "./context.ts";
 import { repeatSchedule } from "../src/repeat-tasks.ts";
+import { mkdtempSync,rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { OperationJournal } from "../src/operation-journal.ts";
+import { noteRemoteWrite } from "../src/write-context.ts";
 
 test("six repeat schedules validate boundaries and reject invalid calendar dates", () => {
   assert.deepEqual(repeatSchedule({type: "month", values: [31, 1]}), {type: "month", value: [1, 31]});
   assert.deepEqual(repeatSchedule({type: "year", values: ["02-29"]}), {type: "year", value: ["02-29"]});
-  for (const type of ["day", "workday"] as const) assert.deepEqual(repeatSchedule({type}), {type, value: null});
+  for (const type of ["day", "workday"] as const) assert.deepEqual(repeatSchedule({type}), {type, value: []});
   assert.deepEqual(repeatSchedule({type: "bystep", values: [3]}), {type: "bystep", value: [3]});
   for (const schedule of [{type: "week", values: [0]}, {type: "month", values: [32]}, {type: "year", values: ["02-30"]}, {type: "workday", values: [1]}, {type: "week", values: [1, 1]}] as const) {
     assert.throws(() => repeatSchedule({type: schedule.type, values: [...schedule.values]}), /周期参数/);
   }
+});
+
+test("future creation review requires unique unexecuted settings and never redispatches the original",async t=>{
+  const root=mkdtempSync(join(tmpdir(),"repeat-review-"));t.after(()=>rmSync(root,{recursive:true}));
+  const store=new Store(":memory:");t.after(()=>store.close());
+  const pat=store.createPat("test",null),account=store.bindPat(pat.id,"uid","test","test"),now=Date.now();
+  store.applySyncBatch(account.id,{changes:[],deletes:[],invalidatedCategoryScopes:[],lasttimes:[]});
+  const startDate=new Date(now+7*86400000).toISOString().slice(0,10);
+  const args={type:2,bookId:"1",fromAssetId:"101",targetAssetId:"102",money:0.03,fee:0.01,remark:"fixture",startDate,timeOfDay:"09:00",schedule:{type:"week",values:[1,3]}};
+  const task={id:"999",userid:"uid",type:2,status:1,count:0,createtime:Math.floor(now/1000),packid:1700000000,data:{bookid:"1",fromid:"101",targetid:"102",money:0.02,fee:0.01,remark:"fixture",start:startDate,time:"9:0",repeat:{type:"week",value:[1,3]},end:null}};
+  let tasks=[task];
+  const client=new QianjiClient({fetch:async(url)=>{
+    if(new URL(String(url)).pathname==="/repeat_task/list") return Response.json({ec:200,data:{list:tasks}});
+    return Response.json({ec:200,data:{changes:[],deletes:[],categories:[],bookid:-1,pageoffset:0,hasmore:0,pagesign:"",lasttimes:[]}});
+  }});
+  const service=new MoneyTrackService(store,client,()=>now,{operationsRoot:root}),journal=new OperationJournal(root),payload={args,expected:[]};
+  const rejected={isError:true,content:[{type:"text" as const,text:JSON.stringify({error:{code:"WRITE_CONFIRMATION_FAILED"}})}]};
+  await journal.execute("uid","create","create_repeat_task",payload,async()=>{},async()=>{noteRemoteWrite();return rejected;});
+  task.count=1;await assert.rejects(service.verifyFutureRepeatCreation(account.id,"create",args,[],"999"),/未唯一匹配/);
+  task.count=0;tasks=[task,{...task,id:"998"}];await assert.rejects(service.verifyFutureRepeatCreation(account.id,"create",args,[],"999"),/未唯一匹配/);
+  tasks=[task];const verified=await service.verifyFutureRepeatCreation(account.id,"create",args,[],"999");
+  assert.equal(verified.operation.state,"reviewed");
+  assert.deepEqual(await journal.execute("uid","create","create_repeat_task",payload,async()=>{},async()=>{throw new Error("must not redispatch");}),rejected);
 });
 
 test("repeat create and edit preserve task identity, reject stale versions and verify historical bills and balances", async t => {
@@ -41,7 +69,7 @@ test("repeat create and edit preserve task identity, reject stale versions and v
       if ((row.data as Record<string, unknown>).time === "21:00") history.remark = "unexpected historical modification";
       const id = row.id === undefined ? String(18000000 + tasks.length) : String(row.id);
       const old = tasks.find(task => String(task.id) === id);
-      const next = {...row, id, status: old?.status ?? 1, count: old?.count ?? 0, packid: old?.packid ?? 1700000001};
+      const next = {...row, userid:"uid", data:{...row.data as Record<string,unknown>,end:null}, id, status: old?.status ?? 1, count: old?.count ?? 0, packid: old?.packid ?? 1700000001};
       if (old) Object.assign(old, next); else tasks.push(next);
       data = {task: next};
     } else throw new Error(path);

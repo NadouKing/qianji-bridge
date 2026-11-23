@@ -32,3 +32,7 @@ export function nextDay(epochSeconds: number): number {
 export function calendarDays(start: number, endExclusive: number): number {
   return localTime(start).toPlainDate().until(localTime(endExclusive).toPlainDate()).days;
 }
+
+export function completeLocalDays(start: number, end: number): number {
+  return localTime(start).until(localTime(end), {largestUnit: "day"}).days;
+}
