@@ -37,6 +37,7 @@ import {
 } from "./bill-rules.ts";
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
+import { installOperationTools } from "./operation-tools.ts";
 
 const bindingExpiryFormatter = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
@@ -663,6 +664,7 @@ export function createMoneyTrackMcp(
     { name: "qianji-bridge", version: "0.1.0" },
     { instructions: serverInstructions.trim() },
   );
+  installOperationTools(server, service, () => userId(principal, store));
 
   server.registerTool(
     "connect_qianji",
@@ -1050,6 +1052,7 @@ export function createMoneyTrackMcp(
         results: z.array(z.object({
           billId: positiveIdText.describe("请求的账单 ID"),
           bill: billSchema.nullable().describe("完整详情，不存在或不属于当前账号时为 null"),
+          fingerprint: z.string().nullable().describe("详情版本 SHA256，用于写前 expectedBills 检查，账单缺失时为 null"),
         })).describe("按 ID 首次出现顺序返回的结果"),
         cache: z.object({
           readAt: z.number().int().describe("读取缓存的时间，Unix 秒，不表示已经同步"),

@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
+import { OperationJournal, type ExpectedBill } from "./operation-journal.ts";
+import { billFingerprint } from "./reconciliation.ts";
 import { readRecoveryBackup, remapBillAsset, recoveryFingerprint, saveRecoveryRecord } from "./bill-recovery.ts";
 
 import {
@@ -231,6 +234,7 @@ export class MoneyTrackService {
   private readonly client: QianjiClient;
   private readonly now: () => number;
   private readonly recoveryRoot?: string;
+  private readonly operations?: OperationJournal;
   private readonly locks = new Map<string, Promise<void>>();
   // 仅记录本进程确认的同步；重启后保持未知，不把读取缓存的时间当作同步时间。
   private readonly billSyncTimes = new Map<number, number>();
@@ -239,11 +243,51 @@ export class MoneyTrackService {
   private readonly initialSyncFailures = new Map<number, AppError>();
 
   /** 创建业务服务，时间函数可注入，以便确定性验证缓存和配额边界。 */
-  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now, options: { recoveryRoot?: string } = {}) {
+  constructor(store: DataStore, client: QianjiClient, now: () => number = Date.now, options: { recoveryRoot?: string; operationsRoot?: string } = {}) {
     this.store = store;
     this.client = client;
     this.now = now;
     this.recoveryRoot = options.recoveryRoot;
+    this.operations = options.operationsRoot ? new OperationJournal(options.operationsRoot) : undefined;
+  }
+
+  async operationStatus(accountId: number, requestId: string) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "尚未配置私人操作回执目录");
+    const account = await this.store.requireAccount(accountId);
+    return this.operations.status(account.uid, requestId);
+  }
+
+  async runOperation(accountId: number, requestId: string | undefined, tool: string, args: Record<string, unknown>,
+    expected: ExpectedBill[] | undefined, action: () => Promise<CallToolResult | InputRequiredResult>) {
+    if (!this.operations) {
+      if (requestId || expected) throw new AppError("OPERATIONS_NOT_CONFIGURED", "请求防重需先配置 QIANJI_MCP_OPERATIONS_ROOT");
+      return action();
+    }
+    if (!requestId) throw new AppError("REQUEST_ID_REQUIRED", "已启用持久防重，请为本次业务提供稳定 requestId");
+    const account = await this.store.requireAccount(accountId);
+    return this.operations.execute(account.uid, requestId, tool, { args, expected: expected ?? [] }, async () => {
+      const required = new Set<string>();
+      const visit = (value: unknown) => {
+        if (Array.isArray(value)) { value.forEach(visit); return; }
+        if (!value || typeof value !== "object") return;
+        for (const [key, child] of Object.entries(value)) {
+          if (["billId", "sourceBillId", "refundBillId", "reimbursementBillId"].includes(key) && typeof child === "string") required.add(child);
+          else if (["billIds", "sourceBillIds"].includes(key) && Array.isArray(child)) child.forEach(id => required.add(String(id)));
+          else visit(child);
+        }
+      };
+      visit(args);
+      const hashes = new Map((expected ?? []).map(row => [row.billId, row.hash]));
+      if (hashes.size !== (expected ?? []).length || [...required].some(id => !hashes.has(id))) {
+        throw new AppError("EXPECTED_BILLS_REQUIRED", "修改及关联源账单必须提供 get_bills 返回的完整版本指纹");
+      }
+      if (hashes.size) {
+        const snapshot = await this.getBills(accountId, [...hashes.keys()], true);
+        if (snapshot.results.some(row => row.bill === null || row.fingerprint !== hashes.get(row.billId))) {
+          throw new AppError("BILL_VERSION_CONFLICT", "账单已变化或无法读取，请重新核对后制定新请求");
+        }
+      }
+    }, action);
   }
 
   /** 等待登录后仍在进行的账单同步结束，供服务关闭前安全释放存储。 */
@@ -1072,7 +1116,8 @@ export class MoneyTrackService {
       const results = [];
       for (const billId of ids) {
         const row = await this.store.getBill(account.id, billId);
-        results.push({ billId, bill: row ? publicBill(cachedBillObject(row)) : null });
+        const bill = row ? publicBill(cachedBillObject(row)) : null;
+        results.push({ billId, bill, fingerprint: bill === null ? null : billFingerprint(bill) });
       }
       return {
         results,
