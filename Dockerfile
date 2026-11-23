@@ -25,7 +25,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
 COPY --from=verify --chown=bun:bun /app/src ./src
-COPY --chown=bun:bun LICENSE ./LICENSE
+COPY --chown=bun:bun LICENSE THIRD_PARTY_NOTICES.md ./
 
 RUN mkdir -p /data && chown bun:bun /data
 
