@@ -30,6 +30,7 @@ import {
   MAX_BILL_CURSOR_LENGTH,
   MAX_CATEGORY_NAME_LENGTH,
   MAX_MONEY,
+  MAX_REFUNDS_PER_SOURCE_BILL,
   MAX_SEARCH_KEYWORD_LENGTH,
   MAX_TAG_NAME_LENGTH,
   TAG_COLOR_PATTERN,
@@ -363,15 +364,11 @@ const derivedCurrencyInputSchema = z.strictObject({
 const userInfoSchema = z.discriminatedUnion("isVip", [
   z.strictObject({
     ...userInfoFields,
-    isVip: z.literal(true).describe("有效 VIP，不适用每日写入额度，结果不包含额度字段"),
+    isVip: z.literal(true).describe("有效 VIP"),
   }),
   z.strictObject({
     ...userInfoFields,
-    isVip: z.literal(false).describe("非有效 VIP，结果包含当日共享写入额度"),
-    dailyWriteLimit: z.number().int().nonnegative().describe("当日成功业务写入上限，单位为次"),
-    dailyWriteUsed: z.number().int().nonnegative().describe("当日已用成功业务写入次数，单位为次"),
-    dailyWriteRemaining: z.number().int().nonnegative().describe("当日剩余成功业务写入次数，单位为次"),
-    dailyWriteResetsAt: z.number().int().nonnegative().describe("额度在 Asia/Shanghai 次日零点重置的 Unix 秒"),
+    isVip: z.literal(false).describe("非有效 VIP"),
   }),
 ]);
 
@@ -888,7 +885,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "get_user_info",
     {
-      description: "返回当前钱迹用户、账户本位币、VIP 状态及适用时的当日写入额度信息",
+      description: "返回当前钱迹用户、账户本位币、VIP 状态",
       inputSchema: z.strictObject({}).meta({ required: [] }),
       outputSchema: z.object({ user: userInfoSchema.describe("当前钱迹用户信息") }),
       annotations: readAnnotations,
@@ -1343,7 +1340,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "create_refund",
     {
-      description: "为普通支出或待报销支出创建退款账单，同一源账单最多关联 25 条退款",
+      description: `为普通支出或待报销支出创建退款账单，同一源账单最多关联 ${MAX_REFUNDS_PER_SOURCE_BILL} 条退款`,
       inputSchema: z.strictObject({
         sourceBillId: positiveIdText.describe("退款源账单 ID"),
         ...refundFields,

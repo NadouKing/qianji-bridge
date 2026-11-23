@@ -8,7 +8,7 @@
 
 #### 查询
 
-- 用户信息、账户本位币、VIP 状态或写入额度：使用 `get_user_info`
+- 用户信息、账户本位币、VIP 状态：使用 `get_user_info`
 - 账本：使用 `list_books`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，默认不返回余额和信用额度，只有用户明确要求查看余额或额度时才设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，`list_assets` 可能包含 type 5 债务记录基础资产条目，但不能替代详细信息，不要自行聚合两类响应

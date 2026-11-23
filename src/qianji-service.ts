@@ -214,7 +214,6 @@ export interface CreateMultipleCategoriesInput {
 const DISPLAY_FIELDS = ["category", "fromact", "targetact", "paytype", "bookname"];
 const GLOBAL_SYNC_BOOK_ID = "-1";
 const USER_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
-const DAILY_WRITE_LIMIT = 15;
 const KNOWN_BILL_TYPES = new Set([0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 20, 21, 22]);
 const MAX_SYNC_PAGES = 200;
 const BILL_SCAN_LIMIT = 1_000_000_000;
@@ -2610,7 +2609,7 @@ export class MoneyTrackService {
     });
   }
 
-  /** 统一执行标签上限、非 VIP 配额预占及远端成功后的配额保留。 */
+  /** 统一执行真实标签限制；不再限制桥接层每日写入次数。 */
   private async withBusinessWrite<T>(
     account: QianjiAccount,
     tagIds: string[],
@@ -2621,18 +2620,8 @@ export class MoneyTrackService {
     if (tagIds.length > tagLimit) {
       throw new AppError("TAG_LIMIT_EXCEEDED", `${vip ? "VIP" : "非 VIP"} 每次写入最多使用 ${tagLimit} 个标签`);
     }
-    if (vip) return operation(() => {});
-
-    const date = shanghaiDate(this.now());
-    await this.store.reserveWriteQuota(account.id, date, DAILY_WRITE_LIMIT);
-    // 配额统计钱迹已接受的写入，因此本地确认失败时也不能释放名额。
-    // ponytail: 接受前崩溃最多占用一个名额到上海午夜，实际发生后再引入持久化写入日志。
-    let remoteSucceeded = false;
-    try {
-      return await operation(() => { remoteSucceeded = true; });
-    } finally {
-      if (!remoteSucceeded) await this.store.releaseWriteQuota(account.id, date);
-    }
+    // Historical quota columns are retained for database downgrade compatibility.
+    return operation(() => {});
   }
 
   /** 在唯一入口处保留部分成功配额、刷新本地状态并返回逐项结果。 */
@@ -3273,7 +3262,7 @@ export class MoneyTrackService {
   }
 }
 
-/** 构造公开用户资料，并为非 VIP 用户附加当天写入配额。 */
+/** 构造公开用户资料；本地历史写入计数不再是业务限制。 */
 async function publicUser(
   user: Record<string, unknown>,
   store: DataStore,
@@ -3294,17 +3283,7 @@ async function publicUser(
   };
   const registrationMethod = registrationMethodName(Number(user.platform ?? 0));
   if (registrationMethod) result.registrationMethod = registrationMethod;
-  if (vip) return result;
-  const quota = await store.getWriteQuota(accountId);
-  const today = shanghaiDate(nowMs);
-  const used = quota.date === today ? quota.used : 0;
-  return {
-    ...result,
-    dailyWriteLimit: DAILY_WRITE_LIMIT,
-    dailyWriteUsed: used,
-    dailyWriteRemaining: Math.max(0, DAILY_WRITE_LIMIT - used),
-    dailyWriteResetsAt: nextShanghaiMidnight(today),
-  };
+  return result;
 }
 
 function publicVipTime(value: unknown, label: string): number | null {
@@ -3810,6 +3789,12 @@ function encodeAdvancedCursor(cursor: AdvancedCursorPayload): string {
   return `c3_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
 }
 
+/** Do not log SyntaxError.message: runtimes may include private cursor contents. */
+function invalidCursor(error: unknown): AppError {
+  if (error instanceof SyntaxError) console.error("账单分页游标解析失败：INVALID_CURSOR_JSON");
+  return new AppError("INVALID_CURSOR", "账单分页游标无效");
+}
+
 function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursorPayload {
   try {
     if (cursor.length > MAX_BILL_CURSOR_LENGTH) throw new Error();
@@ -3822,8 +3807,8 @@ function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursor
       !validAdvancedCursorFilters(value.filters)
     ) throw new Error();
     return { ...value, filters: normalizeAdvancedBillFilters(value.filters) } as AdvancedCursorPayload;
-  } catch {
-    throw new AppError("INVALID_CURSOR", "账单分页游标无效");
+  } catch (error) {
+    throw invalidCursor(error);
   }
 }
 
@@ -3862,8 +3847,8 @@ function decodeCursor(cursor: string, accountId: number): CursorPayload {
       throw new Error();
     }
     return value as CursorPayload;
-  } catch {
-    throw new AppError("INVALID_CURSOR", "账单分页游标无效");
+  } catch (error) {
+    throw invalidCursor(error);
   }
 }
 
