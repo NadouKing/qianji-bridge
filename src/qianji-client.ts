@@ -1,3 +1,4 @@
+import { offsetSeconds } from "./time.ts";
 import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -783,7 +784,7 @@ export class QianjiClient {
     return this.post(
       path,
       { uid: account.uid, ...body, fr: account.uid },
-      { devid: account.devid, utoken: account.utoken, htoken },
+      { devid: account.devid, utoken: account.utoken, htoken, timeZone: account.timeZone },
     );
   }
 
@@ -791,7 +792,7 @@ export class QianjiClient {
   private async post(
     path: string,
     body: Record<string, string | number>,
-    auth: { devid: string; utoken?: string; htoken?: boolean },
+    auth: { devid: string; utoken?: string; htoken?: boolean; timeZone?: string },
   ): Promise<unknown> {
     const { ctrl, act } = extractCtrlAct(path);
     const route = `${ctrl}/${act}`;
@@ -802,6 +803,7 @@ export class QianjiClient {
     const reqidv2 = createReqidv2(ctrl, act, requestMs);
     const headers = new Headers({
       ...CLIENT_PROFILE,
+      timezoneoffset: String(offsetSeconds(now / 1000, auth.timeZone)),
       ctrl,
       act,
       reqidv2,

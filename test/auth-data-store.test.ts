@@ -413,6 +413,7 @@ test("旧 accounts 表升级后具备登录标识、用户缓存与 UID 共享�
     "user_json",
     "user_refreshed_at_ms",
     "write_quota_date",
+    "time_zone",
     "write_quota_used",
     "login_identifier",
   ]);

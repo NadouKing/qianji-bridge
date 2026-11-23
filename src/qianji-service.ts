@@ -1,3 +1,4 @@
+import { inTimeZone, validateTimeZone, timeZone, localTime, localDate, localSecond, startOfDay, nextDay, calendarDays, offsetSeconds } from "./time.ts";
 import { randomUUID } from "node:crypto";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
 import { OperationJournal, type ExpectedBill } from "./operation-journal.ts";
@@ -415,6 +416,17 @@ export class MoneyTrackService {
   }
 
   /** 返回最小用户资料、缓存期内的 VIP 状态和当天共享写入配额。 */
+  async getTimeZone(accountId: number) {
+    return this.withAccount(accountId, async () => ({ timeZone: timeZone() }));
+  }
+  async setTimeZone(accountId: number, zone: string) {
+    return this.withAccount(accountId, async () => {
+      const validated = validateTimeZone(zone);
+      await this.store.setTimeZone(accountId, validated);
+      return { timeZone: validated };
+    });
+  }
+
   async getUserInfo(accountId: number): Promise<Record<string, unknown>> {
     return this.withAccount(accountId, async (account) =>
       publicUser(await this.loadUserWithCurrencyConfig(account), this.store, account.id, this.now()),
@@ -440,9 +452,9 @@ export class MoneyTrackService {
   }
 
   async createRepeatTask(accountId: number, input: RepeatTaskInput) {
-    if (!validDate(input.startDate) || input.startDate <= shanghaiDate(this.now())) throw new AppError("INVALID_REPEAT_START", "新任务必须从上海时区的未来日期开始");
     const adjustment = billAdjustment(input.money, input.fee ?? 0, 0);
     return this.withBillAccount(accountId, async account => {
+      if (!validDate(input.startDate) || input.startDate <= localDate(this.now() / 1000)) throw new AppError("INVALID_REPEAT_START", "新任务必须从当前账号时区的未来日期开始");
       const data: Record<string, unknown> = {start: input.startDate, end: {date: null, count: null}, time: input.timeOfDay,
         repeat: repeatSchedule(input.schedule), bookid: normalizeBookId(input.bookId), fromid: normalizeRequiredAssetId(input.fromAssetId),
         ...(input.targetAssetId ? {targetid: normalizeRequiredAssetId(input.targetAssetId)} : {}),
@@ -529,7 +541,7 @@ export class MoneyTrackService {
       if (!from || !to || Number(to.money) !== decimalAdd(Number(from.money), delta.get(assetId) ?? 0)) throw writeConfirmationFailed("周期操作后账户余额未核验通过");
     }
     await this.store.invalidateCatalogCache(account.id, "assets", "");
-    return {...publicRepeatTask(task), version: billFingerprint(task), generatedBillIds: created.filter(bill => [bill.packid, bill.importpackid].some(value => String(value) === String(task.packid))).map(bill => String(bill.id))};
+    return {...publicRepeatTask(task), version: billFingerprint(task), generatedBillIds: created.filter(bill => Number(task.packid) > 0 && [bill.packid, bill.importpackid].some(value => String(value) === String(task.packid))).map(bill => String(bill.id))};
   }
 
   private async loadRepeatTasks(account: QianjiAccount): Promise<Record<string, unknown>[]> {
@@ -543,10 +555,6 @@ export class MoneyTrackService {
     const fromId = normalizeRequiredAssetId(input.fromAssetId);
     const targetId = normalizeRequiredAssetId(input.targetAssetId);
     const fee = billAdjustment(input.money, input.fee ?? 0, 0);
-    const today = shanghaiDate(this.now());
-    if (input.startDate <= today || Number.isNaN(Date.parse(`${input.startDate}T00:00:00+08:00`))) {
-      throw new AppError("INVALID_REPEAT_START", "新周期任务必须从上海时区的未来日期开始，不回补历史账单");
-    }
     const weekdays = input.weekdays ?? [];
     const repeatType = input.repeatType ?? "week";
     if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input.timeOfDay)
@@ -556,6 +564,9 @@ export class MoneyTrackService {
       throw new AppError("INVALID_REPEAT_SCHEDULE", "周期时间应为 HH:mm，星期应为 1 至 7 的非空无重复列表");
     }
     return this.withBillAccount(accountId, async (account) => {
+      if (!validDate(input.startDate) || input.startDate <= localDate(this.now() / 1000)) {
+        throw new AppError("INVALID_REPEAT_START", "新周期任务必须从当前账号时区的未来日期开始，不回补历史账单");
+      }
       const tagIds = input.tagIds ?? [];
       const { from, target } = await this.validateTransferReferences(account, bookId, fromId, targetId, tagIds, false);
       if (await this.resolvedAssetCurrency(account, from) !== await this.resolvedAssetCurrency(account, target)) {
@@ -2933,7 +2944,10 @@ export class MoneyTrackService {
     operation: (account: QianjiAccount) => Promise<T>,
   ): Promise<T> {
     // ponytail: 进程内账号锁符合单实例约束，支持多副本前改用数据库级锁。
-    return this.withLock(`account:${accountId}`, async () => operation(await this.store.requireAccount(accountId)));
+    return this.withLock(`account:${accountId}`, async () => {
+      const account = await this.store.requireAccount(accountId);
+      return inTimeZone(account.timeZone, () => operation(account));
+    });
   }
 
   /** 使用 Promise 尾链串行执行同一键的任务，并在队列耗尽后释放锁记录。 */
@@ -3594,9 +3608,6 @@ function statisticsRange(
   rows: Array<{ bookid: string; time: number }>,
   nowMs: number,
 ): { startTime: number; endTime: number; unit: StatisticsUnit } {
-  const offset = 8 * 60 * 60;
-  const localSecond = (year: number, month: number, day: number): number =>
-    Math.floor(Date.UTC(year, month - 1, day) / 1000) - offset;
   if (input.range.kind === "custom") {
     if (input.range.startTime > input.range.endTime) throw new AppError("INVALID_TIME_RANGE", "startTime 不能晚于 endTime");
     const days = (input.range.endTime + 1 - input.range.startTime) / 86_400;
@@ -3665,10 +3676,10 @@ function resolveBudgetPeriod(
   const startDay = budgetStartDay(range);
   let filter = input;
   if (!filter) {
-    const local = new Date(nowMs + 28_800_000);
-    let year = local.getUTCFullYear();
-    let month = local.getUTCMonth() + 1;
-    if (Math.floor(nowMs / 1000) < shanghaiSecond(year, month, startDay)) {
+    const local = localTime(nowMs / 1000);
+    let year = local.year;
+    let month = local.month;
+    if (Math.floor(nowMs / 1000) < localSecond(year, month, startDay)) {
       const previous = new Date(Date.UTC(year, month - 2, 1));
       year = previous.getUTCFullYear();
       month = previous.getUTCMonth() + 1;
@@ -3682,18 +3693,18 @@ function resolveBudgetPeriod(
     if (!Number.isInteger(filter.month) || filter.month < 1 || filter.month > 12) {
       throw new AppError("INVALID_BUDGET_PERIOD", "预算月份必须是 1 到 12 之间的整数");
     }
-    const startTime = shanghaiSecond(filter.year, filter.month, startDay);
+    const startTime = localSecond(filter.year, filter.month, startDay);
     return {
       filter,
       startTime,
-      endTime: shanghaiSecond(filter.year, filter.month + 1, startDay) - 1,
+      endTime: localSecond(filter.year, filter.month + 1, startDay) - 1,
     };
   }
   if (filter.kind !== "year") throw new AppError("INVALID_BUDGET_PERIOD", "预算期间只支持月份或年份");
   return {
     filter,
-    startTime: shanghaiSecond(filter.year, 1, 1),
-    endTime: shanghaiSecond(filter.year + 1, 1, 1) - 1,
+    startTime: localSecond(filter.year, 1, 1),
+    endTime: localSecond(filter.year + 1, 1, 1) - 1,
   };
 }
 
@@ -3706,11 +3717,6 @@ function budgetStartDay(range: string | undefined): number {
   return day;
 }
 
-function shanghaiSecond(year: number, month: number, day: number): number {
-  const time = Date.UTC(year, month - 1, day) / 1000 - 28_800;
-  if (!Number.isFinite(time)) throw new AppError("QIANJI_RESPONSE_INVALID", "钱迹账本月份范围无效", 502);
-  return Math.floor(time);
-}
 
 function calculateBudget(options: {
   budgets: Record<string, unknown>[];
@@ -3773,7 +3779,8 @@ function calculateBudget(options: {
     ...options.period.filter,
     startTime: options.period.startTime,
     endTime: options.period.endTime,
-    timezoneOffsetSeconds: 28_800,
+    timeZone: timeZone(),
+    timezoneOffsetSeconds: offsetSeconds(options.period.startTime),
   };
   if (!configured) {
     return {
@@ -3812,7 +3819,7 @@ function calculateBudget(options: {
     }
     const included = spendingScope === "allExpenses" || (categoryRoot !== undefined && selectedRoots.has(categoryRoot));
     if (included && amounts.spend > 0) {
-      const day = Math.floor((row.time + 28_800) / 86_400) * 86_400 - 28_800;
+      const day = startOfDay(row.time);
       dailySpend.set(day, decimalAdd(dailySpend.get(day) ?? 0, amounts.spend));
     }
   }
@@ -3829,10 +3836,10 @@ function calculateBudget(options: {
   const limit = Math.max(fullLimit, totalCategoryLimit);
   const used = spendingScope === "allExpenses" ? allSpend : categorySpend;
   const remaining = decimalSubtract(limit, used);
-  const totalDays = (options.period.endTime + 1 - options.period.startTime) / 86_400;
+  const totalDays = calendarDays(options.period.startTime, options.period.endTime + 1);
   const now = Math.floor(options.nowMs / 1000);
   const remainingDays = options.period.filter.kind === "month" && now >= options.period.startTime && now <= options.period.endTime
-    ? Math.floor((options.period.endTime - now) / 86_400) + 1
+    ? calendarDays(startOfDay(now), options.period.endTime + 1)
     : 0;
   const summary: Record<string, unknown> = {
     spendingScope,
@@ -3913,12 +3920,11 @@ function publicBudgetDays(
 ): Record<string, unknown>[] {
   const result: Record<string, unknown>[] = [];
   let cumulativeSpend = 0;
-  for (let time = period.startTime; time <= period.endTime; time += 86_400) {
+  for (let time = period.startTime; time <= period.endTime; time = nextDay(time)) {
     const spend = spending.get(time) ?? 0;
     cumulativeSpend = decimalAdd(cumulativeSpend, spend);
-    const date = new Date((time + 28_800) * 1000);
     result.push({
-      date: `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`,
+      date: localDate(time),
       spend,
       cumulativeSpend,
       remaining: decimalSubtract(limit, cumulativeSpend),
@@ -3959,22 +3965,6 @@ function isVip(user: Record<string, unknown>, nowMs: number): boolean {
   const start = Number(user.vipstart ?? 0);
   const end = Number(user.vipend ?? 0);
   return type >= 1 && now >= start && now < end;
-}
-
-/** 将时间戳转换为上海时区的自然日字符串。 */
-function shanghaiDate(epochMs: number): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(epochMs);
-}
-
-/** 计算指定上海自然日下一次午夜的 Unix 秒。 */
-function nextShanghaiMidnight(date: string): number {
-  const [year, month, day] = date.split("-").map(Number);
-  return Math.floor((Date.UTC(year!, month! - 1, day! + 1) - 8 * 60 * 60 * 1000) / 1000);
 }
 
 /** 构造远端已写入但本地无法确认时的可恢复错误。 */

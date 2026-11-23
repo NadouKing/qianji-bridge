@@ -104,7 +104,7 @@
 - 账单、账本、分类和资产 ID 使用 Java `long` 正数范围内的十进制字符串，`"-1"` 和 `"0"` 只能在具体字段明确允许时使用
 - 标签和成员 ID 使用对应查询返回的原始字符串，不得按数值 ID 猜测或改写
 - 金额使用币种主单位，不使用分、美分等最小货币单位
-- 时间戳字段使用 Unix 秒，不使用毫秒或 ISO 日期字符串，统计和预算的日期口径固定为 UTC+08:00，周期任务的 `timeOfDay` 单独使用 `HH:mm`
+- 时间戳字段使用 Unix 秒，不使用毫秒或 ISO 日期字符串，统计和预算按 `get_time_zone` 查询的账号时区解释，默认 Asia/Shanghai，`set_time_zone` 只修改本服务的日期口径，不移动历史时间戳或重排已有周期任务，周期任务的 `timeOfDay` 单独使用 `HH:mm`
 - `money`、`fee` 和 `discount` 的业务含义以工具字段说明为准，输入结构约束以 Schema 为准
 - 服务端自动换算时，汇率按 HALF_UP 保留 10 位，换算金额按 HALF_EVEN 保留 2 位
 - 跨币种账单使用 `get_user_info.baseCurrency` 解释本位币，读取历史账单时使用 `currencyConversion` 的保存值，不用当前汇率重算

@@ -247,7 +247,7 @@ const assetSchema = z.object({
       type: repaymentRuleTypeSchema,
       value: z.number().int().positive().describe("固定还款日或账单日后的天数"),
     }).optional().describe("信用账户还款规则"),
-    nextRepaymentDate: z.number().int().nonnegative().optional().describe("按钱迹规则计算的下一还款日，UTC+08:00 当日零点 Unix 秒"),
+    nextRepaymentDate: z.number().int().nonnegative().optional().describe("按钱迹规则计算的下一还款日，当前账号时区 当日零点 Unix 秒"),
     limit: z.number().nonnegative().optional().describe(`信用额度，仅当 list_assets.includeBalances=true 时返回，${moneyUnitDescription}`),
   }).optional().describe("仅信用账户返回的账单日、还款规则和下一还款日，额度仅在 includeBalances=true 时返回"),
 });
@@ -561,7 +561,8 @@ const statisticsOutputSchema = z.object({
   range: z.object({
     startTime: z.number().int().describe("实际统计起点，Unix 秒，包含边界"),
     endTime: z.number().int().describe("实际统计终点，Unix 秒，包含边界"),
-    timezoneOffsetSeconds: z.literal(28_800).describe("日期分桶固定使用 UTC+08:00"),
+    timezoneOffsetSeconds: z.number().describe("期间起点的 UTC 偏移秒数，期间内夏令时可能变化"),
+    timeZone: z.string().describe("日期分桶的 IANA 时区"),
   }).describe("实际使用的统计时间范围"),
   currency: currencySymbolSchema.describe("响应中全部金额使用的币种标识，未指定时为当前本位币"),
   availableCurrencies: z.array(currencySymbolSchema).describe("应用其他筛选后可选的来源币种标识集合，并包含当前本位币"),
@@ -574,7 +575,7 @@ const statisticsOutputSchema = z.object({
   }).describe("匹配账单及实际收入、支出、报销条目计数"),
   average: z.object({
     unit: statisticsUnitSchema.describe("APK 按范围选择的平均和时间序列期间单位"),
-    periodCount: z.number().int().nonnegative().describe("平均值分母，其中 unit=day 时，自然月只计已经完整结束的日历日，跨度不超过 365 天的自定义范围以 startTime 为起点，以 endTime 后一秒与当前 UTC+08:00 自然日零点中的较早者为终点，每满 86400 秒计 1 个期间，范围内无账单的期间也计入，因此进行中的当天不计入，仅查询当天时即使有账单也可能为 0，而 unit=month/year 时只计有账单期间，跨度超过 365 天的自定义范围使用 year"),
+    periodCount: z.number().int().nonnegative().describe("平均值分母，其中 unit=day 时，自然月只计已经完整结束的日历日，跨度不超过 365 天的自定义范围以 startTime 为起点，以 endTime 后一秒与当前 当前账号时区 自然日零点中的较早者为终点，按自然日差计数，夏令时不按固定 86400 秒折算，范围内无账单的期间也计入，因此进行中的当天不计入，仅查询当天时即使有账单也可能为 0，而 unit=month/year 时只计有账单期间，跨度超过 365 天的自定义范围使用 year"),
     income: z.number().describe("totalIncome / periodCount，分母为 0 时为 0"),
     spend: z.number().describe("totalSpend / periodCount，分母为 0 时为 0"),
     balance: z.number().describe("平均收入减平均支出"),
@@ -597,7 +598,7 @@ const statisticsOutputSchema = z.object({
       income: z.number().describe("该期间总收入"),
       spend: z.number().describe("该期间总支出"),
       balance: z.number().describe("该期间收入减支出"),
-    })).describe("按 UTC+08:00 分桶且不补空期间的时间序列"),
+    })).describe("按 当前账号时区 分桶且不补空期间的时间序列"),
   }).describe("按 APK 选择的日期粒度汇总趋势"),
 });
 
@@ -615,7 +616,8 @@ const budgetPeriodInputSchema = z.discriminatedUnion("kind", [
 const budgetRangeFields = {
   startTime: z.number().int().describe("实际预算期间起点，Unix 秒，包含边界"),
   endTime: z.number().int().describe("实际预算期间终点，Unix 秒，包含边界"),
-  timezoneOffsetSeconds: z.literal(28_800).describe("预算日期固定使用 UTC+08:00"),
+  timezoneOffsetSeconds: z.number().describe("期间起点的 UTC 偏移秒数"),
+  timeZone: z.string().describe("预算自然日的 IANA 时区"),
 };
 const budgetTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("total").describe("总预算") }),
@@ -670,7 +672,7 @@ const budgetOutputSchema = z.object({
   summary: budgetSummarySchema.nullable().describe("预算总览，没有配置预算时为 null"),
   categories: z.array(budgetCategorySchema).describe("按一级分类与直属二级分类组织的预算明细，未设置预算的分类不返回"),
   dailyStatistics: z.array(z.object({
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("UTC+08:00 日历日期，格式为 YYYY-MM-DD"),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("当前账号时区 日历日期，格式为 YYYY-MM-DD"),
     spend: z.number().nonnegative().describe("当日预算支出，按 spendingScope 统计并排除不计预算金额"),
     cumulativeSpend: z.number().nonnegative().describe("从预算期间起点到当日的累计预算支出"),
     remaining: z.number().describe("当日结束后的预算剩余额度，固定为 summary.limit - cumulativeSpend，负数表示超支"),
@@ -711,8 +713,8 @@ export function createMoneyTrackMcp(
       bookId: bookIdText, fromAssetId: positiveIdText.describe("收支资金账户或转出资产 ID"), targetAssetId: positiveIdText.optional().describe("转账或还款的转入资产 ID"),
       categoryId: positiveIdText.optional().describe("普通收支或待报销的分类 ID"),
       money: positiveMoneySchema.describe(`每次主金额，转账包含手续费，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`每次固定手续费，仅转账或还款支持，${moneyUnitDescription}`),
-      remark: z.string().max(500).describe("周期备注"), startDate: z.iso.date().describe("上海时区未来起始日期 YYYY-MM-DD"),
-      timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("上海时区记账时刻 HH:mm"), schedule: repeatScheduleSchema,
+      remark: z.string().max(500).describe("周期备注"), startDate: z.iso.date().describe("当前账号时区未来起始日期 YYYY-MM-DD"),
+      timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("当前账号时区记账时刻 HH:mm"), schedule: repeatScheduleSchema,
     }),
     outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
   }, async (input, ctx) => toolResult(async () => ({task: await service.createRepeatTask(await userId(principal, store), input)}), ctx, principal, bindingTickets));
@@ -720,7 +722,7 @@ export function createMoneyTrackMcp(
     description: "按最新版本修改周期金额、费用、备注、时间或频率，保留账户、历史账单和任务关联，核验余额变化",
     inputSchema: z.strictObject({taskId: positiveIdText.describe("周期任务 ID"), expectedVersion: expectedVersionSchema,
       patch: z.strictObject({money: positiveMoneySchema.optional().describe(`新的每次主金额，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`新的固定手续费，${moneyUnitDescription}`),
-        remark: z.string().max(500).optional().describe("新周期备注"), timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional().describe("新的上海时区 HH:mm"), schedule: repeatScheduleSchema.optional(),
+        remark: z.string().max(500).optional().describe("新周期备注"), timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional().describe("新的当前账号时区 HH:mm"), schedule: repeatScheduleSchema.optional(),
       }).refine(value => Object.keys(value).length > 0, "patch 不能为空").meta({required: []}).describe("只修改明确提供的字段"),
     }), outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
   }, async ({taskId, expectedVersion, patch}, ctx) => toolResult(async () => ({task: await service.updateRepeatTask(await userId(principal, store), taskId, expectedVersion, patch)}), ctx, principal, bindingTickets));
@@ -909,8 +911,8 @@ export function createMoneyTrackMcp(
         fee: z.number().nonnegative().max(MAX_MONEY).optional().describe(`每次固定手续费，包含在主金额中，转入金额为 money - fee，${sourceAssetMoneyDescription}`),
         remark: z.string().max(500).describe("周期账单备注"),
         tagIds: z.array(z.string().min(1)).max(8).optional().describe("每次周期账单的标签 ID 列表"),
-        startDate: z.iso.date().describe("上海时区起始日期 YYYY-MM-DD，必须晚于今天，不生成历史账单"),
-        timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("上海时区记账时刻 HH:mm"),
+        startDate: z.iso.date().describe("当前账号时区起始日期 YYYY-MM-DD，必须晚于今天，不生成历史账单"),
+        timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("当前账号时区记账时刻 HH:mm"),
         repeatType: z.union([z.literal("week").describe("每周指定星期"), z.literal("workday").describe("沿用钱迹法定工作日规则")])
           .optional().describe("周期类型，省略为每周指定星期"),
         weekdays: z.array(z.number().int().min(1).max(7)).max(7).optional().describe("week 类型必填的星期列表，1 为周一、7 为周日，workday 类型省略或传空数组"),
@@ -981,6 +983,16 @@ export function createMoneyTrackMcp(
         results: await service.listTags(await userId(principal, store), status),
       }), ctx, principal, bindingTickets),
   );
+
+  server.registerTool("get_time_zone", {
+    description: "查询当前账号用于报表、预算和日期边界的 IANA 时区",
+    inputSchema: z.strictObject({}).meta({required: []}), outputSchema: z.object({timeZone: z.string().describe("IANA 时区")}), annotations: readAnnotations,
+  }, async (_, ctx) => toolResult(async () => service.getTimeZone(await userId(principal, store)), ctx, principal, bindingTickets));
+  server.registerTool("set_time_zone", {
+    description: "设置本服务账号时区，不会移动历史 Unix 秒、修改 APP 设置或重排已有周期任务",
+    inputSchema: z.strictObject({timeZone: z.string().min(1).max(100).describe("IANA 时区，如 Asia/Shanghai")}),
+    outputSchema: z.object({timeZone: z.string().describe("保存的 IANA 时区")}), annotations: {...writeAnnotations, idempotentHint: true},
+  }, async ({timeZone}, ctx) => toolResult(async () => service.setTimeZone(await userId(principal, store), timeZone), ctx, principal, bindingTickets));
 
   server.registerTool(
     "get_user_info",
@@ -1174,7 +1186,7 @@ export function createMoneyTrackMcp(
           description: "是否统计全部账本，启用时忽略 bookId",
           default: false,
         }),
-        range: statisticsRangeSchema.describe("统计范围，按 UTC+08:00 解释月份和年份"),
+        range: statisticsRangeSchema.describe("统计范围，按 当前账号时区 解释月份和年份"),
         memberIds: z.array(opaqueIdText).min(1).max(100).optional()
           .describe("共享账本记账人用户 ID 列表，匹配任一成员"),
         currency: currencySymbolSchema.optional().describe("来源币种标识筛选和统计结果币种，传入时只统计以该币种记账的账单并按该币种汇总，省略时不筛选来源币种并按当前本位币汇总"),

@@ -1,3 +1,4 @@
+import { timeZone, offsetSeconds, localDate, startOfDay, calendarDays } from "./time.ts";
 import { billExtra, publicUserId, refundRelationshipMap, reimbursementRelationshipMap, tagIdsFrom } from "./bill-rules.ts";
 import type { BillRow } from "./data-store.ts";
 import { decimalAdd, decimalDivide, decimalMultiply, decimalRound, decimalSubtract } from "./decimal.ts";
@@ -135,7 +136,8 @@ export function calculateBillStatistics(options: StatisticsOptions): Record<stri
     range: {
       startTime: options.startTime,
       endTime: options.endTime,
-      timezoneOffsetSeconds: 28_800,
+      timeZone: timeZone(),
+      timezoneOffsetSeconds: offsetSeconds(options.startTime),
     },
     currency,
     availableCurrencies: [...availableCurrencies].sort(),
@@ -394,17 +396,15 @@ function publicCategories(values: Map<string, CategoryValue>, total: number): Re
 }
 
 function periodKey(epochSeconds: number, unit: StatisticsUnit): string {
-  const date = new Date(epochSeconds * 1000 + 8 * 60 * 60 * 1000);
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  return unit === "year" ? String(year) : unit === "month" ? `${year}-${month}` : `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
+  const date = localDate(epochSeconds);
+  return unit === "year" ? date.slice(0, 4) : unit === "month" ? date.slice(0, 7) : date;
 }
 
 function averagePeriodCount(options: StatisticsOptions, periods: Map<string, unknown>): number {
   if (options.unit !== "day") return periods.size;
-  const todayStart = Math.floor((options.nowMs + 8 * 60 * 60 * 1000) / 86_400_000) * 86_400 - 28_800;
+  const todayStart = startOfDay(options.nowMs / 1000);
   const effectiveEnd = Math.min(options.endTime + 1, todayStart);
-  return Math.max(0, Math.floor((effectiveEnd - options.startTime) / 86_400));
+  return Math.max(0, calendarDays(options.startTime, effectiveEnd));
 }
 
 function amount(value: number): number {
