@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { AppError } from "./errors.ts";
 import type { QianjiFetch } from "./qianji-client.ts";
+import { noteRemoteWrite } from "./write-context.ts";
 
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_PIXELS = 24_000_000;
@@ -75,8 +76,10 @@ export async function uploadImage(fetch: QianjiFetch, uid: string, bytes: Buffer
   form.set("token", token); form.set("key", imageKey);
   form.set("file", new Blob([new Uint8Array(bytes)], { type: original.mime }), "image");
   let receipt: Record<string, unknown>;
+  const host = imageUploadHost(token);
   try {
-    const response = await fetch(imageUploadHost(token), { method: "POST", body: form, redirect: "error", signal: AbortSignal.timeout(30_000) });
+    noteRemoteWrite();
+    const response = await fetch(host, { method: "POST", body: form, redirect: "error", signal: AbortSignal.timeout(30_000) });
     receipt = JSON.parse((await boundedBody(response, 100_000)).toString("utf8"));
   } catch { throw new AppError("IMAGE_UPLOAD_UNCERTAIN", "上传结果未确认，请查询原请求，不重发上传"); }
   if (receipt.key !== imageKey || receipt.hash !== imageEtag(bytes)) throw new AppError("IMAGE_UPLOAD_UNCERTAIN", "存储回执与图片内容不符，不重发上传");

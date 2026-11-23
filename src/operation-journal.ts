@@ -5,6 +5,7 @@ import { isAbsolute, join } from "node:path";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
 import { AppError, safeError } from "./errors.ts";
 import { billFingerprint, privatePath } from "./reconciliation.ts";
+import { writeObservation } from "./write-context.ts";
 
 type Result = CallToolResult | InputRequiredResult;
 type State = "pending" | "confirmed" | "uncertain" | "notExecuted";
@@ -73,12 +74,13 @@ export class OperationJournal {
         return result;
       }
       let result: Result;
-      try { result = await action(); }
+      const observation = { sent: false };
+      try { result = await writeObservation.run(observation, action); }
       catch (error) { result = errorResult(error); }
       // The callback can contain several upstream calls. Any error or elicitation
       // after entry is conservatively uncertain, never interpreted as rollback.
       const confirmed = "content" in result && !result.isError;
-      persist(confirmed ? "confirmed" : "uncertain", result);
+      persist(confirmed ? "confirmed" : observation.sent ? "uncertain" : "notExecuted", result);
       return result;
     } finally { db.close(); }
   }

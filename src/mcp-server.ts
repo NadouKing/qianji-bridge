@@ -102,6 +102,29 @@ const writeTagIdsSchema = z.array(opaqueIdText).max(8)
 // 最多两位小数继续由 bill-rules.ts 的唯一金额校验入口保证
 const positiveMoneySchema = z.number().finite().positive().max(MAX_MONEY);
 const nonnegativeMoneySchema = z.number().finite().nonnegative().max(MAX_MONEY);
+const expectedVersionSchema = z.string().regex(/^[a-f0-9]{64}$/).describe("最新对象查询返回的版本指纹，变化时拒绝写入");
+const repeatScheduleSchema = z.strictObject({
+  type: z.union([z.literal("day").describe("每天"), z.literal("week").describe("每周指定星期"), z.literal("month").describe("每月指定日期"), z.literal("year").describe("每年指定月日"), z.literal("workday").describe("钱迹法定工作日"), z.literal("bystep").describe("每隔指定天数")]).describe("周期类型"),
+  values: z.array(z.union([z.number().int().describe("周、月或间隔天数"), z.string().describe("每年周期的 MM-DD")])).max(366).optional().describe("周为 1 至 7，月为 1 至 31，年为 MM-DD，间隔为单个 1 至 3650，day 和 workday 省略"),
+}).describe("钱迹原生周期规则，不等同于基金交易日");
+const catalogPatchIdentity = { id: z.string().min(1).max(100).describe("目录对象 ID，使用对应查询原值"), expectedVersion: expectedVersionSchema };
+const catalogCommandSchema = z.discriminatedUnion("action", [
+  z.strictObject({action: z.literal("createBook").describe("创建账本"), name: z.string().trim().min(1).max(15).describe("新账本名称，最多 15 个字符")}),
+  z.strictObject({action: z.literal("updateBook").describe("修改账本"), ...catalogPatchIdentity, name: z.string().trim().min(1).max(15).optional().describe("新账本名称"), visible: z.boolean().optional().describe("显示或隐藏，与名称分开修改")}),
+  z.strictObject({action: z.literal("createAsset").describe("创建 CNY 现金或信用账户"),
+    name: z.string().trim().min(1).max(40).describe("资产名称"), kind: z.union([z.literal("cash").describe("现金账户"), z.literal("credit").describe("信用账户")]).describe("资产类型"),
+    balance: z.number().finite().min(-MAX_MONEY).max(MAX_MONEY).describe("明确的初始余额，CNY 元，信用负债使用负数"),
+    includeInTotal: z.boolean().describe("是否计入总资产"),
+    statementDay: z.number().int().min(1).max(31).optional().describe("信用账户必填的每月账单日，1 至 31 日"),
+    paymentDay: z.number().int().min(1).max(31).optional().describe("信用账户必填的每月固定还款日，1 至 31 日"),
+  }),
+  z.strictObject({action: z.literal("updateAsset").describe("修改资产基础资料"), ...catalogPatchIdentity,
+    name: z.string().trim().min(1).max(40).optional().describe("新资产名称"), remark: z.string().max(500).optional().describe("新备注"),
+    includeInTotal: z.boolean().optional().describe("是否计入总资产"), visible: z.boolean().optional().describe("显示或隐藏，须与其他字段分开修改"),
+  }),
+  z.strictObject({action: z.literal("renameTagGroup").describe("标签组改名"), ...catalogPatchIdentity, name: z.string().trim().min(1).max(10).describe("新标签组名称，保留组内标签")}),
+  z.strictObject({action: z.literal("deleteEmpty").describe("删除无账单及周期引用的自有空账本"), ...catalogPatchIdentity, kind: z.literal("book").describe("当前只支持空账本删除")}),
+]).describe("明确的目录管理操作，修改须提供最新版本指纹");
 const currencySymbolSchema = z.string().min(1)
   .refine(isCurrencySymbol, "币种标识不能为空")
   .describe("币种标识");
@@ -666,6 +689,56 @@ export function createMoneyTrackMcp(
     { instructions: serverInstructions.trim() },
   );
   installOperationTools(server, service, () => userId(principal, store));
+
+  server.registerTool("export_bills", {
+    description: "分页导出账单摘要为 CSV 或 JSON 内容，明确返回完整性和续页游标，不写入服务器任意文件路径",
+    inputSchema: z.strictObject({format: z.union([z.literal("csv").describe("适合表格读取，保护公式及长整数 ID"), z.literal("json").describe("保留结构化摘要")]).describe("导出格式"),
+      maxRows: z.number().int().min(1).max(10000).optional().default(1000).describe("本次最大行数，可能在完整分页边界提前结束，最多 10000 行"),
+      bookId: bookIdText.optional(), allBooks: z.boolean().optional().describe("是否导出全部账本，与 bookId 互斥"),
+      startTime: z.number().int().nonnegative().optional().describe("起始时间，Unix 秒，包含边界"), endTime: z.number().int().nonnegative().optional().describe("结束时间，Unix 秒，包含边界"),
+      cursor: z.string().max(MAX_BILL_CURSOR_LENGTH).optional().describe("上次截断返回的续页游标，续页不再传账本或时间筛选"),
+    }).refine(value => !(value.allBooks && value.bookId !== undefined), "allBooks 与 bookId 互斥")
+      .refine(value => !value.cursor || [value.bookId, value.allBooks, value.startTime, value.endTime].every(v => v === undefined), "游标与筛选互斥")
+      .refine(value => value.startTime === undefined || value.endTime === undefined || value.startTime <= value.endTime, "时间范围无效"),
+    outputSchema: z.object({format: z.string().describe("输出格式"), rowCount: z.number().int().nonnegative().describe("本次实际行数"), complete: z.boolean().describe("是否已读到筛选范围末尾"), nextCursor: z.string().nullable().describe("未读完时的续页游标"), content: z.string().describe("导出内容，含私人账单信息，仅保存到私人目录")}),
+    annotations: readAnnotations,
+  }, async (input, ctx) => toolResult(async () => service.exportBills(await userId(principal, store), input), ctx, principal, bindingTickets));
+
+  server.registerTool("create_repeat_task", {
+    description: "从未来日期创建 CNY 收支、转账、还款或待报销周期任务，支持六种周期，核验可能提前生成的账单及余额",
+    inputSchema: z.strictObject({
+      type: z.union([z.literal(0).describe("支出"), z.literal(1).describe("收入"), z.literal(2).describe("转账"), z.literal(3).describe("信用卡还款"), z.literal(5).describe("待报销支出")]).describe("周期账单类型"),
+      bookId: bookIdText, fromAssetId: positiveIdText.describe("收支资金账户或转出资产 ID"), targetAssetId: positiveIdText.optional().describe("转账或还款的转入资产 ID"),
+      categoryId: positiveIdText.optional().describe("普通收支或待报销的分类 ID"),
+      money: positiveMoneySchema.describe(`每次主金额，转账包含手续费，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`每次固定手续费，仅转账或还款支持，${moneyUnitDescription}`),
+      remark: z.string().max(500).describe("周期备注"), startDate: z.iso.date().describe("上海时区未来起始日期 YYYY-MM-DD"),
+      timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).describe("上海时区记账时刻 HH:mm"), schedule: repeatScheduleSchema,
+    }),
+    outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
+  }, async (input, ctx) => toolResult(async () => ({task: await service.createRepeatTask(await userId(principal, store), input)}), ctx, principal, bindingTickets));
+  server.registerTool("update_repeat_task", {
+    description: "按最新版本修改周期金额、费用、备注、时间或频率，保留账户、历史账单和任务关联，核验余额变化",
+    inputSchema: z.strictObject({taskId: positiveIdText.describe("周期任务 ID"), expectedVersion: expectedVersionSchema,
+      patch: z.strictObject({money: positiveMoneySchema.optional().describe(`新的每次主金额，${moneyUnitDescription}`), fee: nonnegativeMoneySchema.optional().describe(`新的固定手续费，${moneyUnitDescription}`),
+        remark: z.string().max(500).optional().describe("新周期备注"), timeOfDay: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/).optional().describe("新的上海时区 HH:mm"), schedule: repeatScheduleSchema.optional(),
+      }).refine(value => Object.keys(value).length > 0, "patch 不能为空").meta({required: []}).describe("只修改明确提供的字段"),
+    }), outputSchema: z.object({task: z.record(z.string(), z.unknown()).describe("已核验周期设置、版本与本次观察到的新账单 ID")}), annotations: writeAnnotations,
+  }, async ({taskId, expectedVersion, patch}, ctx) => toolResult(async () => ({task: await service.updateRepeatTask(await userId(principal, store), taskId, expectedVersion, patch)}), ctx, principal, bindingTickets));
+
+  server.registerTool("get_catalog_object", {
+    description: "直接读取账本、资产或标签组及版本指纹，包含空标签组，用于修改前核对",
+    inputSchema: z.strictObject({ kind: z.union([z.literal("book").describe("账本"), z.literal("asset").describe("资产"), z.literal("tagGroup").describe("标签组")]).describe("对象类型"),
+      id: z.string().min(1).max(100).describe("对象原始 ID"), includeBalances: z.boolean().optional().default(false).describe("是否返回资产余额，只有明确需要时启用"),
+    }),
+    outputSchema: z.object({object: z.record(z.string(), z.unknown()).describe("公开对象字段"), version: expectedVersionSchema}),
+    annotations: readAnnotations,
+  }, async ({kind, id, includeBalances}, ctx) => toolResult(async () => service.getCatalogObject(await userId(principal, store), kind, id, includeBalances), ctx, principal, bindingTickets));
+  server.registerTool("manage_catalog_object", {
+    description: "创建账本或 CNY 现金及信用账户，修改基础资料和显示状态，标签组改名，删除自有空账本，保留余额和已有关系",
+    inputSchema: z.strictObject({ command: catalogCommandSchema }),
+    outputSchema: z.record(z.string(), z.unknown()).describe("写后核验的公开对象及版本，或已删除对象 ID"),
+    annotations: {...writeAnnotations, destructiveHint: true},
+  }, async ({command}, ctx) => toolResult(async () => service.manageCatalog(await userId(principal, store), command), ctx, principal, bindingTickets));
 
   server.registerTool("upload_bill_image", {
     description: "上传并核验单帧 PNG 或 JPEG，需启用持久回执，返回存储证明及独立的内容核验结果",

@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 
 import { AppError } from "./errors.ts";
 import { uploadImage } from "./attachments.ts";
+import { noteRemoteWrite } from "./write-context.ts";
 import {
   isCurrencySymbol,
   isOptionalPositiveLongId,
@@ -287,6 +288,33 @@ export class QianjiClient {
   async listBooks(account: QianjiAccount, includeHidden: boolean): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/book/list", { t: includeHidden ? -1 : 1 }));
     return asObjectArray(data.list).map(normalizeBook);
+  }
+
+  async submitBook(account: QianjiAccount, value: Record<string, unknown>): Promise<void> {
+    const v = JSON.stringify(value, (key, item) => key === "bookid" && typeof item === "string" && isPositiveLongId(item)
+      ? (JSON as JsonWithRaw).rawJSON(item) : item);
+    await this.authPost(account, "/book/submit", { v });
+  }
+
+  async toggleBookVisibility(account: QianjiAccount, bookId: string): Promise<void> {
+    await this.authPost(account, "/book/visible", { bookid: bookId });
+  }
+
+  async deleteEmptyBook(account: QianjiAccount, bookId: string): Promise<void> {
+    await this.authPost(account, "/book/delete", { bookid: bookId });
+  }
+
+  async listTagGroups(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/tag/list", { status: -1, lasttime: 0 }, true));
+    return asObjectArray(data.list).map(group => ({...group, id: opaqueIdText(group.id, "标签组")}));
+  }
+
+  async renameTagGroup(account: QianjiAccount, groupId: string, name: string): Promise<void> {
+    await this.authPost(account, "/tag/submitgroup", { did: groupId, v: name });
+  }
+
+  async toggleAssetVisibility(account: QianjiAccount, assetId: string): Promise<void> {
+    await this.authPost(account, "/asset/visible", { did: assetId });
   }
 
   async uploadBillImage(account: QianjiAccount, bytes: Buffer) {
@@ -751,6 +779,7 @@ export class QianjiClient {
     body: Record<string, string | number>,
     htoken = false,
   ): Promise<unknown> {
+    if (!new Set(["/client/init", "/book/list", "/book/members", "/asset/list", "/asset/info", "/asset/listloan", "/asset/typelist", "/tag/list", "/budget/list", "/category/listv2", "/category/iconlist", "/category/deletecheckv2", "/currency/listv2", "/repeat_task/list", "/installment/list", "/syncv2/pull", "/common/uploadtoken"]).has(path)) noteRemoteWrite();
     return this.post(
       path,
       { uid: account.uid, ...body, fr: account.uid },
@@ -955,6 +984,7 @@ function normalizeRepeatTask(raw: Record<string, unknown>): Record<string, unkno
   for (const key of ["bookid", "cateid", "fromid", "targetid"]) {
     // 上游省略未选择的引用，尤其转账任务不返回 cateid。
     if (!(key in data)) continue;
+    if (data[key] === null) { delete data[key]; continue; }
     // RepeatTaskData 的 cateId 默认为 0，转账任务没有分类。
     data[key] = key === "cateid" && numericText(data[key]) === "0"
       ? "0" : referenceIdText(data[key], `周期任务 ${numericText(raw.id)} ${key}=${numericText(data[key])}`);

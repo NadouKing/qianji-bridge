@@ -8,11 +8,15 @@
 
 #### 查询
 
+- 导出账单摘要使用 `export_bills`，检查 complete 和 nextCursor，截断不能称为完整导出，返回内容只保存到仓库外私人目录
+
 - 用户信息、账户本位币、VIP 状态：使用 `get_user_info`
 - 账本：使用 `list_books`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围
+- 单个账本、资产或标签组的最新字段和版本：使用 `get_catalog_object`，可查询空标签组，修改时使用其 version
 - 资产：使用 `list_assets`，已知名称片段时用不区分大小写的 `nameKeyword` 缩小范围，默认不返回余额和信用额度，只有用户明确要求查看余额或额度时才设 `includeBalances=true`
 - 借入或借出详情：使用 `list_debt_accounts`，`list_assets` 可能包含 type 5 债务记录基础资产条目，但不能替代详细信息，不要自行聚合两类响应
 - 周期记账设置：使用 `list_repeat_tasks` 查询实际任务，任务模板不代表实际扣款或投资已经发生
+- 新周期类型使用 `create_repeat_task`，任务修改使用 `update_repeat_task` 并传最新 version，当前只支持 CNY，核验本次可能提前生成的账单不代表未来调度已验证
 - 分类：使用 `list_categories`
 - 分类图标：使用 `list_category_icons`
 - 删除分类的影响评估：使用 `check_category_deletion` 取得受影响账单数量
@@ -32,6 +36,8 @@
   - 服务仅返回地址，不下载图片或执行 OCR，客户端没有图像读取能力时应说明限制
 
 #### 创建或修改
+
+- 账本、资产基础资料和标签组名称：使用 `manage_catalog_object` 的明确 command，修改前读取最新对象版本，资产修改保留余额及信用设置，显示状态与其他字段分开修改，当前创建资产支持 CNY 现金和信用账户
 
 - 附件：先用 `upload_bill_image` 上传并取得内容核验通过的回执，再用 `set_bill_images` 按上传请求号关联，append 保留旧图，replace 完整替换，必须明确用户希望替换时才使用 replace
 - 上传返回存储证明不等于 CDN 内容已核验，只有 pixelsVerified=true 的本账号上传回执可关联，失败时查询原请求，不重传图片或猜测对象键

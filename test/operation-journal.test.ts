@@ -7,6 +7,7 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 import { OperationJournal } from "../src/operation-journal.ts";
 import { AppError } from "../src/errors.ts";
 import test from "./context.ts";
+import { noteRemoteWrite } from "../src/write-context.ts";
 
 const result: CallToolResult = { content: [{ type: "text", text: '{"id":"fixture"}' }], structuredContent: { id: "fixture" } };
 const noop = async () => {};
@@ -32,6 +33,7 @@ test("uncertain and partial results stop all new writes, and status never retrie
   const journal = new OperationJournal(root);
   let writes = 0;
   await journal.execute("uid", "partial", "create_bills", {}, noop, async () => {
+    noteRemoteWrite();
     writes++;
     return { isError: true, content: [{ type: "text", text: "WRITE_PARTIAL" }] };
   });

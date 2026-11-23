@@ -3,6 +3,66 @@ import { Store } from "../src/data-store.ts";
 import { QianjiClient, parseQianjiJson } from "../src/qianji-client.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
 import test from "./context.ts";
+import { repeatSchedule } from "../src/repeat-tasks.ts";
+
+test("six repeat schedules validate boundaries and reject invalid calendar dates", () => {
+  assert.deepEqual(repeatSchedule({type: "month", values: [31, 1]}), {type: "month", value: [1, 31]});
+  assert.deepEqual(repeatSchedule({type: "year", values: ["02-29"]}), {type: "year", value: ["02-29"]});
+  for (const type of ["day", "workday"] as const) assert.deepEqual(repeatSchedule({type}), {type, value: null});
+  assert.deepEqual(repeatSchedule({type: "bystep", values: [3]}), {type: "bystep", value: [3]});
+  for (const schedule of [{type: "week", values: [0]}, {type: "month", values: [32]}, {type: "year", values: ["02-30"]}, {type: "workday", values: [1]}, {type: "week", values: [1, 1]}] as const) {
+    assert.throws(() => repeatSchedule({type: schedule.type, values: [...schedule.values]}), /周期参数/);
+  }
+});
+
+test("repeat create and edit preserve task identity, reject stale versions and verify historical bills and balances", async t => {
+  const now = Date.parse("2026-01-01T12:00:00+08:00");
+  const store = new Store(":memory:"); t.after(() => store.close());
+  const pat = store.createPat("fixture", null), account = store.bindPat(pat.id, "uid", "token", "device");
+  const assets = [{id: "101", userid: "uid", type: 1, money: 100, currency: "CNY"}, {id: "102", userid: "uid", type: 4, money: 0, currency: "CNY"}];
+  store.setUserCache(account.id, {id: "uid", viptype: -1, __baseCurrency: "CNY"}, now);
+  store.setCatalogCache(account.id, "books", "", [{bookid: "1", name: "fixture", visible: 1}], now);
+  store.setCatalogCache(account.id, "assets", "", assets, now);
+  store.setCatalogCache(account.id, "categories", "1", [{id: "2", type: 0, bookid: "1", name: "fixture"}], now);
+  store.setCatalogCache(account.id, "tags", "", [], now);
+  const tasks: Record<string, unknown>[] = [];
+  const history = {id: "170000000000000001", bookid: "1", userid: "uid", type: 0, time: 1700000000, createtime: 1700000000, updatetime: 1700000000, money: 1, cateid: "2", assetid: "101", remark: "history", images: ["old"]};
+  let writes = 0;
+  const client = new QianjiClient({fetch: async (url, init) => {
+    const path = new URL(String(url)).pathname, form = new URLSearchParams(String(init?.body));
+    let data: unknown;
+    if (path === "/repeat_task/list") data = {list: tasks};
+    else if (path === "/tag/list") data = {list: []};
+    else if (path === "/asset/list") data = {list: assets};
+    else if (path === "/syncv2/pull") data = {changes: [history], deletes: [], categories: [], bookid: -1, pageoffset: 0, hasmore: 0, pagesign: "", lasttimes: {cursor: writes}};
+    else if (path === "/repeat_task/submit") {
+      writes++;
+      const row = parseQianjiJson(form.get("v")!) as Record<string, unknown>;
+      if ((row.data as Record<string, unknown>).time === "21:00") history.remark = "unexpected historical modification";
+      const id = row.id === undefined ? String(18000000 + tasks.length) : String(row.id);
+      const old = tasks.find(task => String(task.id) === id);
+      const next = {...row, id, status: old?.status ?? 1, count: old?.count ?? 0, packid: old?.packid ?? 1700000001};
+      if (old) Object.assign(old, next); else tasks.push(next);
+      data = {task: next};
+    } else throw new Error(path);
+    return Response.json({ec: 200, data});
+  }});
+  const service = new MoneyTrackService(store, client, () => now);
+  const created = await service.createRepeatTask(account.id, {type: 2, bookId: "1", fromAssetId: "101", targetAssetId: "102", money: 10, fee: 0.03, remark: "fixture", startDate: "2026-01-02", timeOfDay: "09:00", schedule: {type: "week", values: [1,2,3,4,5]}});
+  assert.equal(created.money, 10); assert.equal(created.fee, 0.03);
+  let version = created.version;
+  for (const timeOfDay of ["23:59", "09:00", "22:00"]) {
+    const changed = await service.updateRepeatTask(account.id, String(created.id), version, {timeOfDay, money: 20, fee: 0.04});
+    assert.equal(changed.id, created.id); assert.equal(changed.money, 20); assert.equal(changed.fee, 0.04);
+    assert.equal(changed.timeOfDay, timeOfDay); assert.deepEqual(changed.generatedBillIds, []);
+    version = changed.version;
+  }
+  const before = writes;
+  await assert.rejects(service.updateRepeatTask(account.id, String(created.id), created.version, {remark: "stale"}), /已变化/);
+  assert.equal(writes, before);
+  assert.deepEqual(assets.map(row => row.money), [100, 0]);
+  await assert.rejects(service.updateRepeatTask(account.id, String(created.id), version, {timeOfDay: "21:00"}), /历史账单发生变化/);
+});
 
 test("周期任务读取完整目录，创建含费用的转账模板，暂停后回读且不创建历史账单", async () => {
   const now = Date.parse("2026-01-04T12:00:00+08:00");
