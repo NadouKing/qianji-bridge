@@ -59,6 +59,8 @@ bun run reconcile details --ids '<账单ID>,<账单ID>' --fresh --output "$priva
 
 候选报告不会自动生成写入计划。用户明确授权后，单独准备包含账号、账本和操作的私人计划；执行前仍需核实用途、账户、分类和重复账目。
 
+当前 `apply --apply` 不会根据计划自动传入服务端 `requestId` 和 `expectedBills`。启用 `QIANJI_MCP_OPERATIONS_ROOT` 后仍可用 CLI 导入、查询和匹配。需要记账时，请使用支持服务端回执协议的 MCP 客户端，按[稳定请求号、附件和对象版本](usage.md#稳定请求号附件和对象版本)调用正式工具，保留服务端防重配置。
+
 计划格式示例（均为虚构值）：
 
 ```json
