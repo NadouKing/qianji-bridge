@@ -629,7 +629,6 @@ test("普通 PAT 使用 2026-07-28 并取得当前业务工具契约", async (t)
   assert.equal(schemaNode(vipBranch, "registrationMethod").anyOf, undefined);
   assert.deepEqual(nonVipBranch.required, [
     "id", "name", "avatar", "registeredAt", "vipType", "vipStart", "vipEnd", "baseCurrency", "isVip",
-    "dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining", "dailyWriteResetsAt",
   ]);
   assert.deepEqual(
     schemaNode(tools.find(({ name }) => name === "update_bills")?.inputSchema, "updates", "items", "patch").required,
