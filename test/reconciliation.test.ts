@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { checkWriteScope, main } from "../src/reconcile-cli.ts";
+import { applyWritePlan, checkWriteScope, main } from "../src/reconcile-cli.ts";
 import {
   billFingerprint, executeJournal, OperationFailure, planHash, planSchema, privatePath, proposeMatches, rulesSchema,
   type SourceRecord, type LedgerBill,
@@ -67,6 +67,36 @@ test("journal resumes confirmed operations but stops on partial or uncertain res
   assert.deepEqual(saved.operations[1].failure.completed, [1]);
   await assert.rejects(executeJournal(plan, path, async () => { calls++; return {}; }), /uncertain/);
   assert.equal(calls, 2);
+});
+
+test("CLI keeps legacy writes local and stops on an unresolved server receipt", async t => {
+  const dir = await directory(t);
+  const applied: Record<string, unknown>[] = [];
+  let configured = false;
+  let dispatchedId: unknown;
+  const call = async (tool: string, args: Record<string, unknown>) => {
+    if (tool === "get_user_info") return { user: { id: plan.accountUid } };
+    if (tool === "refresh_cache") return {};
+    if (tool === "get_operation_status") {
+      if (!configured) throw new OperationFailure({ isError: true, content: [{ type: "text", text: '{"error":{"code":"OPERATIONS_NOT_CONFIGURED"}}' }] });
+      return { operation: { requestId: args.requestId, state: args.requestId === dispatchedId ? "uncertain" : "notFound" } };
+    }
+    applied.push(args);
+    if (configured) {
+      dispatchedId = args.requestId;
+      throw new Error("No response");
+    }
+    return { bills: [] };
+  };
+  const legacy = join(dir, "legacy.json");
+  assert.equal((await applyWritePlan(plan, legacy, call, true)).confirmed, 2);
+  assert.deepEqual(applied, plan.operations.map(operation => operation.arguments));
+
+  configured = true;
+  const current = join(dir, "current.json");
+  await assert.rejects(applyWritePlan(plan, current, call, true), /stopped without retry/);
+  await assert.rejects(applyWritePlan(plan, current, call, true), /uncertain result/);
+  assert.equal(applied.length, 3);
 });
 
 test("journal rejects changed plans and overlapping runners; successful reruns perform zero calls", async t => {

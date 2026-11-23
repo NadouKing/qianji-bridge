@@ -163,9 +163,14 @@ function canonical(value: unknown): string {
 }
 export function planHash(plan: WritePlan) { return createHash("sha256").update(canonical(plan)).digest("hex"); }
 export function billFingerprint(bill: unknown) { return createHash("sha256").update(canonical(bill)).digest("hex"); }
+type PlanOperation = WritePlan["operations"][number];
 interface Journal {
   version: 1; hash: string; batchId: string;
-  operations: Array<{ id: string; status: "pending" | "confirmed" | "uncertain"; result?: unknown; failure?: unknown }>;
+  operations: Array<{ id: string; requestId?: string; status: "pending" | "confirmed" | "uncertain"; result?: unknown; failure?: unknown }>;
+}
+export interface ServerReceipts {
+  prepare(operation: PlanOperation): { requestId: string; arguments: Record<string, unknown> };
+  confirmedResult(requestId: string, operation: PlanOperation): Promise<Record<string, unknown> | undefined>;
 }
 export class OperationFailure extends Error {
   readonly detail: unknown;
@@ -176,6 +181,7 @@ export async function executeJournal(
   plan: WritePlan, path: string,
   execute: (tool: string, args: Record<string, unknown>) => Promise<unknown>,
   beforeExecute?: (remaining: WritePlan) => Promise<void>,
+  receipts?: ServerReceipts,
 ) {
   const target = await privatePath(path);
   const databasePath = await privatePath(target + ".sqlite");
@@ -196,10 +202,8 @@ export async function executeJournal(
       journal = JSON.parse(stored?.payload ?? await readFile(target, "utf8")) as Journal;
       if (journal.version !== 1 || journal.hash !== planHash(plan) || journal.batchId !== plan.batchId) throw new Error("Journal does not match plan");
       if (!Array.isArray(journal.operations) || journal.operations.some((entry, i) =>
-        entry.id !== plan.operations[i]?.id || entry.status !== "confirmed")) {
-        throw new Error("Batch has an uncertain result; reconcile the remote ledger before any further write");
-      }
-      if (journal.operations.length > plan.operations.length) throw new Error("Invalid journal");
+        entry.id !== plan.operations[i]?.id || (entry.status !== "confirmed" &&
+          (i !== journal.operations.length - 1 || !["pending", "uncertain"].includes(entry.status))))) throw new Error("Invalid journal");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       journal = { version: 1, hash: planHash(plan), batchId: plan.batchId, operations: [] };
@@ -209,16 +213,29 @@ export async function executeJournal(
         .run(JSON.stringify(journal));
       await writePrivateJson(target, journal, true);
     };
+    const previous = journal.operations.at(-1);
+    if (previous && previous.status !== "confirmed") {
+      const recovered = previous.requestId && receipts &&
+        await receipts.confirmedResult(previous.requestId, plan.operations[journal.operations.length - 1]!);
+      if (!recovered) throw new Error("Batch has an uncertain result; reconcile the remote ledger before any further write");
+      previous.result = recovered;
+      previous.status = "confirmed";
+      delete previous.failure;
+    }
     await persist();
     const remaining = plan.operations.slice(journal.operations.length);
+    if (remaining.length && !receipts && journal.operations.some(entry => entry.requestId)) {
+      throw new Error("Server receipts are unavailable; continue this batch on its original service");
+    }
     // Hold the same lock while checking only work that has not already succeeded.
     await beforeExecute?.({ ...plan, operations: remaining });
     for (const operation of remaining) {
-      const entry: Journal["operations"][number] = { id: operation.id, status: "pending" };
+      const request = receipts?.prepare(operation);
+      const entry: Journal["operations"][number] = { id: operation.id, status: "pending", ...(request && { requestId: request.requestId }) };
       journal.operations.push(entry);
       await persist();
       try {
-        entry.result = await execute(operation.tool, operation.arguments);
+        entry.result = await execute(operation.tool, request?.arguments ?? operation.arguments);
         entry.status = "confirmed";
         await persist();
       } catch (error) {

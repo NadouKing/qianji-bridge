@@ -36,7 +36,7 @@ export function installOperationTools(server: McpServer, service: MoneyTrackServ
     description: "只读查询原请求的持久回执，不重发写入，notFound 不证明原调用已结束",
     inputSchema: z.strictObject({ requestId }),
     outputSchema: z.object({ operation: z.object({
-      requestId, state: z.enum(["notFound", "pending", "confirmed", "uncertain", "notExecuted", "reviewed"]).describe("持久状态，pending 或 uncertain 不表示写入失败，reviewed 表示经专用复核关闭但保留原失败回执"),
+      requestId, state: z.enum(["notFound", "pending", "confirmed", "uncertain", "notExecuted", "reviewed", "awaitingConfirmation"]).describe("持久状态，awaitingConfirmation 表示钱迹要求确认报销迁移，pending 或 uncertain 仍需核实，reviewed 表示经专用复核关闭"),
       tool: z.string().optional().describe("原工具名称"),
       updatedAt: z.number().int().optional().describe("回执更新时间，Unix 秒"),
       result: z.unknown().optional().describe("原工具回执，可能包含部分成功或未核实错误"),

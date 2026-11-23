@@ -3,9 +3,10 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { z } from "zod";
+import { operationErrorCode } from "./errors.ts";
 import {
   billFingerprint, executeJournal, importSchema, OperationFailure, planHash, planSchema, privatePath, proposeMatches,
-  rulesSchema, writePrivateJson, type LedgerBill, type WritePlan,
+  rulesSchema, writePrivateJson, type LedgerBill, type ServerReceipts, type WritePlan,
 } from "./reconciliation.ts";
 
 const billSchema = z.object({
@@ -59,7 +60,7 @@ function day(value: string, end = false) {
   return time / 1000 + (end ? 86399 : 0);
 }
 const load = async (path: string): Promise<unknown> => JSON.parse(await readFile(path, "utf8"));
-async function connect<T>(operation: (call: Call) => Promise<T>) {
+async function connect<T>(operation: (call: Call, names: ReadonlySet<string>) => Promise<T>) {
   const base = process.env.QIANJI_MCP_URL ?? process.env.QIANJI_MCP_PUBLIC_URL;
   const token = process.env.QIANJI_MCP_PAT;
   if (!base || !token) throw new Error("Configure QIANJI_MCP_URL and QIANJI_MCP_PAT");
@@ -85,7 +86,7 @@ async function connect<T>(operation: (call: Call) => Promise<T>) {
       if (!data || typeof data !== "object") throw new Error("MCP returned no structured result");
       return data as Record<string, unknown>;
     };
-    return await operation(call);
+    return await operation(call, names);
   } finally { await client.close(); }
 }
 
@@ -103,6 +104,10 @@ function references(value: unknown, ids = new Set<string>(), books = new Set<str
 export async function checkWriteScope(plan: WritePlan, call: Call) {
   const user = (await call("get_user_info", {})).user as { id?: string } | undefined;
   if (user?.id !== plan.accountUid) throw new Error("Plan belongs to another account");
+  await checkRemainingWrites(plan, call);
+}
+
+async function checkRemainingWrites(plan: WritePlan, call: Call) {
   if (plan.operations.length === 0) return;
   const { ids, books } = references(plan.operations);
   const expected = new Map(plan.expectedBills.map(b => [b.billId, b.hash]));
@@ -123,16 +128,78 @@ export async function checkWriteScope(plan: WritePlan, call: Call) {
   const allIds = [...ids];
   for (let i = 0; i < allIds.length; i += 100) {
     const result = await call("get_bills", { billIds: allIds.slice(i, i + 100) });
-    const parsed = z.array(z.object({ billId: z.string(), bill: billSchema.nullable() })).parse(result.results);
+    const parsed = billDetails.parse(result.results);
     const requested = allIds.slice(i, i + 100);
     if (parsed.length !== requested.length || parsed.some((r, index) =>
-      r.billId !== requested[index] || !r.bill || !plan.bookIds.includes(r.bill.bookId))) {
+      r.billId !== requested[index] || typeof r.bill?.bookId !== "string" || !plan.bookIds.includes(r.bill.bookId))) {
       throw new Error("Source bill missing or outside allowed books");
     }
-    for (const row of parsed) if (billFingerprint(row.bill) !== expected.get(row.billId)) {
+    for (const row of parsed) if (detailFingerprint(row) !== expected.get(row.billId)) {
       throw new Error("A reviewed bill changed; refresh details and review the plan again");
     }
   }
+}
+
+const billDetails = z.array(z.object({
+  billId: z.string(), bill: z.record(z.string(), z.unknown()).nullable(), fingerprint: z.string().regex(/^[a-f0-9]{64}$/).nullish(),
+}));
+const detailFingerprint = (row: z.infer<typeof billDetails>[number]) => row.fingerprint ?? (row.bill ? billFingerprint(row.bill) : null);
+
+const receiptStatus = z.object({
+  requestId: z.string(), state: z.string(), tool: z.string().optional(),
+  result: z.object({ structuredContent: z.record(z.string(), z.unknown()).optional(), isError: z.boolean().optional() }).nullish(),
+});
+const receiptRequestId = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
+const receiptExpectedBills = z.array(z.strictObject({
+  billId: z.string().regex(/^[1-9]\d*$/), hash: z.string().regex(/^[a-f0-9]{64}$/),
+})).max(100);
+
+export async function applyWritePlan(plan: WritePlan, journal: string, call: Call, hasStatusTool: boolean) {
+  await checkWriteScope({ ...plan, operations: [] }, call);
+  const reviewedPlanHash = planHash(plan);
+  const generatedRequestId = (operation: WritePlan["operations"][number]) =>
+    "reconcile-" + billFingerprint([reviewedPlanHash, operation.id]);
+  const status = async (requestId: string) => {
+    const receipt = receiptStatus.parse((await call("get_operation_status", { requestId })).operation);
+    if (receipt.requestId !== requestId) throw new Error("Server receipt does not match the original request");
+    return receipt;
+  };
+  let receipts: ServerReceipts | undefined;
+  if (hasStatusTool) {
+    try {
+      await status(generatedRequestId(plan.operations[0]!));
+      const reviewed = new Map(plan.expectedBills.map(row => [row.billId, row.hash]));
+      const prepared = new Map(plan.operations.map(operation => {
+        const { requestId: suppliedId, expectedBills: supplied, ...args } = operation.arguments;
+        const { ids } = references(args);
+        const requestId = suppliedId === undefined ? generatedRequestId(operation) : receiptRequestId.parse(suppliedId);
+        const expectedBills = supplied === undefined
+          ? plan.expectedBills.filter(row => ids.has(row.billId)) : receiptExpectedBills.parse(supplied);
+        const expected = new Map(expectedBills.map(row => [row.billId, row.hash]));
+        if (expected.size !== expectedBills.length || expectedBills.some(row => reviewed.get(row.billId) !== row.hash) ||
+            [...ids].some(id => !expected.has(id))) {
+          throw new Error("Operation fingerprints must match the reviewed plan and cover all referenced bills");
+        }
+        return [operation.id, { requestId, arguments: { ...args, requestId, expectedBills } }] as const;
+      }));
+      if (new Set([...prepared.values()].map(request => request.requestId)).size !== prepared.size) {
+        throw new Error("Each operation must have a distinct server request ID");
+      }
+      receipts = {
+        prepare: operation => prepared.get(operation.id)!,
+        confirmedResult: async (requestId, operation) => {
+          // An externally chosen ID can also belong to a different payload of the same tool.
+          if (requestId !== generatedRequestId(operation)) return undefined;
+          const receipt = await status(requestId);
+          return receipt.state === "confirmed" && receipt.tool === operation.tool && !receipt.result?.isError
+            ? receipt.result?.structuredContent : undefined;
+        },
+      };
+    } catch (error) {
+      if (!(error instanceof OperationFailure) || operationErrorCode(error.detail) !== "OPERATIONS_NOT_CONFIGURED") throw error;
+    }
+  }
+  return executeJournal(plan, journal, call, remaining => checkRemainingWrites(remaining, call), receipts);
 }
 
 export async function main(args: string[]) {
@@ -196,9 +263,9 @@ export async function main(args: string[]) {
     if (ids.length > 100 || ids.some(id => !/^[1-9]\d*$/.test(id))) throw new Error("Provide 1-100 valid bill IDs");
     await connect(async call => {
       const result = await call("get_bills", { billIds: ids, refresh: opts.has("fresh") });
-      const parsed = z.array(z.object({ billId: z.string(), bill: z.record(z.string(), z.unknown()).nullable() })).parse(result.results);
+      const parsed = billDetails.parse(result.results);
       await writePrivateJson(output, { ...result, results: parsed.map(row =>
-        ({ ...row, fingerprint: row.bill ? billFingerprint(row.bill) : null })) });
+        ({ ...row, fingerprint: detailFingerprint(row) })) });
       console.log(JSON.stringify({ requested: ids.length }));
     });
   } else if (command === "apply") {
@@ -208,8 +275,8 @@ export async function main(args: string[]) {
       return;
     }
     const journal = await privatePath(opts.require("journal"));
-    await connect(async call => {
-      console.log(JSON.stringify(await executeJournal(plan, journal, call, remaining => checkWriteScope(remaining, call))));
+    await connect(async (call, names) => {
+      console.log(JSON.stringify(await applyWritePlan(plan, journal, call, names.has("get_operation_status"))));
     });
   } else throw new Error("Unknown command; use --help");
 }

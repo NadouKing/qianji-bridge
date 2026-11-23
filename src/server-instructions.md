@@ -46,12 +46,11 @@
 - 普通收支：创建使用 `create_bills` 的 `bills`，修改使用 `update_bills` 的 `updates`，即使只操作一笔，也传入只有一项的列表，修改按 `billId` 定位原账单，不传 `type`，只在用户要求时通过 `reimbursable` 切换普通支出与待报销支出
 - 转账或信用卡还款：创建使用 `create_transfer`，修改使用 `update_transfer`，修改按 `billId` 定位单笔账单，只在用户要求改变场景时传 `creditRepayment`，同一次修改可以同时提交最终场景、金额和双边资产
 - 退款：创建使用 `create_refund`，修改使用 `update_refund`，修改按 `refundBillId` 定位单笔退款，不传源账单 ID
-- 报销：创建使用 `reimburse_bills`，只传源账单列表和本次总金额，单条报销入账删除使用 `delete_reimbursement`，按源账单取消全部报销关系使用 `cancel_reimbursements`
+- 报销：创建使用 `reimburse_bills`，提供源账单列表和本次总金额，单条报销入账删除使用 `delete_reimbursement`，按源账单取消全部报销关系使用 `cancel_reimbursements`
   1. 首次调用提示迁移新版报销时，告知用户迁移后旧版本将不能继续使用报销
-  2. 取得明确同意后，未启用服务端持久回执时，用相同业务参数将 `confirmReimbursementUpgrade` 设为 `true` 重试
+  2. 取得明确同意后，保留相同业务参数，仅将 `confirmReimbursementUpgrade` 设为 `true`。启用持久回执时，沿用原 `requestId` 和 `expectedBills`，先用 `get_operation_status` 确认 `awaitingConfirmation` 或旧回执中明确的迁移提示
   3. 不得预先同意，服务器只在钱迹明确要求时迁移并只重试一次
-  4. 迁移完成但报销失败时，只处理失败原因，不得再次迁移
-  5. 启用持久回执时，首次迁移提示可能留下 `uncertain` 并阻止继续写入。先查原回执及实际账目，记录阻塞。同号改参数会冲突，不能换号或移除回执绕过门禁
+  4. 迁移完成但报销结果未确认时，先查原请求及实际账目，不得再次迁移
 
 退款和报销必须使用专用工具，不得自行构造账单关联关系。
 
@@ -80,9 +79,9 @@
 
 ### 异常恢复
 
-服务启用私人操作回执目录后，为每个业务请求保留稳定的 `requestId`。修改或关联已有账单时，将 `get_bills` 返回的 `fingerprint` 填入 `expectedBills` 的 `hash`，并附 `billId`。目录、周期、借贷或分期工具需要 `expectedVersion` 时，使用相应查询返回的 `version`。同号改参数会被拒绝。服务端是否提供持久防重取决于该部署的配置。
+服务启用私人操作回执目录后，为每个业务请求保留稳定的 `requestId`。修改或关联已有账单时，将 `get_bills` 返回的 `fingerprint` 填入 `expectedBills` 的 `hash`，并附 `billId`。目录、周期、借贷或分期工具需要 `expectedVersion` 时，使用相应查询返回的 `version`。原号只接受相同参数，报销迁移确认按上面的规则继续。服务端是否提供持久防重取决于该部署的配置。
 
-- `get_operation_status` 只读查询原请求回执，`confirmed` 表示原调用已确认，`notExecuted` 表示未执行，`reviewed` 表示已通过专用复核关闭且保留原失败回执。用实际账目判断当前状态
+- `get_operation_status` 只读查询原请求回执，`confirmed` 表示原调用已确认，`awaitingConfirmation` 表示钱迹明确要求报销迁移，`notExecuted` 表示未执行，`reviewed` 表示已通过专用复核关闭且保留原失败回执。用实际账目判断当前状态
 - `pending`、`uncertain` 或 `notFound` 时先核查实际对象，不换号重发或删除回执。专用 `verify_*` 工具会修改本地回执状态，且只适用于各自说明的已结束请求
 - 操作记录协调共用私人目录的单机服务进程，仍需防范官方 App 或其他设备同时修改
 
