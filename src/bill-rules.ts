@@ -479,6 +479,8 @@ function positiveRelationshipValue(value: unknown): boolean {
   return isPositiveLongId(text);
 }
 
+export const MAX_REFUNDS_PER_SOURCE_BILL = 25;
+
 /** 校验退款场景、源分类和创建时的条数上限。 */
 export function validateRefundSource(source: Record<string, unknown>, enforceCountLimit: boolean): void {
   if (![0, 5].includes(Number(source.type))) {
@@ -488,8 +490,8 @@ export function validateRefundSource(source: Record<string, unknown>, enforceCou
     throw new AppError("REFUND_SOURCE_CATEGORY_MISSING", "退款源账单缺少有效分类");
   }
   const refunds = refundRelationshipMap(source);
-  if (enforceCountLimit && refunds.size >= 25) {
-    throw new AppError("REFUND_COUNT_LIMIT_REACHED", "同一源账单最多关联 25 条退款");
+  if (enforceCountLimit && refunds.size >= MAX_REFUNDS_PER_SOURCE_BILL) {
+    throw new AppError("REFUND_COUNT_LIMIT_REACHED", `同一源账单最多关联 ${MAX_REFUNDS_PER_SOURCE_BILL} 条退款`);
   }
 }
 

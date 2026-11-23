@@ -3810,6 +3810,12 @@ function encodeAdvancedCursor(cursor: AdvancedCursorPayload): string {
   return `c3_${Buffer.from(JSON.stringify(cursor)).toString("hex")}`;
 }
 
+/** Do not log SyntaxError.message: runtimes may include private cursor contents. */
+function invalidCursor(error: unknown): AppError {
+  if (error instanceof SyntaxError) console.error("账单分页游标解析失败：INVALID_CURSOR_JSON");
+  return new AppError("INVALID_CURSOR", "账单分页游标无效");
+}
+
 function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursorPayload {
   try {
     if (cursor.length > MAX_BILL_CURSOR_LENGTH) throw new Error();
@@ -3822,8 +3828,8 @@ function decodeAdvancedCursor(cursor: string, accountId: number): AdvancedCursor
       !validAdvancedCursorFilters(value.filters)
     ) throw new Error();
     return { ...value, filters: normalizeAdvancedBillFilters(value.filters) } as AdvancedCursorPayload;
-  } catch {
-    throw new AppError("INVALID_CURSOR", "账单分页游标无效");
+  } catch (error) {
+    throw invalidCursor(error);
   }
 }
 
@@ -3862,8 +3868,8 @@ function decodeCursor(cursor: string, accountId: number): CursorPayload {
       throw new Error();
     }
     return value as CursorPayload;
-  } catch {
-    throw new AppError("INVALID_CURSOR", "账单分页游标无效");
+  } catch (error) {
+    throw invalidCursor(error);
   }
 }
 

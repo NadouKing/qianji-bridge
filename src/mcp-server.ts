@@ -30,6 +30,7 @@ import {
   MAX_BILL_CURSOR_LENGTH,
   MAX_CATEGORY_NAME_LENGTH,
   MAX_MONEY,
+  MAX_REFUNDS_PER_SOURCE_BILL,
   MAX_SEARCH_KEYWORD_LENGTH,
   MAX_TAG_NAME_LENGTH,
   TAG_COLOR_PATTERN,
@@ -1343,7 +1344,7 @@ export function createMoneyTrackMcp(
   server.registerTool(
     "create_refund",
     {
-      description: "为普通支出或待报销支出创建退款账单，同一源账单最多关联 25 条退款",
+      description: `为普通支出或待报销支出创建退款账单，同一源账单最多关联 ${MAX_REFUNDS_PER_SOURCE_BILL} 条退款`,
       inputSchema: z.strictObject({
         sourceBillId: positiveIdText.describe("退款源账单 ID"),
         ...refundFields,
