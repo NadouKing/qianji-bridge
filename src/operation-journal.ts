@@ -3,12 +3,12 @@ import { createHash } from "node:crypto";
 import { chmodSync, closeSync, existsSync, openSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
-import { AppError, safeError } from "./errors.ts";
+import { AppError, operationErrorCode, safeError } from "./errors.ts";
 import { billFingerprint, privatePath } from "./reconciliation.ts";
 import { writeObservation } from "./write-context.ts";
 
 type Result = CallToolResult | InputRequiredResult;
-type State = "pending" | "confirmed" | "uncertain" | "notExecuted" | "reviewed";
+type State = "pending" | "confirmed" | "uncertain" | "notExecuted" | "reviewed" | "awaitingConfirmation";
 interface Row { request_id: string; tool: string; hash: string; state: State; result: string | null; updated_at: number }
 export interface ExpectedBill { billId: string; hash: string }
 
@@ -43,10 +43,7 @@ export class OperationJournal {
   private checkRejection(row: Row | null, tool: string, args: unknown) {
     if (!row || row.tool!==tool || row.hash!==billFingerprint({tool,args})) throw new AppError("REQUEST_ID_CONFLICT","原请求工具、参数或账单指纹不一致");
     if (!["set_bill_images","update_bills","update_transfer"].includes(tool) || row.state!=="uncertain") throw new AppError("OPERATION_REVIEW_UNSUPPORTED","仅能复核已结束且被明确拒绝的普通账单修改");
-    const result=JSON.parse(row.result??"null") as CallToolResult | null;
-    let code: unknown;
-    try { const text=result?.content?.find(item=>item.type==="text");code=text?.type==="text" ? JSON.parse(text.text).error?.code:undefined; } catch { /* Not a recognised terminal rejection. */ }
-    if (!result?.isError || code!=="WRITE_FAILED") throw new AppError("OPERATION_REVIEW_UNSUPPORTED","超时、部分成功或未知错误不能自动解除门禁");
+    if (operationErrorCode(JSON.parse(row.result ?? "null")) !== "WRITE_FAILED") throw new AppError("OPERATION_REVIEW_UNSUPPORTED","超时、部分成功或未知错误不能自动解除门禁");
   }
 
   async assertExplicitRejection(uid: string, requestId: string, tool: string, args: unknown) {
@@ -68,18 +65,12 @@ export class OperationJournal {
     }).immediate();} finally {db.close();}
   }
 
-  async completedRepeatCreation(uid: string, requestId: string, args: unknown) {
-    return this.completedCreation(uid,requestId,"create_repeat_task",args);
-  }
-
   async completedCreation(uid: string, requestId: string, tool: "create_repeat_task" | "manage_debt", args: unknown) {
     const db=new Database(await privatePath(this.path(uid)),{readonly:true,strict:true});
     try {
       const row=db.query<Row,[string]>("SELECT * FROM operations WHERE request_id=?").get(requestId);
       if (!row || row.tool!==tool || row.hash!==billFingerprint({tool:row.tool,args})) throw new AppError("REQUEST_ID_CONFLICT","原创建请求参数不一致");
-      let code:unknown;
-      try {code=JSON.parse(JSON.parse(row.result!).content[0].text).error.code;}catch{}
-      if(row.state!=="uncertain" || code!=="WRITE_CONFIRMATION_FAILED") throw new AppError("OPERATION_REVIEW_UNSUPPORTED","只能复核创建接口已返回但回读未确认的请求，不处理超时或仍执行中的请求");
+      if(row.state!=="uncertain" || operationErrorCode(JSON.parse(row.result ?? "null"))!=="WRITE_CONFIRMATION_FAILED") throw new AppError("OPERATION_REVIEW_UNSUPPORTED","只能复核创建接口已返回但回读未确认的请求，不处理超时或仍执行中的请求");
       return {hash:row.hash,updatedAt:row.updated_at};
     }finally{db.close();}
   }
@@ -98,7 +89,7 @@ export class OperationJournal {
   }
 
   async execute(uid: string, requestId: string, tool: string, args: unknown,
-    preflight: () => Promise<void>, action: () => Promise<Result>): Promise<Result> {
+    preflight: () => Promise<void>, action: () => Promise<Result>, reimbursementBeforeConfirmation?: unknown): Promise<Result> {
     if (!/^[A-Za-z0-9_-]{1,100}$/.test(requestId)) throw new AppError("INVALID_REQUEST_ID", "请求号格式无效");
     const path = await privatePath(this.path(uid));
     try { closeSync(openSync(path, "wx", 0o600)); }
@@ -111,14 +102,25 @@ export class OperationJournal {
     try {
       const existing = db.transaction(() => {
         const old = db.query<Row, [string]>("SELECT * FROM operations WHERE request_id=?").get(requestId);
-        if (old) {
+        // Older versions recorded this explicit rejection as uncertain. Require the exact
+        // old payload and response before allowing that same request to continue.
+        const resume = old?.tool === "reimburse_bills" && tool === old.tool && reimbursementBeforeConfirmation !== undefined &&
+          old.hash === billFingerprint({ tool, args: reimbursementBeforeConfirmation }) &&
+          (old.state === "awaitingConfirmation" || (old.state === "uncertain" &&
+            operationErrorCode(JSON.parse(old.result ?? "null")) === "QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED"));
+        if (old && !resume) {
           if (old.hash !== hash || old.tool !== tool) throw new AppError("REQUEST_ID_CONFLICT", "请求号已用于不同内容，禁止覆盖原回执");
-          if (old.state === "confirmed" || old.state === "notExecuted" || old.state === "reviewed") return JSON.parse(old.result!) as Result;
+          if (old.state === "confirmed" || old.state === "notExecuted" || old.state === "reviewed" || old.state === "awaitingConfirmation") return JSON.parse(old.result!) as Result;
           throw new AppError("OPERATION_UNCERTAIN", "原请求仍在执行或结果待核实，请查询原请求状态，不得换号重发");
         }
-        const pending = db.query("SELECT 1 FROM operations WHERE state IN ('pending','uncertain') LIMIT 1").get();
+        if (reimbursementBeforeConfirmation !== undefined && !resume) {
+          throw new AppError("REIMBURSEMENT_CONFIRMATION_REQUIRED", "先查询原报销请求的迁移提示，经用户确认后沿用原请求号继续");
+        }
+        const pending = db.query("SELECT 1 FROM operations WHERE request_id <> ? AND state IN ('pending','uncertain') LIMIT 1").get(requestId);
         if (pending) throw new AppError("ACCOUNT_OPERATION_PENDING", "当前账号有待核实写入，先核实原请求，不发送新写入");
-        db.query("INSERT INTO operations VALUES (?, ?, ?, 'pending', NULL, ?)").run(requestId, tool, hash, Math.floor(Date.now()/1000));
+        const now = Math.floor(Date.now() / 1000);
+        if (resume) db.query("UPDATE operations SET hash=?, state='pending', result=NULL, updated_at=? WHERE request_id=?").run(hash, now, requestId);
+        else db.query("INSERT INTO operations VALUES (?, ?, ?, 'pending', NULL, ?)").run(requestId, tool, hash, now);
         return undefined;
       }).immediate();
       if (existing) return existing;
@@ -134,10 +136,10 @@ export class OperationJournal {
       const observation = { sent: false };
       try { result = await writeObservation.run(observation, action); }
       catch (error) { result = errorResult(error); }
-      // The callback can contain several upstream calls. Any error or elicitation
-      // after entry is conservatively uncertain, never interpreted as rollback.
       const confirmed = "content" in result && !result.isError;
-      persist(confirmed ? "confirmed" : observation.sent ? "uncertain" : "notExecuted", result);
+      const needsConsent = tool === "reimburse_bills" && reimbursementBeforeConfirmation === undefined &&
+        operationErrorCode(result) === "QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED";
+      persist(confirmed ? "confirmed" : needsConsent ? "awaitingConfirmation" : observation.sent ? "uncertain" : "notExecuted", result);
       return result;
     } finally { db.close(); }
   }

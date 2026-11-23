@@ -432,7 +432,7 @@ test("服务层重排标签组发送 JSON 字符串 ID 数组并失效标签快�
   }
 });
 
-test("标签写入不计本地配额，仍报告远端错误", async (t) => {
+test("标签写入报告远端拒绝", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 10, 4);
@@ -448,14 +448,12 @@ test("标签写入不计本地配额，仍报告远端错误", async (t) => {
   }), () => now);
 
   await service.updateTags(accountId, [{ tagId: "t1", name: "新名" }]);
-  assert.equal(store.getWriteQuota(accountId).used, 0);
 
   failNext = true;
   await assert.rejects(
     () => service.updateTags(accountId, [{ tagId: "t2", name: "失败" }]),
     (error) => error instanceof AppError && error.code === "QIANJI_BUSINESS_ERROR",
   );
-  assert.equal(store.getWriteQuota(accountId).used, 0);
 });
 
 test("标签局部更新读取最新字段，保留名称、分组和颜色，缺失项阻止整个批次写入", async (t) => {

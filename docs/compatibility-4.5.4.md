@@ -20,7 +20,7 @@ JADX 1.5.6 导出存在 43 个方法还原错误；本次检查的下列接口�
 APK、反编译源码、真实账号数据不提交到本仓库。
 
 官方近期日志涉及截图 AI 记账、批量图片下载、筛选和导出改进等客户端功能；它们不意味着本桥接服务已提供这些功能。
-本节记录的旧版图片功能仅返回原图 URL。新分支增加上传及账单关联，验证状态另见[升级范围与验收](capability-upgrade.md)，不沿用旧版实测结论。
+本节记录图片地址读取的协议验证。图片上传与账单关联的后续验证见[升级范围与验收](capability-upgrade.md)。
 
 ## 本次核对与调整
 
@@ -53,7 +53,7 @@ APK、反编译源码、真实账号数据不提交到本仓库。
 | 普通收支 | `create_bills`、`update_bills`、`delete_bills` | `/bill/syncall` 入口和本地写入确认、部分成功、退款/报销关联限制有测试；人工只在测试账本验证金额、分类、标签、日期和删除范围 |
 | 转账/信用卡还款 | `create_transfer`、`update_transfer` | 通过账单同步写入，转入转出、手续费/优惠与币种有测试；人工检查双边余额与还款标识 |
 | 退款 | `create_refund`、`update_refund`、`delete_refund` | `/bill/refund2` 和账单同步入口存在，关系和限额有测试；人工验证部分退款、二次退款、修改及删除后的原账单 |
-| 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` | `/baoxiao/baoxiao`、`upgradev2`、`cancelbaoxiao` 参数已对照；迁移确认、关系、币种和配额有测试；人工验证部分/整笔报销及取消，不自动同意账号迁移 |
+| 报销 | `reimburse_bills`、`delete_reimbursement`、`cancel_reimbursements` | `/baoxiao/baoxiao`、`upgradev2`、`cancelbaoxiao` 参数已对照，人工验证部分/整笔报销及取消。现行确认流程见[报销迁移](usage.md#报销迁移) |
 | 分类创建 | `create_categories`、`create_subcategories` | `submitv2`、`submitmultiple` 参数、父级、默认账本已检查；人工验证同名项、重复子分类返回及刷新后显示 |
 | 分类变更 | `update_categories`、`move_category`、`reorder_categories` | `submitv2`、`movesubcate`、`changelevel`、`reorder3` 已检查；人工重点检查改名后类型/图标/账本是否保留、提升/移动后的子分类结构 |
 | 分类删除与图标 | `delete_categories`、`check_category_deletion`、`list_category_icons` | 删除参数、影响数量、目标冲突与刷新有测试；人工验证转移账单与连账单删除两条独立路径及图标显示 |
@@ -201,11 +201,3 @@ PostgreSQL/MySQL 实库、容器构建及其他客户端平台仍未验证。已
 6. 异常中断、服务器部分成功继续用模拟测试验证；不要故意在生产账号制造失败。
 
 反馈只需记录：工具名、客户端版本、虚构输入、预期结果、实际结果、是否已刷新。账号、金额明细、附件、令牌和真实日志不进入公开 issue、PR 或此文档。
-
-## 后续优化候选
-
-- 优先：补齐上述未覆盖的真实业务分支；分类连账单删除不回滚余额，不能以删除成功代替余额验收。
-- 评估空标签组查询，以及账本/资产创建与编辑的独立设计和测试，不将一次性恢复脚本当作通用功能发布。
-- 补充 Linux、PostgreSQL/MySQL 的持续集成验证，保留 Windows 本地测试。
-- 有需要再添加标签组改名、恢复归档标签；目前 16 个新增工具并未覆盖 App 的每个管理动作。
-- 把每次 APK 版本、哈希和协议差异记录成同类文档，避免只修改版本号就声称全面兼容。

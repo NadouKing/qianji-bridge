@@ -10,10 +10,14 @@ import { Client, StreamableHTTPClientTransport, UrlElicitationRequiredError } fr
 
 import { BindingTicketManager } from "../src/auth.ts";
 import { Store, type PatRole } from "../src/data-store.ts";
+import { AppError, operationErrorCode } from "../src/errors.ts";
 import { createHttpApplication, createShutdown, loadConfig, type AppConfig } from "../src/http-server.ts";
 import { POSITIVE_ID_PATTERN } from "../src/ids.ts";
 import { QianjiClient, md5, type QianjiFetch } from "../src/qianji-client.ts";
 import { MoneyTrackService } from "../src/qianji-service.ts";
+import { applyWritePlan } from "../src/reconcile-cli.ts";
+import { OperationFailure, planSchema } from "../src/reconciliation.ts";
+import { noteRemoteWrite } from "../src/write-context.ts";
 import serverInstructions from "../src/server-instructions.md" with { type: "text" };
 import test from "./context.ts";
 
@@ -113,6 +117,79 @@ test("MCP writes use durable receipts across connections, require IDs when enabl
       assert.equal(conflict.isError, true);
     } finally { await client.close(); }
   }
+  assert.equal(writes, 1);
+});
+
+test("reimbursement approval resumes the same request without blocking unrelated writes", async t => {
+  const root = mkdtempSync(join(tmpdir(), "qianji-reimbursement-approval-"));
+  const { store, app, service, token } = setupApp({ operationsRoot: root });
+  const client = new Client({ name: "reimbursement-receipt-test", version: "1" });
+  t.after(async () => { await client.close(); await app.close(); store.close(); rmSync(root, { recursive: true }); });
+  await client.connect(transport(app, token));
+  const billId = "101";
+  const hash = "a".repeat(64);
+  service.getBills = async () => ({ results: [{ billId, fingerprint: hash, bill: {} }],
+    cache: { readAt: 1, lastSyncedAt: 1, refreshed: true } });
+  const observations: boolean[] = [];
+  service.reimburseBills = async (_account, input) => {
+    observations.push(Boolean(input.confirmReimbursementUpgrade));
+    noteRemoteWrite();
+    if (!input.confirmReimbursementUpgrade) throw new AppError("QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED", "Approval required");
+    return { bills: [] };
+  };
+  const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+  const input = { requestId: "reimbursement-test", sourceBillIds: [billId], money: 4, expectedBills: [{ billId, hash }] };
+  const approve = { ...input, confirmReimbursementUpgrade: true };
+  const original = await call("reimburse_bills", input);
+  assert.equal(operationErrorCode(original), "QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED");
+  assert.equal(operationErrorCode(await call("reimburse_bills", input)), "QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED");
+  const waiting = await call("get_operation_status", { requestId: input.requestId });
+  assert.equal((waiting.structuredContent as { operation: { state: string } }).operation.state, "awaitingConfirmation");
+  assert.equal(operationErrorCode(await call("reimburse_bills", { ...approve, money: 5 })), "REQUEST_ID_CONFLICT");
+  assert.equal(operationErrorCode(await call("reimburse_bills", { ...approve, requestId: "new-id" })), "REIMBURSEMENT_CONFIRMATION_REQUIRED");
+
+  service.setBudget = async (_account, input) => input;
+  const budget = await call("set_budget", { requestId: "independent-budget", bookId: "1",
+    period: { kind: "month", year: 2026, month: 1 }, target: { kind: "total" }, amount: 10 });
+  assert.equal(budget.isError, undefined);
+
+  assert.equal((await call("reimburse_bills", approve)).isError, undefined);
+  assert.equal((await call("reimburse_bills", approve)).isError, undefined);
+  assert.deepEqual(observations, [false, true]);
+});
+
+test("reconciliation CLI resumes from an MCP receipt after a lost write response", async t => {
+  const root = mkdtempSync(join(tmpdir(), "qianji-cli-server-receipts-"));
+  const { store, app, service, token } = setupApp({ operationsRoot: root });
+  const client = new Client({ name: "cli-receipt-test", version: "1" });
+  t.after(async () => { await client.close(); await app.close(); store.close(); rmSync(root, { recursive: true }); });
+  await client.connect(transport(app, token));
+  const hash = "a".repeat(64);
+  service.getBills = async () => ({ results: [{ billId: "101", fingerprint: hash, bill: { bookId: "1" } }],
+    cache: { readAt: 1, lastSyncedAt: 1, refreshed: true } });
+  let writes = 0;
+  let sent: Record<string, unknown> | undefined;
+  service.updateBills = async () => { writes++; return { bills: [] }; };
+  const call = async (name: string, args: Record<string, unknown>) => {
+    if (name === "get_user_info") return { user: { id: "uid-test" } };
+    if (name === "refresh_cache") return {};
+    if (name === "get_bills") return service.getBills(1, ["101"]);
+    const result = await client.callTool({ name, arguments: args });
+    if (result.isError) throw new OperationFailure(result);
+    if (name === "update_bills") {
+      sent = args;
+      throw new Error("Simulated loss after the server confirmed the write");
+    }
+    return result.structuredContent as Record<string, unknown>;
+  };
+  const plan = planSchema.parse({ version: 1, accountUid: "uid-test", bookIds: ["1"], batchId: "fixture-apply",
+    expectedBills: [{ billId: "101", hash }, { billId: "102", hash }],
+    operations: [{ id: "fix-remark", tool: "update_bills", arguments: { updates: [{ billId: "101", patch: { remark: "reviewed" } }] } }] });
+  const journal = join(root, "client.json");
+  await assert.rejects(applyWritePlan(plan, journal, call, true), /stopped without retry/);
+  assert.match(String(sent?.requestId), /^reconcile-[a-f0-9]{64}$/);
+  assert.deepEqual(sent?.expectedBills, [{ billId: "101", hash }]);
+  assert.deepEqual(await applyWritePlan(plan, journal, call, true), { batchId: "fixture-apply", confirmed: 1 });
   assert.equal(writes, 1);
 });
 
@@ -281,12 +358,10 @@ function assertUnitDescriptions(schema: unknown, path: string): void {
       const description = String((child as Record<string, unknown>).description ?? "");
       if (name === "money" || name === "fee" || name === "discount") {
         assert.match(description, /币种主单位.*不使用.*最小货币单位.*CNY.*USD.*JPY/, `${path}.${name} must state the currency unit`);
-      } else if (["time", "startTime", "endTime", "createTime", "createStartTime", "createEndTime", "updateTime", "registeredAt", "vipStart", "vipEnd", "expiresAt", "createdAt", "dailyWriteResetsAt"].includes(name)) {
+      } else if (["time", "startTime", "endTime", "createTime", "createStartTime", "createEndTime", "updateTime", "registeredAt", "vipStart", "vipEnd", "expiresAt", "createdAt"].includes(name)) {
         assert.match(description, /Unix 秒/, `${path}.${name} must state the time unit`);
       } else if (name === "memberCount") {
         assert.match(description, /单位为人/, `${path}.${name} must state the count unit`);
-      } else if (["dailyWriteLimit", "dailyWriteUsed", "dailyWriteRemaining"].includes(name)) {
-        assert.match(description, /单位为次/, `${path}.${name} must state the quota unit`);
       } else if (["bookCount", "visibleBookCount", "hiddenBookCount", "assetCount", "categoryCount", "tagCount"].includes(name)) {
         assert.match(description, /单位为个/, `${path}.${name} must state the count unit`);
       } else if (name === "billCount" || (name === "limit" && /每页条数/.test(description))) {
@@ -387,7 +462,7 @@ test("服务器级说明同时通过新版 discover 和旧版 initialize 返回"
   assert.match(serverInstructions, /update_transfer.*同一次修改.*最终场景、金额和双边资产/s);
   assert.match(serverInstructions, /refresh_cache.*全部目录缓存.*币种目录/s);
   assert.match(serverInstructions, /旧版本将不能继续使用报销.*明确同意.*confirmReimbursementUpgrade.*不得预先同意.*只在钱迹明确要求时迁移并只重试一次/s);
-  assert.match(serverInstructions, /迁移完成但报销失败.*不得再次迁移/s);
+  assert.match(serverInstructions, /迁移完成但报销结果未确认.*不得再次迁移/s);
   assert.match(serverInstructions, /删除或取消.*取得用户确认/s);
   assert.match(serverInstructions, /普通收支、待报销支出、转账或还款.*delete_bills/s);
   assert.match(serverInstructions, /取消一笔或多笔源账单的全部报销关系.*cancel_reimbursements.*保留源账单/s);

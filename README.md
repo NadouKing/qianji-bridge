@@ -24,49 +24,7 @@
 
 ## 快速开始
 
-需要 [Bun](https://bun.sh/) **1.3.14 或更高版本**，以及支持 **Streamable HTTP** 和自定义 Authorization Header 的 MCP 客户端。
-
-### 1. 安装依赖
-
-```bash
-bun install --frozen-lockfile
-```
-
-### 2. 生成管理员 PAT
-
-```bash
-bun -e "import { randomBytes } from 'node:crypto'; console.log('mt_pat_' + randomBytes(32).toString('hex'))"
-```
-
-请安全保存生成的 PAT，不要将其提交至仓库。
-
-### 3. 启动服务
-
-Windows PowerShell：
-
-```powershell
-$env:QIANJI_MCP_ADMIN_PAT = 'mt_pat_替换为生成的完整PAT'
-$env:QIANJI_MCP_PUBLIC_URL = 'http://127.0.0.1:3000'
-bun run start
-```
-
-macOS / Linux：
-
-```bash
-QIANJI_MCP_ADMIN_PAT='mt_pat_替换为生成的完整PAT' \
-QIANJI_MCP_PUBLIC_URL='http://127.0.0.1:3000' bun run start
-```
-
-默认只监听本机，数据使用 SQLite 保存于 `data/qianji.db`。
-
-### 4. 连接 MCP 客户端
-
-- **MCP 地址**：`http://127.0.0.1:3000/mcp`
-- **请求头**：`Authorization: Bearer mt_pat_...`
-
-首次调用业务工具时，支持 URL Elicitation 的客户端会提供钱迹账号绑定链接。完成绑定后重新调用工具即可。其他客户端是否支持该交互取决于其 MCP 实现。
-
-Docker、公网 HTTPS、数据库和环境变量配置见[部署与配置](docs/deployment.md)。
+按[部署与配置](docs/deployment.md#快速开始)使用 [Bun](https://bun.sh/) 1.3.14 或更新版本启动源码，或使用 Docker。连接支持 Streamable HTTP 和自定义 Authorization Header 的 MCP 客户端。默认 MCP 地址为 `http://127.0.0.1:3000/mcp`。
 
 ## 文档
 
@@ -75,6 +33,7 @@ Docker、公网 HTTPS、数据库和环境变量配置见[部署与配置](docs/
 | [工具与能力说明](docs/features.md) | 功能清单、验证基线与已知限制 |
 | [部署与配置](docs/deployment.md) | 本地/Docker 启动、MCP 连接、环境变量与数据库 |
 | [使用说明](docs/usage.md) | 查询、写入、批量操作、金额及同步规则 |
+| [本地批量对账](docs/reconciliation.md) | 本机导入、候选、计划与批次回执 |
 | [安全说明](docs/security.md) | 凭据管理、账号隔离、登录安全与调试日志 |
 | [兼容性与验收记录](docs/compatibility-4.5.4.md) | Android 4.5.4-1234 联调细节与验证记录 |
 | [开发工作流](docs/development-workflow.md) | 分支、工作目录与协作规范 |

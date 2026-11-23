@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { CallToolResult } from "@modelcontextprotocol/server";
-import { OperationJournal } from "../src/operation-journal.ts";
+import { errorResult, OperationJournal } from "../src/operation-journal.ts";
 import { AppError } from "../src/errors.ts";
 import test from "./context.ts";
 import { noteRemoteWrite } from "../src/write-context.ts";
@@ -43,6 +44,25 @@ test("uncertain and partial results stop all new writes, and status never retrie
     await assert.rejects(journal.execute("uid", "new", "create_bills", {}, noop, async () => { writes++; return result; }), /待核实/);
   }
   assert.equal(writes, 1);
+});
+
+test("a legacy reimbursement receipt can continue only after its explicit upgrade rejection", async t => {
+  const root = mkdtempSync(join(tmpdir(), "qianji-legacy-approval-"));
+  t.after(() => rmSync(root, { recursive: true }));
+  const journal = new OperationJournal(root);
+  const initial = { args: { money: 4, confirmReimbursementUpgrade: false }, expected: [] };
+  const approved = { ...initial, args: { ...initial.args, confirmReimbursementUpgrade: true } };
+  const rejection = errorResult(new AppError("QIANJI_REIMBURSEMENT_UPGRADE_REQUIRED", "Approval required"));
+  await journal.execute("uid", "legacy", "reimburse_bills", initial, noop, async () => { noteRemoteWrite(); return rejection; });
+  const db = new Database(join(root, readdirSync(root).find(name => name.endsWith(".sqlite"))!));
+  try { db.run("UPDATE operations SET state='uncertain' WHERE request_id='legacy'"); }
+  finally { db.close(); }
+
+  const reopened = new OperationJournal(root);
+  assert.equal((await reopened.status("uid", "legacy")).state, "uncertain");
+  const confirmed = await reopened.execute("uid", "legacy", "reimburse_bills", approved, noop, async () => result, initial);
+  assert.deepEqual(confirmed, result);
+  assert.equal((await reopened.status("uid", "legacy")).state, "confirmed");
 });
 
 test("preflight failure is not executed, while competing journal instances cannot enter a pending write", async t => {

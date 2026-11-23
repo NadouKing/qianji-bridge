@@ -22,3 +22,15 @@ export function safeError(error: unknown): AppError {
     ? error
     : new AppError("INTERNAL_ERROR", "服务暂时不可用", 500);
 }
+
+/** Read the stable error code from a tool result or a stored receipt. */
+export function operationErrorCode(result: unknown): string | undefined {
+  if (!result || typeof result !== "object" || !("isError" in result) || result.isError !== true ||
+      !("content" in result) || !Array.isArray(result.content)) return undefined;
+  const item = result.content.find(item => item?.type === "text");
+  if (typeof item?.text !== "string") return undefined;
+  try {
+    const code: unknown = JSON.parse(item.text).error?.code;
+    return typeof code === "string" ? code : undefined;
+  } catch { return undefined; }
+}
