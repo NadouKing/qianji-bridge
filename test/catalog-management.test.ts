@@ -15,6 +15,10 @@ test("catalog management preserves balances and credit settings, checks versions
   client.listAssets = async () => structuredClone(assets);
   client.listTagGroups = async () => structuredClone(groups);
   client.listRepeatTasks = async () => [];
+  client.listInstallments = async () => [];
+  client.listCategories = async () => [];
+  client.listDebtAccounts = async () => [];
+  client.deleteUnusedWallet = async (_account,id) => {writes++; assets=assets.filter(row=>row.id!==id);};
   client.submitBook = async (_account, value) => {
     writes++;
     if (value.bookid) Object.assign(books.find(row => row.bookid === value.bookid)!, value);
@@ -53,4 +57,15 @@ test("catalog management preserves balances and credit settings, checks versions
   const empty = await getCatalogObject(client, account, "book", "101");
   await run({action: "deleteEmpty", kind: "book", id: "101", expectedVersion: empty.version});
   assert.equal(books.some(row => row.bookid === "101"), false);
+  const zero=await getCatalogObject(client,account,"asset","201",true);
+  client.listInstallments=async()=>[{id:"999",assetid:"201",data:{cateid:"500"}}];
+  const count=writes;
+  await assert.rejects(run({action:"deleteEmpty",kind:"asset",id:"201",expectedVersion:zero.version}),/分期引用/);
+  assert.equal(writes,count);
+  client.listInstallments=async()=>[];
+  client.listDebtAccounts=async()=>[{id:"998",loan:{accountId:"201"}}];
+  await assert.rejects(run({action:"deleteEmpty",kind:"asset",id:"201",expectedVersion:zero.version}),/借贷或共享/);
+  client.listDebtAccounts=async()=>[];
+  await run({action:"deleteEmpty",kind:"asset",id:"201",expectedVersion:zero.version});
+  assert.equal(assets.some(row=>row.id==="201"),false);
 });

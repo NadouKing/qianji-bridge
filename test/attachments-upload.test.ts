@@ -17,6 +17,10 @@ test("image validation fully decodes and rejects malformed data, unsupported for
   const bytes = await png();
   assert.deepEqual(decodeImageBase64(bytes.toString("base64")), bytes);
   assert.equal((await imageIdentity(bytes)).width, 3);
+  const jpeg=await sharp(bytes).jpeg().toBuffer();
+  assert.equal((await imageIdentity(jpeg)).mime,"image/jpeg");
+  const oversized=await sharp({create:{width:5000,height:5000,channels:3,background:"white"}}).png().toBuffer();
+  await assert.rejects(imageIdentity(oversized),/2400/);
   await assert.rejects(imageIdentity(bytes.subarray(0, 34)), /解码/);
   await assert.rejects(imageIdentity(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')), /PNG/);
   assert.throws(() => decodeImageBase64("data:image/png;base64,AAAA"), /Base64/);

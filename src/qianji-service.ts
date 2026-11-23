@@ -1,3 +1,4 @@
+import { manageDebt, debtDetails, manageInstallment, publicInstallment, type DebtCommand, type InstallmentCommand } from "./linked-finance.ts";
 import { inTimeZone, validateTimeZone, timeZone, localTime, localDate, localSecond, startOfDay, nextDay, calendarDays, offsetSeconds } from "./time.ts";
 import { randomUUID } from "node:crypto";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
@@ -266,6 +267,40 @@ export class MoneyTrackService {
       (cursor, limit) => this.listBillsUnlocked(account, cursor ? {cursor} : {
         bookId: input.bookId, allBooks: input.allBooks, startTime: input.startTime, endTime: input.endTime, limit,
       }), input.cursor));
+  }
+
+  private financeContext(account: QianjiAccount) {
+    return {client:this.client,store:this.store,account,sync:()=>this.syncUnlocked(account),now:this.now()};
+  }
+  async getDebtDetails(accountId: number, id: string) {
+    return this.withAccount(accountId, account => debtDetails(this.financeContext(account),id));
+  }
+  async manageDebt(accountId: number, command: DebtCommand) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "借贷写入需要持久操作回执");
+    return this.withBillAccount(accountId,account=>manageDebt(this.financeContext(account),command));
+  }
+  async listInstallments(accountId: number) {
+    return this.withAccount(accountId,async account=>(await this.client.listInstallments(account)).map(publicInstallment));
+  }
+  async manageInstallment(accountId: number, command: InstallmentCommand) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "分期写入需要持久操作回执");
+    return this.withBillAccount(accountId,account=>manageInstallment(this.financeContext(account),command));
+  }
+  async deleteUnusedRepeatTask(accountId: number, id: string, expectedVersion: string) {
+    return this.withBillAccount(accountId, async account => {
+      const task=(await this.loadRepeatTasks(account)).find(row=>String(row.id)===id);
+      if (!task || publicUserId(task.userid)!==account.uid || billFingerprint(task)!==expectedVersion) throw new AppError("REPEAT_VERSION_CONFLICT","周期任务不存在、不属于当前账号或版本已变化");
+      const before=await this.scheduleSnapshot(account);
+      if (Number(task.count)!==0 || before.bills.some(row=>[cachedBillObject(row).packid,cachedBillObject(row).importpackid].some(value=>Number(task.packid)>0 && String(value)===String(task.packid)))) throw new AppError("REPEAT_TASK_IN_USE","只删除尚未生成账单的周期设置");
+      await this.client.deleteRepeatTask(account,id);
+      if ((await this.loadRepeatTasks(account)).some(row=>String(row.id)===id)) throw writeConfirmationFailed("周期任务删除未确认");
+      await this.syncUnlocked(account);
+      const after=await this.scheduleSnapshot(account);
+      const history=(rows:BillRow[])=>rows.map(row=>[row.id,billFingerprint(publicBill(cachedBillObject(row)))]).sort();
+      const balances=(rows:Record<string,unknown>[])=>rows.map(row=>[String(row.id),row.money]).sort();
+      if (billFingerprint(history(before.bills))!==billFingerprint(history(after.bills)) || billFingerprint(balances(before.assets))!==billFingerprint(balances(after.assets))) throw writeConfirmationFailed("删除周期设置期间账单或余额发生变化");
+      return {deleted:true,id};
+    });
   }
 
   async getCatalogObject(accountId: number, kind: CatalogObjectKind, id: string, includeBalances = false) {

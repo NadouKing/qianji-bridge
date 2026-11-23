@@ -344,6 +344,38 @@ export class QianjiClient {
     await this.authPost(account, "/repeat_task/toggle", { did: taskId });
   }
 
+  async deleteRepeatTask(account: QianjiAccount, taskId: string): Promise<void> {
+    await this.authPost(account, "/repeat_task/delete", { did: taskId });
+  }
+
+  async finishDebt(account: QianjiAccount, id: string, endDate: string): Promise<void> {
+    await this.authPost(account, "/asset/finish", {did: id, v: endDate});
+  }
+
+  async listInstallments(account: QianjiAccount): Promise<Record<string, unknown>[]> {
+    const data = asObject(await this.authPost(account, "/installment/list", {flts: "{}"}));
+    if (data.hasmore === 1 || data.hasmore === true) throw new AppError("INSTALLMENT_PAGINATION_UNSUPPORTED", "分期目录未完整返回，停止依赖该目录的写入", 502);
+    return asObjectArray(data.list).map(row => {
+      const details=asObject(typeof row.data === "string" ? parseQianjiJson(row.data) : row.data);
+      return {...row, id:positiveIdText(row.id,"分期"),assetid:positiveIdText(row.assetid,"分期资产"),
+        data:{...details,cateid:optionalPositiveIdText(details.cateid,"分期分类")}};
+    });
+  }
+
+  async submitInstallment(account: QianjiAccount, task: Record<string, unknown>): Promise<void> {
+    const v = JSON.stringify(task, (key, value) => ["id", "assetid", "cateid"].includes(key)
+      && typeof value === "string" && isPositiveLongId(value) ? (JSON as JsonWithRaw).rawJSON(value) : value);
+    await this.authPost(account, "/installment/submit", {v});
+  }
+
+  async configureInstallment(account: QianjiAccount, id: string, value: Record<string, number>): Promise<void> {
+    await this.authPost(account, "/installment/config", {did: id, v: JSON.stringify(value)});
+  }
+
+  async deleteInstallment(account: QianjiAccount, id: string): Promise<void> {
+    await this.authPost(account, "/installment/delete", {did: id});
+  }
+
   /** APK AssetAccount submit protocol: change balance without diffparams or an adjustment bill. */
   async submitAssetBalance(account: QianjiAccount, asset: Record<string, unknown>, money: number, extra?: Record<string, unknown>): Promise<void> {
     const raw: Record<string, unknown> = { ...asset, money };

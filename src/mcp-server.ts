@@ -123,7 +123,7 @@ const catalogCommandSchema = z.discriminatedUnion("action", [
     includeInTotal: z.boolean().optional().describe("是否计入总资产"), visible: z.boolean().optional().describe("显示或隐藏，须与其他字段分开修改"),
   }),
   z.strictObject({action: z.literal("renameTagGroup").describe("标签组改名"), ...catalogPatchIdentity, name: z.string().trim().min(1).max(10).describe("新标签组名称，保留组内标签")}),
-  z.strictObject({action: z.literal("deleteEmpty").describe("删除无账单及周期引用的自有空账本"), ...catalogPatchIdentity, kind: z.literal("book").describe("当前只支持空账本删除")}),
+  z.strictObject({action: z.literal("deleteEmpty").describe("删除无账单、周期及分期引用的自有空对象"), ...catalogPatchIdentity, kind: z.union([z.literal("book").describe("自有空账本"), z.literal("asset").describe("零余额无引用资产")]).describe("删除对象类型")}),
 ]).describe("明确的目录管理操作，修改须提供最新版本指纹");
 const currencySymbolSchema = z.string().min(1)
   .refine(isCurrencySymbol, "币种标识不能为空")
@@ -692,6 +692,46 @@ export function createMoneyTrackMcp(
   );
   installOperationTools(server, service, () => userId(principal, store));
 
+  const financeName = z.string().min(1).max(40).describe("自定义名称");
+  const financeRemark = z.string().max(500).describe("用途备注");
+  const financeDate = z.iso.date().describe("自然日 YYYY-MM-DD");
+  const financeTime = z.number().int().nonnegative().describe("Unix 秒");
+  const debtPrincipalSchema = nonnegativeMoneySchema.describe(`本金，纯利息还款可为零，${moneyUnitDescription}`);
+  const debtCommand = z.discriminatedUnion("action", [
+    z.strictObject({action:z.literal("create").describe("新建借贷及原生本金账单"), name:financeName,
+      direction:z.union([z.literal("borrowed").describe("借入"),z.literal("lent").describe("借出")]).describe("借贷方向"),money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),bookId:bookIdText,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),startDate:financeDate,endDate:financeDate.optional(),remark:financeRemark}),
+    z.strictObject({action:z.literal("addPrincipal").describe("追加本金"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),time:financeTime,remark:financeRemark}),
+    z.strictObject({action:z.literal("repay").describe("归还或收回本金并单独记录利息"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,cashAssetId:positiveIdText.describe("CNY 资金账户 ID"),bookId:bookIdText,money:debtPrincipalSchema,interest:nonnegativeMoneySchema.describe("独立利息主单位"),time:financeTime,remark:financeRemark}),
+    z.strictObject({action:z.literal("finish").describe("结清零本金借贷"),debtId:positiveIdText.describe("借贷 ID"),expectedVersion:expectedVersionSchema,endDate:financeDate}),
+  ]).describe("原生借贷操作，需持久回执，暂限明确 CNY 资金账户");
+  server.registerTool("get_debt_details", {
+    description:"读取借贷详情及版本指纹", inputSchema:z.strictObject({debtId:positiveIdText.describe("借贷 ID")}),
+    outputSchema:z.record(z.string(),z.unknown()).describe("借贷公开字段及版本"),annotations:readAnnotations,
+  },async ({debtId},ctx)=>toolResult(async()=>service.getDebtDetails(await userId(principal,store),debtId),ctx,principal,bindingTickets));
+  server.registerTool("manage_debt", {
+    description:"创建借贷、追加本金、归还本金与利息或结清，核验原生关系、历史账单和余额",
+    inputSchema:z.strictObject({command:debtCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验借贷详情、版本和新账单编号"),annotations:writeAnnotations,
+  },async ({command},ctx)=>toolResult(async()=>service.manageDebt(await userId(principal,store),command),ctx,principal,bindingTickets));
+  server.registerTool("list_installments", {
+    description:"直接读取分期目录和版本，不从历史账单猜测当前设置",inputSchema:z.strictObject({}).meta({required:[]}),
+    outputSchema:z.object({results:z.array(z.record(z.string(),z.unknown())).describe("分期设置、剩余本金费用及版本")}),annotations:readAnnotations,
+  },async (_,ctx)=>toolResult(async()=>({results:await service.listInstallments(await userId(principal,store))}),ctx,principal,bindingTickets));
+  const feeMethod = z.union([z.literal("average").describe("平均分配"),z.literal("first").describe("首期收取"),z.literal("last").describe("末期收取")]).describe("手续费分配方式");
+  const remainder = z.union([z.literal("first").describe("首期补余数"),z.literal("last").describe("末期补余数")]).describe("本金和平均手续费的分币余数位置");
+  const installmentCommand=z.discriminatedUnion("action",[
+    z.strictObject({action:z.literal("create").describe("从未来自然日创建原生分期"),name:financeName,assetId:positiveIdText.describe("独立 CNY 信用账户 ID"),bookId:bookIdText,categoryId:positiveIdText.describe("该账本的支出分类 ID"),money:positiveMoneySchema.describe(`本金，${moneyUnitDescription}`),fee:nonnegativeMoneySchema.describe(`全部期数总手续费，${moneyUnitDescription}`),periods:z.number().int().min(2).max(120).describe("期数 2 至 120"),time:financeTime,feeMethod,remainder,remark:financeRemark}),
+    z.strictObject({action:z.literal("configure").describe("修改分期统计开关"),id:positiveIdText,expectedVersion:expectedVersionSchema,includeInStatistics:z.boolean().describe("本金计入统计"),feeInStatistics:z.boolean().describe("手续费计入统计")}),
+    z.strictObject({action:z.literal("deleteUnused").describe("删除未生成账单的分期设置"),id:positiveIdText,expectedVersion:expectedVersionSchema}),
+  ]).describe("分期操作，需持久回执，保留历史记录");
+  server.registerTool("manage_installment", {
+    description:"创建未来分期、修改统计开关或删除未执行设置，核验本金费用与余额，未来自动生成需届时复核",
+    inputSchema:z.strictObject({command:installmentCommand}),outputSchema:z.record(z.string(),z.unknown()).describe("已核验分期设置及版本或删除结果"),annotations:{...writeAnnotations,destructiveHint:true},
+  },async ({command},ctx)=>toolResult(async()=>service.manageInstallment(await userId(principal,store),command),ctx,principal,bindingTickets));
+  server.registerTool("delete_unused_repeat_task", {
+    description:"按版本删除尚未生成账单的自有周期设置，保留已有账单和余额",
+    inputSchema:z.strictObject({taskId:positiveIdText,expectedVersion:expectedVersionSchema}),outputSchema:z.object({deleted:z.boolean().describe("删除已确认"),id:positiveIdText}),annotations:destructiveAnnotations,
+  },async ({taskId,expectedVersion},ctx)=>toolResult(async()=>service.deleteUnusedRepeatTask(await userId(principal,store),taskId,expectedVersion),ctx,principal,bindingTickets));
+
   server.registerTool("export_bills", {
     description: "分页导出账单摘要为 CSV 或 JSON 内容，明确返回完整性和续页游标，不写入服务器任意文件路径",
     inputSchema: z.strictObject({format: z.union([z.literal("csv").describe("适合表格读取，保护公式及长整数 ID"), z.literal("json").describe("保留结构化摘要")]).describe("导出格式"),
@@ -736,7 +776,7 @@ export function createMoneyTrackMcp(
     annotations: readAnnotations,
   }, async ({kind, id, includeBalances}, ctx) => toolResult(async () => service.getCatalogObject(await userId(principal, store), kind, id, includeBalances), ctx, principal, bindingTickets));
   server.registerTool("manage_catalog_object", {
-    description: "创建账本或 CNY 现金及信用账户，修改基础资料和显示状态，标签组改名，删除自有空账本，保留余额和已有关系",
+    description: "创建账本或 CNY 现金及信用账户，修改基础资料和显示状态，标签组改名，删除自有空账本或零余额无引用资产，保留余额和已有关系",
     inputSchema: z.strictObject({ command: catalogCommandSchema }),
     outputSchema: z.record(z.string(), z.unknown()).describe("写后核验的公开对象及版本，或已删除对象 ID"),
     annotations: {...writeAnnotations, destructiveHint: true},

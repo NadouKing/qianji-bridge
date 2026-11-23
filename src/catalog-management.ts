@@ -2,8 +2,8 @@ import type { DataStore, QianjiAccount } from "./data-store.ts";
 import type { QianjiClient } from "./qianji-client.ts";
 import { AppError } from "./errors.ts";
 import { billFingerprint } from "./reconciliation.ts";
-import { publicBook, publicAssetGroups, publicTagGroup, cachedBillObject } from "./qianji-mappers.ts";
-import { requireNonnegativeMoney } from "./bill-rules.ts";
+import { publicBook, publicAssetGroups, publicTagGroup, cachedBillObject, categoryChildren } from "./qianji-mappers.ts";
+import { requireNonnegativeMoney, publicUserId } from "./bill-rules.ts";
 
 export type CatalogObjectKind = "book" | "asset" | "tagGroup";
 export type CatalogCommand =
@@ -28,7 +28,7 @@ function publicObject(row: Record<string, unknown>, kind: CatalogObjectKind, inc
   return { object, version: billFingerprint(row) };
 }
 function owned(row: Record<string, unknown>, account: QianjiAccount) {
-  if (String(row.userid) !== account.uid) throw new AppError("CATALOG_OWNER_MISMATCH", "仅支持管理当前账号拥有的对象");
+  if (publicUserId(row.userid) !== account.uid) throw new AppError("CATALOG_OWNER_MISMATCH", "仅支持管理当前账号拥有的对象");
 }
 function name(value: string, max: number) {
   if (!value.trim() || value !== value.trim() || value.length > max) throw new AppError("INVALID_CATALOG_NAME", `名称必须为 1 至 ${max} 个字符且不含首尾空白`);
@@ -61,7 +61,7 @@ export async function manageCatalog(client: QianjiClient, store: DataStore, acco
     } else if (command.action === "updateBook") {
       if ((command.name !== undefined) === (command.visible !== undefined)) throw new AppError("INVALID_CATALOG_PATCH", "每次只修改账本名称或显示状态之一");
       expected = {name: command.name ?? old!.name, visible: command.visible === undefined ? old!.visible : Number(command.visible)};
-      if (command.name !== undefined) await client.submitBook(account, {bookid: id, name: command.name, cover: old!.cover ?? "--", type: old!.type, range: old!.range ?? null});
+      if (command.name !== undefined) await client.submitBook(account, {bookid: id, name: command.name, cover: old!.cover ?? "--", type: old!.type, range: old!.range ?? (old!.config as Record<string, unknown> | undefined)?.range ?? null});
       else if (Number(old!.visible) !== Number(command.visible)) await client.toggleBookVisibility(account, id!);
     } else if (command.action === "createAsset") {
       requireNonnegativeMoney(Math.abs(command.balance), "初始余额");
@@ -101,10 +101,28 @@ export async function manageCatalog(client: QianjiClient, store: DataStore, acco
         const data = task.data as Record<string, unknown>;
         return (kind === "book" ? [data.bookid] : [data.fromid, data.targetid]).some(value => String(value) === id);
       })) throw new AppError("CATALOG_OBJECT_IN_USE", "对象仍被周期任务引用");
-      // Deletion of assets also needs installment, loan and shared-credit checks;
-      // keep it closed until those catalogs are integrated and verified.
-      if (kind === "asset") throw new AppError("ASSET_DELETE_UNSUPPORTED", "资产删除需完整检查借贷、分期及共享额度关系，当前保留资产");
-      await client.deleteEmptyBook(account, id!); removed = true;
+      const installments = await client.listInstallments(account);
+      const categories = kind === "book" ? (await client.listCategories(account, id!, -1)).flatMap(row => [row, ...categoryChildren(row)]) : [];
+      if (installments.some(task => kind === "asset" ? String(task.assetid) === id : categories.some(category => String(category.id) === String((task.data as Record<string,unknown>).cateid)))) {
+        throw new AppError("CATALOG_OBJECT_IN_USE", "对象仍被分期引用");
+      }
+      if (kind === "asset") {
+        if (![1,2,3,4].includes(Number(old!.type)) || Number(old!.money) !== 0) throw new AppError("ASSET_NOT_EMPTY", "仅删除零余额的普通资产");
+        const shareId = (old!.credit as Record<string,unknown> | null)?.shareid;
+        if (shareId != null && !["", "0", "-1"].includes(String(shareId))) throw new AppError("CATALOG_OBJECT_IN_USE", "资产仍有关联共享额度");
+        const assets = await client.listAssets(account, true);
+        // Reject references inside native credit/loan/extra metadata as well as bills and schedules.
+        const references = (value: unknown): boolean => {
+          if (value === null || value === undefined) return false;
+          if (typeof value === "object") return Object.values(value).some(references);
+          return String(value) === id;
+        };
+        const debts: Record<string,unknown>[] = [];
+        for (const direction of [51,52] as const) for (const status of [0,1] as const) debts.push(...await client.listDebtAccounts(account,direction,status));
+        if ([...assets.filter(row=>String(row.id)!==id),...debts].some(row=>[row.credit,row.loan,row.extra].some(references))) throw new AppError("CATALOG_OBJECT_IN_USE", "资产仍被借贷或共享额度关系引用");
+        await client.deleteUnusedWallet(account,id!);
+      } else await client.deleteEmptyBook(account, id!);
+      removed = true;
     }
     const after = await read(client, account, kind);
     if (removed) {
