@@ -575,7 +575,7 @@ test("无账本上下文的分类写入使全部已缓存账本的分类快照�
   assert.equal(store.getCatalogCache(account.id, "categories", "-1"), undefined);
 });
 
-test("分类写入预占并保留非 VIP 每日写入配额，远端失败时释放", async (t) => {
+test("分类写入不计本地配额，仍报告远端错误", async (t) => {
   const { store, accountId, account } = setup();
   t.after(() => store.close());
   const now = Date.UTC(2026, 7, 10, 4);
@@ -592,14 +592,14 @@ test("分类写入预占并保留非 VIP 每日写入配额，远端失败时释
   }), () => now);
 
   await service.updateCategories(accountId, [{ categoryId: "170", name: "新名" }]);
-  assert.equal(store.getWriteQuota(accountId).used, 1);
+  assert.equal(store.getWriteQuota(accountId).used, 0);
 
   failNext = true;
   await assert.rejects(
     () => service.updateCategories(accountId, [{ categoryId: "171", name: "失败" }]),
     (error) => error instanceof AppError && error.code === "QIANJI_BUSINESS_ERROR",
   );
-  assert.equal(store.getWriteQuota(accountId).used, 1);
+  assert.equal(store.getWriteQuota(accountId).used, 0);
 });
 
 test("子分类改名从新鲜目录恢复账本、收入类型、父级和图标，缺失分类不写入", async (t) => {
