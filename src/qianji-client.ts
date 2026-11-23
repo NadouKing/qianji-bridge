@@ -3,6 +3,7 @@ import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { AppError } from "./errors.ts";
+import { uploadImage } from "./attachments.ts";
 import {
   isCurrencySymbol,
   isOptionalPositiveLongId,
@@ -286,6 +287,12 @@ export class QianjiClient {
   async listBooks(account: QianjiAccount, includeHidden: boolean): Promise<Record<string, unknown>[]> {
     const data = asObject(await this.authPost(account, "/book/list", { t: includeHidden ? -1 : 1 }));
     return asObjectArray(data.list).map(normalizeBook);
+  }
+
+  async uploadBillImage(account: QianjiAccount, bytes: Buffer) {
+    const data = asObject(await this.authPost(account, "/common/uploadtoken", { dt: 1 }));
+    if (typeof data.v !== "string" || data.v.length < 10 || data.v.length > 10_000) throw new AppError("UPLOAD_TOKEN_INVALID", "上传令牌响应无效");
+    return uploadImage(this.fetchImpl, account.uid, bytes, data.v);
   }
 
   /** APK page=0 请求返回完整目录，服务端不按 page 分页。 */
@@ -846,6 +853,7 @@ export class QianjiClient {
 
   /** 以脱敏 JSONL 追加可选诊断记录，日志失败不影响业务请求。 */
   private writeDebugLog(url: URL, requestBody: string, status: number | null, responseBody: string | null): void {
+    if (url.pathname === "/common/uploadtoken") return;
     if (!this.debugLogPath) return;
     try {
       // ponytail: 可选诊断采用同步追加已足够，吞吐成为实际问题时再接入部署日志管道。

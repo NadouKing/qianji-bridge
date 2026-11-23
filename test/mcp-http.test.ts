@@ -19,6 +19,8 @@ import test from "./context.ts";
 
 const ADMIN_PAT = `mt_pat_${"a".repeat(43)}`;
 const BUSINESS_TOOLS = [
+  "upload_bill_image",
+  "set_bill_images",
   "get_operation_status",
   "archive_tags",
   "list_repeat_tasks",

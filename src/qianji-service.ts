@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { CallToolResult, InputRequiredResult } from "@modelcontextprotocol/server";
 import { OperationJournal, type ExpectedBill } from "./operation-journal.ts";
 import { billFingerprint } from "./reconciliation.ts";
+import { decodeImageBase64, imageIdentity } from "./attachments.ts";
 import { readRecoveryBackup, remapBillAsset, recoveryFingerprint, saveRecoveryRecord } from "./bill-recovery.ts";
 
 import {
@@ -255,6 +256,54 @@ export class MoneyTrackService {
     if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "尚未配置私人操作回执目录");
     const account = await this.store.requireAccount(accountId);
     return this.operations.status(account.uid, requestId);
+  }
+
+  async uploadBillImage(accountId: number, imageBase64: string) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "附件上传必须启用持久操作回执");
+    const bytes = decodeImageBase64(imageBase64);
+    await imageIdentity(bytes);
+    return this.withAccount(accountId, account => this.client.uploadBillImage(account, bytes));
+  }
+
+  async setBillImages(accountId: number, input: { billId: string; mode: "append" | "replace"; uploadRequestIds: string[] }) {
+    if (!this.operations) throw new AppError("OPERATIONS_NOT_CONFIGURED", "附件关联必须启用持久操作回执");
+    return this.withBillAccount(accountId, async account => {
+      const keys: string[] = [];
+      for (const requestId of input.uploadRequestIds) {
+        const status = await this.operations!.status(account.uid, requestId);
+        const image = status.result?.structuredContent?.image;
+        if (status.state !== "confirmed" || status.tool !== "upload_bill_image" || !image || typeof image !== "object"
+          || typeof image.imageKey !== "string" || image.storageVerified !== true || image.pixelsVerified !== true) {
+          throw new AppError("IMAGE_REFERENCE_UNVERIFIED", "只能关联本账号已完成内容核验的上传回执");
+        }
+        keys.push(image.imageKey);
+      }
+      await this.syncUnlocked(account);
+      const row = await this.store.getBill(account.id, normalizeBillId(input.billId));
+      if (!row) throw new AppError("BILL_NOT_FOUND", "账单不存在", 404);
+      const raw = cachedBillObject(row);
+      requireOwnedBill(raw, account.uid);
+      await this.requireWritableBook(account, String(raw.bookid));
+      if (![0, 1, 2, 3, 5].includes(Number(raw.type))) throw new AppError("BILL_SCENARIO_MISMATCH", "当前附件编辑仅支持普通收支、待报销、转账和还款");
+      if (raw.images != null && (!Array.isArray(raw.images) || raw.images.some(item => typeof item !== "string"))) throw new AppError("IMAGE_REFERENCE_UNVERIFIED", "原账单图片结构无法安全保留");
+      const images = [...new Set([...(input.mode === "append" ? (raw.images as string[] | null ?? []) : []), ...keys])];
+      if (images.length > 6) throw new AppError("IMAGE_LIMIT_EXCEEDED", "当前附件编辑最多保留 6 张图片，不会自动删图");
+      if (JSON.stringify(images) === JSON.stringify(raw.images ?? [])) return publicBill(raw);
+      const next = { ...raw, images, updatetime: Math.floor(this.now()/1000) };
+      return this.withBusinessWrite(account, tagIdsFrom(raw), async mark => {
+        await this.acceptSyncBillResult(account, await this.client.syncBills(account, { bills: { changelist: [next] } }), [row.id], mark);
+        await this.confirmWrite(() => this.syncUnlocked(account));
+        const confirmed = await this.store.getBill(account.id, row.id);
+        if (!confirmed) throw writeConfirmationFailed("附件关联后账单未查到");
+        const after = cachedBillObject(confirmed);
+        const stable = (bill: Record<string, unknown>) => {
+          const { imageUrls: _images, updateTime: _time, ...fields } = publicBill(bill);
+          return billFingerprint(fields);
+        };
+        if (JSON.stringify(after.images ?? []) !== JSON.stringify(images) || stable(raw) !== stable(after)) throw writeConfirmationFailed("附件或原账单字段未核验通过，请查询原请求及账单");
+        return publicBill(after);
+      });
+    });
   }
 
   async runOperation(accountId: number, requestId: string | undefined, tool: string, args: Record<string, unknown>,

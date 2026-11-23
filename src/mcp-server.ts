@@ -38,6 +38,7 @@ import {
 import { MoneyTrackService } from "./qianji-service.ts";
 import serverInstructions from "./server-instructions.md" with { type: "text" };
 import { installOperationTools } from "./operation-tools.ts";
+import { MAX_IMAGE_BYTES } from "./attachments.ts";
 
 const bindingExpiryFormatter = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
@@ -665,6 +666,30 @@ export function createMoneyTrackMcp(
     { instructions: serverInstructions.trim() },
   );
   installOperationTools(server, service, () => userId(principal, store));
+
+  server.registerTool("upload_bill_image", {
+    description: "上传并核验单帧 PNG 或 JPEG，需启用持久回执，返回存储证明及独立的内容核验结果",
+    inputSchema: z.strictObject({ imageBase64: z.string().min(1).max(Math.ceil(MAX_IMAGE_BYTES / 3) * 4).describe("图片标准 Base64 内容，原文件最多 8 MiB，不接受路径、URL 或 data URL") }),
+    outputSchema: z.object({ image: z.object({
+      imageKey: z.string().describe("本账号上传的图片对象键"),
+      sha256: z.string().describe("上传文件 SHA256"),
+      storageVerified: z.boolean().describe("存储回执哈希是否符合上传内容"),
+      fileVerified: z.boolean().describe("CDN 回读字节是否完全一致"),
+      pixelsVerified: z.boolean().describe("按图片方向解码后的尺寸及像素是否完全一致"),
+    }).describe("上传和回读结果，内容核验失败不代表存储上传失败") }),
+    annotations: writeAnnotations,
+  }, async ({ imageBase64 }, ctx) => toolResult(async () => ({ image: await service.uploadBillImage(await userId(principal, store), imageBase64) }), ctx, principal, bindingTickets));
+
+  server.registerTool("set_bill_images", {
+    description: "按已核验的上传请求关联账单附件，append 保留旧图，replace 显式替换，仅修改附件并回读原账单字段",
+    inputSchema: z.strictObject({
+      billId: positiveIdText.describe("目标账单 ID"),
+      mode: z.union([z.literal("append").describe("保留旧图并按顺序追加"), z.literal("replace").describe("完整替换附件，空列表清除全部图片")]).describe("附件修改方式"),
+      uploadRequestIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,100}$/)).max(6).describe("本账号已完成内容核验的上传请求号列表，最多 6 张图片"),
+    }),
+    outputSchema: z.object({ bill: billSchema.describe("附件和其他字段已核验的账单") }),
+    annotations: { ...writeAnnotations, destructiveHint: true },
+  }, async (input, ctx) => toolResult(async () => ({ bill: await service.setBillImages(await userId(principal, store), input) }), ctx, principal, bindingTickets));
 
   server.registerTool(
     "connect_qianji",

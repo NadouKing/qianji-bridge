@@ -33,6 +33,9 @@
 
 #### 创建或修改
 
+- 附件：先用 `upload_bill_image` 上传并取得内容核验通过的回执，再用 `set_bill_images` 按上传请求号关联，append 保留旧图，replace 完整替换，必须明确用户希望替换时才使用 replace
+- 上传返回存储证明不等于 CDN 内容已核验，只有 pixelsVerified=true 的本账号上传回执可关联，失败时查询原请求，不重传图片或猜测对象键
+
 需要账本、资产、分类或标签 ID 且当前缺少可信 ID 时，只调用对应的 `list_books`、`list_assets`、`list_categories` 或 `list_tags` 获取，不得猜测或构造 ID。
 
 - 普通收支：创建使用 `create_bills` 的 `bills`，修改使用 `update_bills` 的 `updates`，即使只操作一笔，也传入只有一项的列表，修改按 `billId` 定位原账单，不传 `type`，只在用户要求时通过 `reimbursable` 切换普通支出与待报销支出
